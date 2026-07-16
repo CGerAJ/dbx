@@ -126,6 +126,8 @@ pub struct ColumnInfo {
     pub is_nullable: bool,
     pub column_default: Option<String>,
     pub is_primary_key: bool,
+    #[serde(default)]
+    pub is_unique: bool,
     pub extra: Option<String>,
     pub comment: Option<String>,
     pub numeric_precision: Option<i32>,
