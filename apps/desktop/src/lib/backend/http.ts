@@ -634,6 +634,10 @@ export async function getColumns(connectionId: string, database: string, schema:
   return get(`/api/schema/columns?${qs({ connection_id: connectionId, database, schema, table, catalog })}`);
 }
 
+export async function getAllColumns(connectionId: string, database: string, schema: string): Promise<Array<[string, ColumnInfo[]]>> {
+  return get(`/api/schema/all-columns?${qs({ connection_id: connectionId, database, schema })}`);
+}
+
 export async function listDataTypes(connectionId: string, database: string): Promise<string[]> {
   return get(`/api/schema/data-types?${qs({ connection_id: connectionId, database })}`);
 }

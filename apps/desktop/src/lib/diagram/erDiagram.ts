@@ -9,7 +9,7 @@ export interface DiagramTable {
 export interface DiagramRelationship {
   id: string;
   name: string;
-  kind: "foreign-key" | "custom";
+  kind: "foreign-key" | "custom" | "inferred";
   sourceTable: string;
   sourceColumn: string;
   targetTable: string;
@@ -95,7 +95,63 @@ export function buildDiagramRelationships(tables: DiagramTable[], customRelation
       kind: "custom" as const,
     }));
 
-  return [...foreignKeyRelationships, ...custom];
+  return deduplicateRelationships([...foreignKeyRelationships, ...custom]);
+}
+
+export function deduplicateRelationships(relationships: DiagramRelationship[]): DiagramRelationship[] {
+  const seen = new Set<string>();
+  const unique: DiagramRelationship[] = [];
+
+  for (const rel of relationships) {
+    const key = `${rel.sourceTable}:${rel.sourceColumn}:${rel.targetTable}:${rel.targetColumn}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      unique.push(rel);
+    }
+  }
+
+  return unique;
+}
+
+export interface InferredRelationshipInput {
+  id: string;
+  sourceTable: string;
+  sourceColumn: string;
+  targetTable: string;
+  targetColumn: string;
+  confidence?: "high" | "medium";
+  strategy?: string;
+}
+
+export function toDiagramRelationship(input: InferredRelationshipInput): DiagramRelationship {
+  return {
+    id: input.id,
+    name: `${input.sourceTable}_${input.sourceColumn}_${input.targetTable}_${input.targetColumn}`,
+    kind: "inferred",
+    sourceTable: input.sourceTable,
+    sourceColumn: input.sourceColumn,
+    targetTable: input.targetTable,
+    targetColumn: input.targetColumn,
+    sourceCardinality: "N",
+    targetCardinality: "1",
+  };
+}
+
+export function mergeRelationshipsWithInferred(
+  existing: DiagramRelationship[],
+  inferred: InferredRelationshipInput[],
+): DiagramRelationship[] {
+  const existingIds = new Set(existing.map((r) => r.id));
+  const inferredIds = new Set(inferred.map((r) => r.id));
+  const merged: DiagramRelationship[] = [...existing];
+
+  for (const inf of inferred) {
+    if (!existingIds.has(inf.id) && !inferredIds.has(inf.id)) {
+      merged.push(toDiagramRelationship(inf));
+    }
+  }
+
+  return deduplicateRelationships(merged);
 }
 
 export function filterDiagramTables(tables: DiagramTable[], query: string): DiagramTable[] {

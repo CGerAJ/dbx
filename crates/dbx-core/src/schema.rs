@@ -4383,6 +4383,37 @@ fn deduplicate_column_infos(columns: Vec<db::ColumnInfo>) -> Vec<db::ColumnInfo>
     result
 }
 
+pub async fn get_all_columns_core(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    schema: &str,
+) -> Result<Vec<(String, Vec<db::ColumnInfo>)>, String> {
+    let tables = list_tables_core(state, connection_id, database, schema, None, None, None, None).await?;
+
+    let mut result: Vec<(String, Vec<db::ColumnInfo>)> = Vec::with_capacity(tables.len());
+    for table in tables {
+        match get_columns_core(state, connection_id, database, schema, &table.name).await {
+            Ok(columns) => {
+                result.push((table.name, columns));
+            }
+            Err(e) => {
+                log::warn!(
+                    "[schema][get_all_columns] connection_id={} database={} schema={} table={} error={}",
+                    connection_id,
+                    database,
+                    schema,
+                    table.name,
+                    e
+                );
+                result.push((table.name, Vec::new()));
+            }
+        }
+    }
+
+    Ok(result)
+}
+
 fn merge_optional_string(target: &mut Option<String>, candidate: Option<String>) {
     let Some(candidate) = candidate else {
         return;
