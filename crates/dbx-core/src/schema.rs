@@ -4359,6 +4359,7 @@ fn deduplicate_column_infos(columns: Vec<db::ColumnInfo>) -> Vec<db::ColumnInfo>
     for column in columns {
         if let Some(existing) = result.iter_mut().find(|existing| existing.name == column.name) {
             existing.is_primary_key |= column.is_primary_key;
+            existing.is_unique |= column.is_unique;
             existing.is_nullable &= column.is_nullable;
             merge_optional_string(&mut existing.column_default, column.column_default);
             merge_optional_string(&mut existing.extra, column.extra);

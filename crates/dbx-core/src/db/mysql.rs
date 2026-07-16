@@ -2448,6 +2448,7 @@ pub async fn get_columns(pool: &MySqlPool, database: &str, table: &str) -> Resul
             };
             Some(ColumnInfo {
                 is_primary_key: column_key.eq_ignore_ascii_case("PRI"),
+                is_unique: column_key.eq_ignore_ascii_case("UNI"),
                 name,
                 data_type: column_type,
                 is_nullable: get_str_by_name(row, "IS_NULLABLE") == "YES",
@@ -2502,6 +2503,7 @@ pub async fn get_columns_show(pool: &MySqlPool, database: &str, table: &str) -> 
                 is_nullable: get_str_by_name(row, "Null").eq_ignore_ascii_case("YES"),
                 column_default: get_opt_str(row, "Default"),
                 is_primary_key: key.eq_ignore_ascii_case("PRI"),
+                is_unique: key.eq_ignore_ascii_case("UNI"),
                 extra: get_opt_str(row, "Extra"),
                 comment: get_opt_str(row, "Comment")
                     .map(|s| fix_potential_double_encoding(&s))
@@ -3463,6 +3465,7 @@ pub async fn get_columns_show_from(
                 is_nullable: get_str_by_name(row, "Null").eq_ignore_ascii_case("YES"),
                 column_default: get_opt_str(row, "Default"),
                 is_primary_key: key.eq_ignore_ascii_case("PRI"),
+                is_unique: key.eq_ignore_ascii_case("UNI"),
                 extra: get_opt_str(row, "Extra"),
                 comment: get_opt_str(row, "Comment")
                     .map(|s| fix_potential_double_encoding(&s))

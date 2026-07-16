@@ -414,6 +414,7 @@ export interface ColumnInfo {
   is_nullable: boolean;
   column_default: string | null;
   is_primary_key: boolean;
+  is_unique?: boolean;
   extra: string | null;
   comment?: string | null;
   numeric_precision?: number | null;
