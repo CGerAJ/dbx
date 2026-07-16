@@ -896,6 +896,10 @@ export async function getSqlServerColumnMetadata(connectionId: string, database:
   return invoke("get_sqlserver_column_metadata", { connectionId, database, schema, table });
 }
 
+export async function getAllColumns(connectionId: string, database: string, schema: string): Promise<Array<[string, ColumnInfo[]]>> {
+  return invoke("get_all_columns", { connectionId, database, schema });
+}
+
 export async function listDataTypes(connectionId: string, database: string): Promise<string[]> {
   return invoke("list_data_types", { connectionId, database });
 }

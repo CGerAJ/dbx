@@ -699,6 +699,10 @@ export async function getSqlServerColumnMetadata(connectionId: string, database:
   return get(`/api/schema/sqlserver/column-metadata?${qs({ connection_id: connectionId, database, schema, table })}`);
 }
 
+export async function getAllColumns(connectionId: string, database: string, schema: string): Promise<Array<[string, ColumnInfo[]]>> {
+  return get(`/api/schema/all-columns?${qs({ connection_id: connectionId, database, schema })}`);
+}
+
 export async function listDataTypes(connectionId: string, database: string): Promise<string[]> {
   return get(`/api/schema/data-types?${qs({ connection_id: connectionId, database })}`);
 }
