@@ -15,7 +15,7 @@ import * as api from "@/lib/backend/api";
 import type { TransferMode, TransferTableNameCase } from "@/lib/backend/api";
 import type { DatabaseType } from "@/types/database";
 import { isSchemaAware, supportsTransfer } from "@/lib/database/databaseCapabilities";
-import { databaseOptionsForConnection } from "@/composables/useDatabaseOptions";
+import { databaseOptionsForConnection, fetchNamespaceOptionsForConnection, namespaceOptionsAreSchemas } from "@/composables/useDatabaseOptions";
 import { useExportTracker } from "@/composables/useExportTracker";
 import { ArrowRightLeft, ArrowLeftRight, Loader2, Square, CheckSquare } from "@lucide/vue";
 
@@ -99,8 +99,9 @@ async function loadDatabases(connectionId: string, target: "source" | "target") 
   if (!connectionId) return;
   try {
     await store.ensureConnected(connectionId);
-    const rawNames = isMongoConnection(connectionId) ? await api.mongoListDatabases(connectionId) : (await api.listDatabases(connectionId)).map((d) => d.name);
-    const names = databaseOptionsForConnection(rawNames, store.getConfig(connectionId));
+    const config = store.getConfig(connectionId);
+    if (!config) return;
+    const names = isMongoConnection(connectionId) ? databaseOptionsForConnection(await api.mongoListDatabases(connectionId), config) : await fetchNamespaceOptionsForConnection(connectionId, config);
     if (target === "source") {
       sourceDatabases.value = names;
       sourceDatabase.value = names.length === 1 ? names[0] : "";
@@ -188,7 +189,12 @@ watch(sourceConnectionId, (id) => {
 watch(sourceDatabase, async (db) => {
   if (db) {
     const config = store.getConfig(sourceConnectionId.value);
-    if (isSchemaAware(config?.db_type)) {
+    if (namespaceOptionsAreSchemas(config)) {
+      // Dameng has no selectable catalog, so the top-level namespace option is
+      // also the schema used for metadata lookup and qualified transfer SQL.
+      sourceSchemas.value = [];
+      sourceSchema.value = db;
+    } else if (isSchemaAware(config?.db_type)) {
       await loadSchemas(sourceConnectionId.value, db, "source");
     } else {
       sourceSchema.value = db;
@@ -208,7 +214,10 @@ watch(targetConnectionId, (id) => {
 watch(targetDatabase, async (db) => {
   if (db) {
     const config = store.getConfig(targetConnectionId.value);
-    if (isSchemaAware(config?.db_type)) {
+    if (namespaceOptionsAreSchemas(config)) {
+      targetSchemas.value = [];
+      targetSchema.value = db;
+    } else if (isSchemaAware(config?.db_type)) {
       await loadSchemas(targetConnectionId.value, db, "target");
     } else {
       targetSchema.value = db;
@@ -350,15 +359,15 @@ function getConnectionName(id: string) {
 <template>
   <Dialog v-model:open="open">
     <DialogContent class="sm:max-w-[780px] max-h-[80vh] flex flex-col overflow-hidden" @interact-outside.prevent>
-      <DialogHeader>
+      <DialogHeader class="shrink-0">
         <DialogTitle class="flex items-center gap-2">
           <ArrowRightLeft class="w-4 h-4" />
           {{ t("transfer.title") }}
         </DialogTitle>
       </DialogHeader>
 
-      <div class="flex-1 min-h-0 overflow-auto">
-        <div class="grid gap-4 py-3">
+      <div class="min-h-0 flex-1 overflow-hidden">
+        <div class="grid h-full min-h-0 grid-rows-[auto_minmax(0,1fr)_auto] gap-4 py-3">
           <!-- Source / Target Side by Side -->
           <div class="grid grid-cols-[1fr_auto_1fr] gap-4 items-start">
             <!-- Source Section -->
@@ -486,7 +495,7 @@ function getConnectionName(id: string) {
           </div>
 
           <!-- Tables Section -->
-          <div class="space-y-2">
+          <div class="flex min-h-0 flex-col gap-2">
             <div class="flex items-center justify-between">
               <div class="text-xs font-medium text-muted-foreground uppercase tracking-wider">
                 {{ t("transfer.tables") }}
@@ -509,7 +518,7 @@ function getConnectionName(id: string) {
             <div v-else-if="sourceTables.length === 0" class="text-xs text-muted-foreground py-4 text-center">
               {{ t("transfer.noTables") }}
             </div>
-            <div v-else class="border rounded-md max-h-[200px] overflow-y-auto">
+            <div v-else class="min-h-0 max-h-[200px] overflow-y-auto rounded-md border">
               <div v-for="table in filteredTables" :key="table" class="flex items-center gap-2 px-2.5 py-1.5 hover:bg-muted/50 cursor-pointer text-xs" @click="toggleTable(table)">
                 <CheckSquare v-if="selectedTables.has(table)" class="w-3.5 h-3.5 text-primary shrink-0" />
                 <Square v-else class="w-3.5 h-3.5 text-muted-foreground/40 shrink-0" />
@@ -559,7 +568,7 @@ function getConnectionName(id: string) {
         </div>
       </div>
 
-      <DialogFooter>
+      <DialogFooter class="shrink-0">
         <Button variant="outline" size="sm" @click="open = false">
           {{ t("transfer.cancel") }}
         </Button>

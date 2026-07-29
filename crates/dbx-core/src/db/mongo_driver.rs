@@ -1,7 +1,7 @@
 use mongodb::{
     bson::{doc, oid::ObjectId, Bson, DateTime, Document},
-    options::{ClientOptions, GridFsBucketOptions, IndexOptions},
-    Client, Database, IndexModel,
+    options::{ClientOptions, GridFsBucketOptions, IndexOptions, UpdateModifications},
+    Client, Cursor, Database, IndexModel,
 };
 use serde::{Deserialize, Serialize};
 
@@ -12,15 +12,9 @@ use futures::{io::AsyncReadExt, io::AsyncWriteExt, TryStreamExt};
 use percent_encoding::percent_decode_str;
 use std::{collections::HashSet, time::Duration};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MongoDocumentResult {
-    pub documents: Vec<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub raw_documents: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub extended_documents: Option<Vec<serde_json::Value>>,
-    pub total: u64,
-}
+pub use super::document_result::DocumentQueryResult;
+/// Backward-compatible name for callers of Mongo-specific APIs.
+pub type MongoDocumentResult = DocumentQueryResult;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MongoDropIndexesResult {
@@ -203,6 +197,54 @@ pub async fn list_databases(client: &Client) -> Result<Vec<String>, String> {
     client.list_database_names().await.map_err(|e| e.to_string())
 }
 
+/// MongoDB collection kind from `listCollections` (not GridFS buckets).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MongoCollectionKind {
+    Collection,
+    View,
+    Timeseries,
+}
+
+impl MongoCollectionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Collection => "collection",
+            Self::View => "view",
+            Self::Timeseries => "timeseries",
+        }
+    }
+
+    pub fn from_driver_type(collection_type: &mongodb::results::CollectionType) -> Self {
+        match collection_type {
+            mongodb::results::CollectionType::View => Self::View,
+            mongodb::results::CollectionType::Timeseries => Self::Timeseries,
+            // Collection and any future non_exhaustive variants default to a renamable collection.
+            _ => Self::Collection,
+        }
+    }
+}
+
+/// Name + kind for a MongoDB collection/view/timeseries returned by full `listCollections`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MongoCollectionSpec {
+    pub name: String,
+    pub kind: MongoCollectionKind,
+}
+
+/// Full `listCollections` with type metadata (for sidebar rename gating, etc.).
+pub async fn list_collection_specs(client: &Client, database: &str) -> Result<Vec<MongoCollectionSpec>, String> {
+    let mut cursor = client.database(database).list_collections().await.map_err(|e| e.to_string())?;
+    let mut specs = Vec::new();
+    while let Some(spec) = cursor.try_next().await.map_err(|e| e.to_string())? {
+        specs.push(MongoCollectionSpec {
+            name: spec.name,
+            kind: MongoCollectionKind::from_driver_type(&spec.collection_type),
+        });
+    }
+    Ok(specs)
+}
+
+/// Name-only listing (schema, GridFS helpers, and other callers that do not need type).
 pub async fn list_collections(client: &Client, database: &str) -> Result<Vec<String>, String> {
     client.database(database).list_collection_names().await.map_err(|e| e.to_string())
 }
@@ -505,6 +547,39 @@ pub async fn drop_collection(client: &Client, database: &str, collection: &str) 
     client.database(database).collection::<Document>(collection).drop().await.map_err(|e| e.to_string())
 }
 
+/// Build the admin `renameCollection` command document for a same-database rename.
+///
+/// Collection (and database) names are identifiers and must be passed exactly as provided —
+/// do not trim or otherwise normalize them before building the namespace.
+pub fn rename_collection_command_document(database: &str, old_name: &str, new_name: &str) -> Result<Document, String> {
+    if database.is_empty() {
+        return Err("Database name is required".to_string());
+    }
+    if old_name.is_empty() {
+        return Err("Collection name is required".to_string());
+    }
+    if new_name.is_empty() {
+        return Err("New collection name is required".to_string());
+    }
+    if old_name == new_name {
+        return Err("New collection name must differ from the current name".to_string());
+    }
+    // MongoDB reserves system.* namespaces; reject them before exposing a rename that the server cannot perform.
+    if old_name.starts_with("system.") || new_name.starts_with("system.") {
+        return Err("System collections cannot be renamed".to_string());
+    }
+    Ok(doc! {
+        "renameCollection": format!("{database}.{old_name}"),
+        "to": format!("{database}.{new_name}"),
+    })
+}
+
+pub async fn rename_collection(client: &Client, database: &str, old_name: &str, new_name: &str) -> Result<(), String> {
+    let command = rename_collection_command_document(database, old_name, new_name)?;
+    client.database("admin").run_command(command).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 pub async fn list_indexes(client: &Client, database: &str, collection: &str) -> Result<Vec<IndexInfo>, String> {
     let col = client.database(database).collection::<Document>(collection);
     let mut cursor = col.list_indexes().await.map_err(|e| e.to_string())?;
@@ -562,10 +637,11 @@ pub async fn find_documents(
         _ => doc! {},
     };
 
-    let total = if filter_doc.is_empty() {
-        col.estimated_document_count().await.map_err(|e| e.to_string())?
-    } else {
+    let total_is_exact = !filter_doc.is_empty();
+    let total = if total_is_exact {
         col.count_documents(filter_doc.clone()).await.map_err(|e| e.to_string())?
+    } else {
+        col.estimated_document_count().await.map_err(|e| e.to_string())?
     };
 
     let mut find = col.find(filter_doc).skip(skip).limit(limit);
@@ -592,10 +668,16 @@ pub async fn find_documents(
     while cursor.advance().await.map_err(|e| e.to_string())? {
         let doc = cursor.deserialize_current().map_err(|e| e.to_string())?;
         documents.push(bson_to_json(&Bson::Document(doc.clone())));
-        extended_documents.push(Bson::Document(doc).into_relaxed_extjson());
+        extended_documents.push(Bson::Document(doc).into_canonical_extjson());
     }
 
-    Ok(MongoDocumentResult { documents, raw_documents: None, extended_documents: Some(extended_documents), total })
+    Ok(MongoDocumentResult {
+        documents,
+        raw_documents: None,
+        extended_documents: Some(extended_documents),
+        total,
+        total_is_exact,
+    })
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -678,7 +760,7 @@ pub async fn count_documents(
     }
 }
 
-/// Find MongoDB documents as relaxed Extended JSON for MongoDB transfer paths.
+/// Find MongoDB documents in a browser-friendly representation.
 #[allow(clippy::too_many_arguments)]
 pub async fn find_documents_extended_json(
     client: &Client,
@@ -700,10 +782,11 @@ pub async fn find_documents_extended_json(
         _ => doc! {},
     };
 
-    let total = if filter_doc.is_empty() {
-        col.estimated_document_count().await.map_err(|e| e.to_string())?
-    } else {
+    let total_is_exact = !filter_doc.is_empty();
+    let total = if total_is_exact {
         col.count_documents(filter_doc.clone()).await.map_err(|e| e.to_string())?
+    } else {
+        col.estimated_document_count().await.map_err(|e| e.to_string())?
     };
 
     let mut find = col.find(filter_doc).skip(skip).limit(limit);
@@ -726,30 +809,104 @@ pub async fn find_documents_extended_json(
     let mut cursor = find.await.map_err(|e| e.to_string())?;
 
     let mut documents = Vec::new();
+    let mut extended_documents = Vec::new();
     while cursor.advance().await.map_err(|e| e.to_string())? {
         let doc = cursor.deserialize_current().map_err(|e| e.to_string())?;
-        documents.push(Bson::Document(doc).into_relaxed_extjson());
+        let (document, extended_document) = document_json_views(doc);
+        documents.push(document);
+        extended_documents.push(extended_document);
     }
 
-    Ok(MongoDocumentResult { extended_documents: Some(documents.clone()), documents, raw_documents: None, total })
+    Ok(MongoDocumentResult {
+        extended_documents: Some(extended_documents),
+        documents,
+        raw_documents: None,
+        total,
+        total_is_exact,
+    })
 }
 
+/// Run `db.collection.aggregate(pipeline, options)`.
+///
+/// One execution model for every non-explain aggregate (empty or free-form options):
+/// build the server [`aggregate`](https://www.mongodb.com/docs/manual/reference/command/aggregate/)
+/// command and open it with [`Database::run_cursor_command`] so session-scoped getMore/killCursors
+/// stay with the driver cursor. Options are forwarded as-is (`allowDiskUse`, `cursor.batchSize`,
+/// `maxTimeMS`, collation, hint, comment, let, …).
+///
+/// `explain: true` is the only special case: the server returns a plan document (no cursor), so
+/// that path uses plain `run_command`.
+///
+/// Note: this intentionally uses the command/cursor path rather than `Collection::aggregate`, so
+/// default read/write concern inheritance matches other free-form shell options (explicit options
+/// on the command document only).
 pub async fn aggregate_documents(
     client: &Client,
     database: &str,
     collection: &str,
     pipeline_json: &str,
     max_rows: Option<usize>,
+    options_json: Option<&str>,
 ) -> Result<MongoDocumentResult, String> {
     let json: serde_json::Value =
         serde_json::from_str(pipeline_json).map_err(|e| format!("Invalid pipeline JSON: {e}"))?;
     let pipeline_values = json.as_array().ok_or_else(|| "Aggregate pipeline must be a JSON array".to_string())?;
-    let pipeline = pipeline_values
+    let pipeline_docs = pipeline_values
         .iter()
         .map(|value| json_object_to_document(value).map_err(|e| format!("Invalid pipeline stage: {e}")))
         .collect::<Result<Vec<Document>, String>>()?;
-    let col = client.database(database).collection::<Document>(collection);
-    let mut cursor = col.aggregate(pipeline).await.map_err(|e| e.to_string())?;
+
+    let options = parse_aggregate_options_document(options_json)?;
+    let (command, explain) = build_aggregate_command(collection, pipeline_docs, options)?;
+    let db = client.database(database);
+
+    if explain {
+        let result = db.run_command(command).await.map_err(|e| e.to_string())?;
+        let document = bson_to_json(&Bson::Document(result.clone()));
+        let extended = Bson::Document(result).into_relaxed_extjson();
+        return Ok(MongoDocumentResult {
+            documents: vec![document],
+            raw_documents: None,
+            extended_documents: Some(vec![extended]),
+            total: 1,
+            total_is_exact: true,
+        });
+    }
+
+    // Driver cursor owns the implicit session across aggregate + getMore + killCursors.
+    let mut cursor = db.run_cursor_command(command).await.map_err(|e| e.to_string())?;
+    drain_document_cursor(&mut cursor, max_rows).await
+}
+
+/// Build the server aggregate command document, preserving free-form options.
+/// Returns `(command, explain)` so callers branch only on the explain flag.
+fn build_aggregate_command(
+    collection: &str,
+    pipeline: Vec<Document>,
+    options: Document,
+) -> Result<(Document, bool), String> {
+    let explain = aggregate_options_explain(&options)?;
+    let pipeline_bson: Vec<Bson> = pipeline.into_iter().map(Bson::Document).collect();
+    let mut command = doc! {
+        "aggregate": collection,
+        "pipeline": pipeline_bson,
+    };
+    for (key, value) in options {
+        command.insert(key, value);
+    }
+    // Server requires `cursor` unless `explain` is true.
+    if !explain && !command.contains_key("cursor") {
+        command.insert("cursor", doc! {});
+    }
+    Ok((command, explain))
+}
+
+/// Drain a driver cursor up to `max_rows`, peeking one extra document so callers can detect
+/// truncation: when more rows exist, `total == max_rows + 1` while `documents.len() == max_rows`.
+async fn drain_document_cursor(
+    cursor: &mut Cursor<Document>,
+    max_rows: Option<usize>,
+) -> Result<MongoDocumentResult, String> {
     let max_rows = max_rows.unwrap_or(100);
     let fetch_limit = max_rows.saturating_add(1);
     let mut documents = Vec::new();
@@ -764,7 +921,73 @@ pub async fn aggregate_documents(
         documents.truncate(max_rows);
         extended_documents.truncate(max_rows);
     }
-    Ok(MongoDocumentResult { documents, raw_documents: None, extended_documents: Some(extended_documents), total })
+    Ok(MongoDocumentResult {
+        documents,
+        raw_documents: None,
+        extended_documents: Some(extended_documents),
+        total,
+        total_is_exact: true,
+    })
+}
+
+fn parse_aggregate_options_document(options_json: Option<&str>) -> Result<Document, String> {
+    let Some(raw) = options_json.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(Document::new());
+    };
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| format!("Invalid aggregate options JSON: {e}"))?;
+    if !value.is_object() {
+        return Err("Aggregate options must be a JSON object".to_string());
+    }
+    // Free-form object conversion keeps every official aggregate option (nested
+    // docs, hint strings, maxTimeMS numbers, comments, let vars, …) intact.
+    json_object_to_document(&value).map_err(|e| format!("Invalid aggregate options: {e}"))
+}
+
+fn aggregate_options_explain(options: &Document) -> Result<bool, String> {
+    match options.get("explain") {
+        None => Ok(false),
+        Some(Bson::Boolean(flag)) => Ok(*flag),
+        Some(_) => Err("aggregate options.explain must be a boolean (for example { explain: true })".to_string()),
+    }
+}
+
+/// Distinct values of a field, matching the mongo shell's `db.coll.distinct(field, filter)`:
+/// array fields contribute their elements rather than the whole array, and the server may
+/// answer from an index with a DISTINCT_SCAN. Values are returned in the `documents` slot as
+/// bare scalars, which `mongoDocumentsToQueryResult` already renders as a single column.
+pub async fn distinct(
+    client: &Client,
+    database: &str,
+    collection: &str,
+    field: &str,
+    filter: Option<&str>,
+) -> Result<MongoDocumentResult, String> {
+    if field.trim().is_empty() {
+        return Err("Distinct field name is required".to_string());
+    }
+
+    let filter_doc: Document = match filter {
+        Some(f) if !f.trim().is_empty() => {
+            let json: serde_json::Value = serde_json::from_str(f).map_err(|e| format!("Invalid filter JSON: {e}"))?;
+            json_filter_to_document(&json)?
+        }
+        _ => doc! {},
+    };
+
+    let col = client.database(database).collection::<Document>(collection);
+    let values = col.distinct(field, filter_doc).await.map_err(|e| e.to_string())?;
+    let documents = values.iter().map(bson_to_json).collect::<Vec<_>>();
+    let extended_documents = values.into_iter().map(|value| value.into_relaxed_extjson()).collect::<Vec<_>>();
+    let total = documents.len() as u64;
+
+    Ok(MongoDocumentResult {
+        documents,
+        raw_documents: None,
+        extended_documents: Some(extended_documents),
+        total,
+        total_is_exact: true,
+    })
 }
 
 pub async fn create_index(
@@ -959,7 +1182,7 @@ pub async fn update_document(
 ) -> Result<u64, String> {
     let value: serde_json::Value = serde_json::from_str(doc_json).map_err(|e| format!("Invalid JSON: {e}"))?;
     let col = client.database(database).collection::<Document>(collection);
-    let update_doc = json_object_to_document(&value).map_err(|e| format!("Invalid document: {e}"))?;
+    let update_doc = json_object_to_document_for_update(&value, None).map_err(|e| format!("Invalid document: {e}"))?;
     if is_update_operator_document(&update_doc) {
         for filter in document_id_filters(id) {
             let result = col.update_one(filter, update_doc.clone()).await.map_err(|e| e.to_string())?;
@@ -972,7 +1195,7 @@ pub async fn update_document(
 
     for filter in document_id_filters(id) {
         let current = col.find_one(filter.clone()).await.map_err(|e| e.to_string())?;
-        let mut new_doc = json_object_to_document_preserving_existing(&value, current.as_ref())
+        let mut new_doc = json_object_to_document_for_update(&value, current.as_ref())
             .map_err(|e| format!("Invalid document: {e}"))?;
         new_doc.remove("_id");
         let result = col.replace_one(filter, new_doc.clone()).await.map_err(|e| e.to_string())?;
@@ -1006,7 +1229,7 @@ pub async fn update_documents(
     let update_value: serde_json::Value =
         serde_json::from_str(update_json).map_err(|e| format!("Invalid update JSON: {e}"))?;
     let filter = json_filter_to_document(&filter_value).map_err(|e| format!("Invalid filter: {e}"))?;
-    let update = json_object_to_document(&update_value).map_err(|e| format!("Invalid update: {e}"))?;
+    let update = json_update_to_modifications(&update_value).map_err(|e| format!("Invalid update: {e}"))?;
     let array_filters = parse_update_array_filters(options_json)?;
     let col = client.database(database).collection::<Document>(collection);
     let result = if many {
@@ -1128,14 +1351,16 @@ fn single_document_result(document: Option<Document>) -> MongoDocumentResult {
         Some(document) => MongoDocumentResult {
             documents: vec![bson_to_json(&Bson::Document(document.clone()))],
             raw_documents: None,
-            extended_documents: Some(vec![Bson::Document(document).into_relaxed_extjson()]),
+            extended_documents: Some(vec![Bson::Document(document).into_canonical_extjson()]),
             total: 1,
+            total_is_exact: true,
         },
         None => MongoDocumentResult {
             documents: Vec::new(),
             raw_documents: None,
             extended_documents: Some(Vec::new()),
             total: 0,
+            total_is_exact: true,
         },
     }
 }
@@ -1153,7 +1378,7 @@ pub async fn find_one_and_update(
     let update_value: serde_json::Value =
         serde_json::from_str(update_json).map_err(|e| format!("Invalid update JSON: {e}"))?;
     let filter = json_filter_to_document(&filter_value).map_err(|e| format!("Invalid filter: {e}"))?;
-    let update = json_object_to_document(&update_value).map_err(|e| format!("Invalid update: {e}"))?;
+    let update = json_update_to_modifications(&update_value).map_err(|e| format!("Invalid update: {e}"))?;
     let options: MongoFindOneAndUpdateOptions = parse_find_and_modify_options(options_json, "findOneAndUpdate")?;
     let col = client.database(database).collection::<Document>(collection);
     let mut action = col.find_one_and_update(filter, update);
@@ -1350,12 +1575,50 @@ fn bson_document_field_to_json(key: &str, bson: &Bson) -> serde_json::Value {
     bson_to_json(bson)
 }
 
+fn bson_to_browser_json(bson: &Bson) -> serde_json::Value {
+    match bson {
+        Bson::Int64(value) if !(-9_007_199_254_740_991..=9_007_199_254_740_991).contains(value) => {
+            serde_json::json!({ "$numberLong": value.to_string() })
+        }
+        Bson::ObjectId(oid) => serde_json::json!({ "$oid": oid.to_hex() }),
+        Bson::Array(values) => serde_json::Value::Array(values.iter().map(bson_to_browser_json).collect()),
+        Bson::Document(document) => serde_json::Value::Object(
+            document.iter().map(|(key, value)| (key.clone(), bson_to_browser_json(value))).collect(),
+        ),
+        _ => bson_to_json(bson),
+    }
+}
+
+fn document_json_views(document: Document) -> (serde_json::Value, serde_json::Value) {
+    let bson = Bson::Document(document);
+    let browser = bson_to_browser_json(&bson);
+    // Derive copy JSON from the original BSON so every BSON type keeps its canonical wrapper.
+    let extended = bson.into_canonical_extjson();
+    (browser, extended)
+}
+
 /// Convert a `serde_json::Value` (JSON object) to a BSON `Document`,
 /// handling MongoDB extended JSON conventions such as `{"$oid":"..."}`.
 pub fn json_object_to_document(value: &serde_json::Value) -> Result<Document, String> {
     match json_value_to_bson(value) {
         Bson::Document(doc) => Ok(doc),
         other => Err(format!("Expected a JSON object, got {other:?}")),
+    }
+}
+
+fn json_update_to_modifications(value: &serde_json::Value) -> Result<UpdateModifications, String> {
+    match json_value_to_bson(value) {
+        Bson::Document(document) => Ok(UpdateModifications::Document(document)),
+        Bson::Array(stages) => stages
+            .into_iter()
+            .enumerate()
+            .map(|(index, stage)| match stage {
+                Bson::Document(document) => Ok(document),
+                other => Err(format!("Update pipeline stage {} must be a JSON object, got {other:?}", index + 1)),
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(UpdateModifications::Pipeline),
+        other => Err(format!("Expected a JSON object or pipeline array, got {other:?}")),
     }
 }
 
@@ -1370,19 +1633,25 @@ fn json_object_to_document_preserving_existing(
     value: &serde_json::Value,
     existing: Option<&Document>,
 ) -> Result<Document, String> {
-    match (value, existing) {
-        (serde_json::Value::Object(obj), Some(existing)) => Ok(obj
+    match value {
+        serde_json::Value::Object(obj) => obj
             .iter()
             .map(|(key, value)| {
-                let bson = existing
-                    .get(key)
-                    .map(|existing_bson| json_value_to_bson_preserving_existing(value, existing_bson))
-                    .unwrap_or_else(|| json_value_to_bson(value));
-                (key.clone(), bson)
+                json_value_to_bson_preserving_existing(value, existing.and_then(|document| document.get(key)))
+                    .map(|bson| (key.clone(), bson))
             })
-            .collect()),
+            .collect(),
         _ => json_object_to_document(value),
     }
+}
+
+/// Parse document-editor input value by value so mixed browser representations
+/// retain their BSON types.
+fn json_object_to_document_for_update(
+    value: &serde_json::Value,
+    existing: Option<&Document>,
+) -> Result<Document, String> {
+    json_object_to_document_preserving_existing(value, existing)
 }
 
 pub fn json_filter_to_document(value: &serde_json::Value) -> Result<Document, String> {
@@ -1392,36 +1661,49 @@ pub fn json_filter_to_document(value: &serde_json::Value) -> Result<Document, St
     }
 }
 
-fn json_value_to_bson_preserving_existing(value: &serde_json::Value, existing: &Bson) -> Bson {
-    if &bson_to_json(existing) == value {
-        return existing.clone();
+fn json_value_to_bson_preserving_existing(value: &serde_json::Value, existing: Option<&Bson>) -> Result<Bson, String> {
+    if let Some(existing) = existing {
+        if &bson_to_json(existing) == value {
+            return Ok(existing.clone());
+        }
     }
 
-    match (value, existing) {
-        (serde_json::Value::Array(values), Bson::Array(existing_values)) => Bson::Array(
+    match value {
+        serde_json::Value::Array(values) => {
+            let existing_values = match existing {
+                Some(Bson::Array(values)) => Some(values),
+                _ => None,
+            };
             values
                 .iter()
                 .enumerate()
                 .map(|(index, item)| {
-                    existing_values
-                        .get(index)
-                        .map(|existing_item| json_value_to_bson_preserving_existing(item, existing_item))
-                        .unwrap_or_else(|| json_value_to_bson(item))
+                    json_value_to_bson_preserving_existing(item, existing_values.and_then(|values| values.get(index)))
                 })
-                .collect(),
-        ),
-        (serde_json::Value::Object(obj), Bson::Document(existing_doc)) => Bson::Document(
+                .collect::<Result<Vec<_>, _>>()
+                .map(Bson::Array)
+        }
+        serde_json::Value::Object(obj) => {
+            if let Some(value) = parse_extended_json_value(obj)? {
+                return Ok(value);
+            }
+
+            let existing_document = match existing {
+                Some(Bson::Document(document)) => Some(document),
+                _ => None,
+            };
             obj.iter()
                 .map(|(key, item)| {
-                    let bson = existing_doc
-                        .get(key)
-                        .map(|existing_item| json_value_to_bson_preserving_existing(item, existing_item))
-                        .unwrap_or_else(|| json_value_to_bson(item));
-                    (key.clone(), bson)
+                    json_value_to_bson_preserving_existing(
+                        item,
+                        existing_document.and_then(|document| document.get(key)),
+                    )
+                    .map(|bson| (key.clone(), bson))
                 })
-                .collect(),
-        ),
-        _ => json_value_to_bson(value),
+                .collect::<Result<Document, _>>()
+                .map(Bson::Document)
+        }
+        _ => Ok(json_value_to_bson(value)),
     }
 }
 
@@ -1443,19 +1725,8 @@ fn json_value_to_bson(value: &serde_json::Value) -> Bson {
         }
         serde_json::Value::Array(arr) => Bson::Array(arr.iter().map(json_value_to_bson).collect()),
         serde_json::Value::Object(obj) => {
-            // Extended JSON: {"$oid":"..."} → BSON ObjectId
-            if obj.len() == 1 {
-                if let Some(serde_json::Value::String(hex)) = obj.get("$oid") {
-                    if let Ok(oid) = ObjectId::parse_str(hex) {
-                        return Bson::ObjectId(oid);
-                    }
-                }
-                if let Some(value) = parse_extended_json_int64(obj) {
-                    return Bson::Int64(value);
-                }
-                if let Some(date) = parse_extended_json_date(obj) {
-                    return Bson::DateTime(date);
-                }
+            if let Ok(Some(value)) = parse_extended_json_value(obj) {
+                return value;
             }
             let doc: Document = obj.iter().map(|(k, v)| (k.clone(), json_value_to_bson(v))).collect();
             Bson::Document(doc)
@@ -1463,46 +1734,49 @@ fn json_value_to_bson(value: &serde_json::Value) -> Bson {
     }
 }
 
-fn parse_mongo_shell_date(value: &str) -> Option<DateTime> {
-    let trimmed = value.trim();
-    if let Some(inner) = trimmed.strip_prefix("ISODate(").or_else(|| trimmed.strip_prefix("new Date(")) {
-        let inner = inner.strip_suffix(')')?.trim();
-        let quoted = inner
-            .strip_prefix('"')
-            .and_then(|value| value.strip_suffix('"'))
-            .or_else(|| inner.strip_prefix('\'').and_then(|value| value.strip_suffix('\'')))?;
-        return DateTime::parse_rfc3339_str(quoted).ok();
+fn parse_extended_json_value(obj: &serde_json::Map<String, serde_json::Value>) -> Result<Option<Bson>, String> {
+    let is_wrapper = match obj.len() {
+        1 => obj.keys().next().is_some_and(|key| {
+            matches!(
+                key.as_str(),
+                "$oid"
+                    | "$date"
+                    | "$numberInt"
+                    | "$numberLong"
+                    | "$numberDouble"
+                    | "$numberDecimal"
+                    | "$binary"
+                    | "$regularExpression"
+                    | "$timestamp"
+                    | "$minKey"
+                    | "$maxKey"
+                    | "$undefined"
+                    | "$symbol"
+                    | "$code"
+                    | "$dbPointer"
+                    | "$uuid"
+            )
+        }),
+        2 => obj.contains_key("$code") && obj.contains_key("$scope"),
+        _ => false,
+    };
+
+    if !is_wrapper {
+        return Ok(None);
     }
-    parse_legacy_mongo_date_display(trimmed)
+
+    Bson::try_from(serde_json::Value::Object(obj.clone())).map(Some).map_err(|error| error.to_string())
 }
 
-fn parse_legacy_mongo_date_display(value: &str) -> Option<DateTime> {
-    let (date, time) = value.split_once(' ').or_else(|| value.split_once('T'))?;
-    if date.len() != 10 || time.len() < 8 || time.len() > 12 {
-        return None;
-    }
-    if !date
-        .chars()
-        .enumerate()
-        .all(|(index, ch)| matches!(index, 4 | 7) && ch == '-' || !matches!(index, 4 | 7) && ch.is_ascii_digit())
-    {
-        return None;
-    }
-    let (seconds, millis) = time.split_once('.').unwrap_or((time, "000"));
-    if seconds.len() != 8 || millis.is_empty() || millis.len() > 3 {
-        return None;
-    }
-    if !seconds
-        .chars()
-        .enumerate()
-        .all(|(index, ch)| matches!(index, 2 | 5) && ch == ':' || !matches!(index, 2 | 5) && ch.is_ascii_digit())
-    {
-        return None;
-    }
-    if !millis.chars().all(|ch| ch.is_ascii_digit()) {
-        return None;
-    }
-    DateTime::parse_rfc3339_str(format!("{date}T{seconds}.{}Z", format!("{millis:0<3}"))).ok()
+fn parse_mongo_shell_date(value: &str) -> Option<DateTime> {
+    let trimmed = value.trim();
+    let inner = trimmed.strip_prefix("ISODate(").or_else(|| trimmed.strip_prefix("new Date("))?;
+    let inner = inner.strip_suffix(')')?.trim();
+    let quoted = inner
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .or_else(|| inner.strip_prefix('\'').and_then(|value| value.strip_suffix('\'')))?;
+    DateTime::parse_rfc3339_str(quoted).ok()
 }
 
 fn parse_extended_json_date(obj: &serde_json::Map<String, serde_json::Value>) -> Option<DateTime> {
@@ -1629,6 +1903,124 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parse_aggregate_options_document_keeps_official_fields() {
+        let doc = parse_aggregate_options_document(Some(
+            r#"{
+                "explain": true,
+                "allowDiskUse": true,
+                "cursor": { "batchSize": 25 },
+                "maxTimeMS": 1000,
+                "bypassDocumentValidation": true,
+                "collation": { "locale": "en" },
+                "hint": "status_1",
+                "comment": "agg-test",
+                "let": { "year": 2024 },
+                "readConcern": { "level": "local" }
+            }"#,
+        ))
+        .unwrap();
+        assert_eq!(doc.get_bool("explain").ok(), Some(true));
+        assert_eq!(doc.get_bool("allowDiskUse").ok(), Some(true));
+        assert_eq!(doc.get_i64("maxTimeMS").ok(), Some(1000));
+        assert_eq!(doc.get_str("hint").ok(), Some("status_1"));
+        assert_eq!(doc.get_str("comment").ok(), Some("agg-test"));
+        assert_eq!(doc.get_document("cursor").ok().and_then(|c| c.get_i64("batchSize").ok()), Some(25));
+        assert_eq!(doc.get_document("collation").ok().and_then(|c| c.get_str("locale").ok()), Some("en"));
+        assert_eq!(doc.get_document("let").ok().and_then(|c| c.get_i64("year").ok()), Some(2024));
+        assert!(aggregate_options_explain(&doc).unwrap());
+
+        let no_explain = parse_aggregate_options_document(Some(r#"{"allowDiskUse":false}"#)).unwrap();
+        assert!(!aggregate_options_explain(&no_explain).unwrap());
+
+        let err = aggregate_options_explain(
+            &parse_aggregate_options_document(Some(r#"{"explain":"executionStats"}"#)).unwrap(),
+        )
+        .unwrap_err();
+        assert!(err.contains("boolean"), "{err}");
+    }
+
+    #[test]
+    fn build_aggregate_command_adds_cursor_unless_explain() {
+        let pipeline = vec![doc! { "$match": { "active": true } }];
+        let (with_cursor, explain_flag) = build_aggregate_command(
+            "products",
+            pipeline.clone(),
+            parse_aggregate_options_document(Some(r#"{"allowDiskUse":true,"cursor":{"batchSize":1}}"#)).unwrap(),
+        )
+        .unwrap();
+        assert!(!explain_flag);
+        assert_eq!(with_cursor.get_str("aggregate").ok(), Some("products"));
+        assert_eq!(with_cursor.get_bool("allowDiskUse").ok(), Some(true));
+        assert_eq!(with_cursor.get_document("cursor").ok().and_then(|c| c.get_i64("batchSize").ok()), Some(1));
+
+        let (default_cursor, _) = build_aggregate_command(
+            "products",
+            pipeline.clone(),
+            parse_aggregate_options_document(Some(r#"{"comment":"agg"}"#)).unwrap(),
+        )
+        .unwrap();
+        assert!(default_cursor.get_document("cursor").is_ok(), "non-explain aggregate requires cursor");
+        assert_eq!(default_cursor.get_str("comment").ok(), Some("agg"));
+
+        // Empty options still produce a cursor command (single path with run_cursor_command).
+        let (empty_options, empty_explain) =
+            build_aggregate_command("products", pipeline.clone(), Document::new()).unwrap();
+        assert!(!empty_explain);
+        assert!(empty_options.get_document("cursor").is_ok());
+
+        let (explain, is_explain) = build_aggregate_command(
+            "products",
+            pipeline,
+            parse_aggregate_options_document(Some(r#"{"explain":true,"allowDiskUse":true}"#)).unwrap(),
+        )
+        .unwrap();
+        assert!(is_explain);
+        assert!(explain.get("cursor").is_none(), "explain path must not inject cursor");
+        assert_eq!(explain.get_bool("explain").ok(), Some(true));
+    }
+
+    #[test]
+    fn update_modifications_accept_document_and_pipeline() {
+        let document = json_update_to_modifications(&serde_json::json!({ "$set": { "status": "done" } })).unwrap();
+        match document {
+            mongodb::options::UpdateModifications::Document(document) => {
+                assert_eq!(document, doc! { "$set": { "status": "done" } });
+            }
+            other => panic!("expected document update, got {other:?}"),
+        }
+
+        let owner_id = ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap();
+        let pipeline = json_update_to_modifications(&serde_json::json!([
+            { "$set": { "update_date": { "$add": ["$update_date", 1000] } } },
+            { "$set": { "owner_id": { "$oid": owner_id.to_hex() } } }
+        ]))
+        .unwrap();
+        match pipeline {
+            mongodb::options::UpdateModifications::Pipeline(stages) => {
+                assert_eq!(
+                    stages,
+                    vec![
+                        doc! { "$set": { "update_date": { "$add": ["$update_date", 1000_i64] } } },
+                        doc! { "$set": { "owner_id": owner_id } },
+                    ]
+                );
+            }
+            other => panic!("expected pipeline update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_modifications_reject_invalid_shapes() {
+        let stage_error =
+            json_update_to_modifications(&serde_json::json!([{ "$set": { "status": "done" } }, "invalid"]))
+                .unwrap_err();
+        assert!(stage_error.contains("stage 2"));
+
+        let value_error = json_update_to_modifications(&serde_json::json!("invalid")).unwrap_err();
+        assert!(value_error.contains("object or pipeline array"));
+    }
+
+    #[test]
     fn update_options_parse_array_filters() {
         let filters = parse_update_array_filters(Some(r#"{"arrayFilters":[{"item.id":322678},{"item.active":true}]}"#))
             .unwrap()
@@ -1643,6 +2035,48 @@ mod tests {
 
         assert!(error.starts_with("Invalid update options:"));
         assert!(error.contains("unknown field `upsert`"));
+    }
+
+    #[test]
+    fn rename_collection_command_uses_fully_qualified_names() {
+        let command = rename_collection_command_document("app", "users", "accounts").unwrap();
+        assert_eq!(command.get_str("renameCollection").unwrap(), "app.users");
+        assert_eq!(command.get_str("to").unwrap(), "app.accounts");
+    }
+
+    #[test]
+    fn rename_collection_command_rejects_invalid_names() {
+        assert!(rename_collection_command_document("", "users", "accounts").unwrap_err().contains("Database"));
+        assert!(rename_collection_command_document("app", "", "accounts").unwrap_err().contains("Collection"));
+        assert!(rename_collection_command_document("app", "users", "").unwrap_err().contains("New collection"));
+        assert!(rename_collection_command_document("app", "users", "users").unwrap_err().contains("differ"));
+        assert!(rename_collection_command_document("app", "system.views", "views_backup")
+            .unwrap_err()
+            .contains("System collections"));
+        assert!(rename_collection_command_document("app", "users", "system.users")
+            .unwrap_err()
+            .contains("System collections"));
+    }
+
+    #[test]
+    fn rename_collection_command_preserves_identifier_whitespace() {
+        let command = rename_collection_command_document("app", " users ", " renamed ").unwrap();
+        assert_eq!(command.get_str("renameCollection").unwrap(), "app. users ");
+        assert_eq!(command.get_str("to").unwrap(), "app. renamed ");
+    }
+
+    #[test]
+    fn rename_collection_command_does_not_drop_existing_target() {
+        // Existing target names must fail at the server instead of being overwritten.
+        let command = rename_collection_command_document("app", "users", "accounts").unwrap();
+        assert!(!command.contains_key("dropTarget"));
+    }
+
+    #[test]
+    fn mongo_collection_kind_as_str_is_stable_wire_value() {
+        assert_eq!(MongoCollectionKind::Collection.as_str(), "collection");
+        assert_eq!(MongoCollectionKind::View.as_str(), "view");
+        assert_eq!(MongoCollectionKind::Timeseries.as_str(), "timeseries");
     }
 
     #[test]
@@ -1695,7 +2129,7 @@ mod tests {
     #[test]
     fn document_id_filters_try_object_id_then_string_for_hex_ids() {
         let id = "507f1f77bcf86cd799439011";
-        let filters = document_id_filters(&id);
+        let filters = document_id_filters(id);
 
         assert_eq!(filters.len(), 2);
         assert!(matches!(filters[0].get("_id"), Some(Bson::ObjectId(_))));
@@ -1705,7 +2139,7 @@ mod tests {
     #[test]
     fn document_id_filters_use_string_only_for_non_hex_ids() {
         let id = "customer-42";
-        let filters = document_id_filters(&id);
+        let filters = document_id_filters(id);
 
         assert_eq!(filters.len(), 1);
         assert!(matches!(filters[0].get("_id"), Some(Bson::String(value)) if value == id));
@@ -1850,8 +2284,38 @@ mod tests {
 
         assert_eq!(result.documents[0]["lastUpdatedDate"], serde_json::json!("ISODate(\"2025-05-06T08:35:32Z\")"));
         let extended = result.extended_documents.expect("extended documents");
-        assert_eq!(extended[0]["lastUpdatedDate"], serde_json::json!({ "$date": "2025-05-06T08:35:32Z" }));
+        assert_eq!(extended[0]["lastUpdatedDate"], serde_json::json!({ "$date": { "$numberLong": "1746520532000" } }));
         assert_eq!(extended[0]["dateText"], serde_json::json!("ISODate(\"2025-05-06T08:35:32Z\")"));
+    }
+
+    #[test]
+    fn document_json_views_keep_browser_display_and_canonical_bson_types() {
+        let date = DateTime::parse_rfc3339_str("2026-06-10T13:59:31.287Z").unwrap();
+        let (browser, extended) = document_json_views(doc! {
+            "date": date,
+            "int32": Bson::Int32(42),
+            "int64": Bson::Int64(42),
+            "unsafeInt64": Bson::Int64(2_326_645_729_978_441_729),
+        });
+
+        assert_eq!(
+            browser,
+            serde_json::json!({
+                "date": "ISODate(\"2026-06-10T13:59:31.287Z\")",
+                "int32": 42,
+                "int64": 42,
+                "unsafeInt64": { "$numberLong": "2326645729978441729" },
+            })
+        );
+        assert_eq!(
+            extended,
+            serde_json::json!({
+                "date": { "$date": { "$numberLong": "1781099971287" } },
+                "int32": { "$numberInt": "42" },
+                "int64": { "$numberLong": "42" },
+                "unsafeInt64": { "$numberLong": "2326645729978441729" },
+            })
+        );
     }
 
     #[test]
@@ -1898,7 +2362,124 @@ mod tests {
     }
 
     #[test]
-    fn bson_to_extended_json_preserves_nested_object_ids() {
+    fn browser_json_keeps_normal_scalars_readable_and_unsafe_int64_typed() {
+        let date = DateTime::parse_rfc3339_str("2026-06-10T13:59:31.287Z").unwrap();
+        let value = bson_to_browser_json(&Bson::Document(doc! {
+            "int32": Bson::Int32(42), "double": Bson::Double(3.5), "date": Bson::DateTime(date),
+            "unsafe": Bson::Int64(2_326_645_729_978_441_729),
+        }));
+        assert_eq!(value["int32"], serde_json::json!(42));
+        assert_eq!(value["double"], serde_json::json!(3.5));
+        assert_eq!(value["date"], serde_json::json!("ISODate(\"2026-06-10T13:59:31.287Z\")"));
+        assert_eq!(value["unsafe"], serde_json::json!({ "$numberLong": "2326645729978441729" }));
+    }
+
+    #[test]
+    fn browser_json_round_trips_normal_scalars_and_unsafe_int64_on_edit() {
+        let date = DateTime::parse_rfc3339_str("2026-06-10T13:59:31.287Z").unwrap();
+        let existing = doc! {
+            "name": "before",
+            "int32": Bson::Int32(42),
+            "double": Bson::Double(3.5),
+            "date": Bson::DateTime(date),
+            "unsafe": Bson::Int64(2_326_645_729_978_441_729),
+        };
+        let mut edited = bson_to_browser_json(&Bson::Document(existing.clone()));
+        edited["name"] = serde_json::json!("after");
+        let round_tripped = json_object_to_document_for_update(&edited, Some(&existing)).unwrap();
+
+        assert_eq!(round_tripped.get_str("name").unwrap(), "after");
+        assert!(matches!(round_tripped.get("int32"), Some(Bson::Int32(42))));
+        assert!(matches!(round_tripped.get("double"), Some(Bson::Double(value)) if *value == 3.5));
+        assert!(matches!(round_tripped.get("date"), Some(Bson::DateTime(value)) if *value == date));
+        assert!(matches!(round_tripped.get("unsafe"), Some(Bson::Int64(2_326_645_729_978_441_729))));
+    }
+
+    #[test]
+    fn browser_json_round_trips_mixed_bson_types_when_editing_an_unrelated_field() {
+        let object_id = ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap();
+        let date = DateTime::parse_rfc3339_str("2026-06-10T13:59:31.287Z").unwrap();
+        let existing = doc! {
+            "_id": Bson::ObjectId(object_id),
+            "name": "before",
+            "date": Bson::DateTime(date),
+            "unsafe": Bson::Int64(2_326_645_729_978_441_729),
+        };
+        let mut edited = bson_to_browser_json(&Bson::Document(existing.clone()));
+        assert_eq!(edited["_id"], serde_json::json!({ "$oid": "507f1f77bcf86cd799439011" }));
+        assert_eq!(edited["date"], serde_json::json!("ISODate(\"2026-06-10T13:59:31.287Z\")"));
+        assert_eq!(edited["unsafe"], serde_json::json!({ "$numberLong": "2326645729978441729" }));
+
+        edited["name"] = serde_json::json!("after");
+        let round_tripped = json_object_to_document_for_update(&edited, None).unwrap();
+
+        assert_eq!(round_tripped.get_str("name").unwrap(), "after");
+        assert!(matches!(
+            round_tripped.get("_id"),
+            Some(Bson::ObjectId(value)) if *value == object_id
+        ));
+        assert!(matches!(round_tripped.get("date"), Some(Bson::DateTime(value)) if *value == date));
+        assert!(matches!(round_tripped.get("unsafe"), Some(Bson::Int64(2_326_645_729_978_441_729))));
+    }
+
+    #[test]
+    fn document_update_rejects_invalid_extended_json_wrapper() {
+        let edited = serde_json::json!({
+            "unsafe": { "$numberLong": "not-an-integer" },
+        });
+
+        assert!(json_object_to_document_for_update(&edited, None).is_err());
+    }
+
+    #[test]
+    fn document_update_parses_wrapper_when_replacing_an_existing_document_value() {
+        let object_id = ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap();
+        let existing = doc! {
+            "value": { "kind": "plain" },
+        };
+        let edited = serde_json::json!({
+            "value": { "$oid": "507f1f77bcf86cd799439011" },
+        });
+
+        let updated = json_object_to_document_for_update(&edited, Some(&existing)).unwrap();
+
+        assert!(matches!(updated.get("value"), Some(Bson::ObjectId(value)) if *value == object_id));
+    }
+
+    #[test]
+    fn document_update_decodes_uuid_wrapper_per_value() {
+        let uuid = serde_json::json!({ "$uuid": "00112233-4455-6677-8899-aabbccddeeff" });
+        let expected = Bson::try_from(uuid.clone()).unwrap();
+        let edited = serde_json::json!({
+            "name": "after",
+            "uuid": uuid,
+        });
+
+        let updated = json_object_to_document_for_update(&edited, None).unwrap();
+
+        assert_eq!(updated.get("uuid"), Some(&expected));
+    }
+
+    #[test]
+    fn browser_json_filters_decode_normal_scalars_and_unsafe_int64() {
+        let filter = serde_json::json!({
+            "int32": 42,
+            "double": 3.5,
+            "date": "ISODate(\"2026-06-10T13:59:31.287Z\")",
+            "unsafe": { "$numberLong": "2326645729978441729" },
+        });
+        let document = json_filter_to_document(&filter).unwrap();
+
+        assert!(matches!(document.get("int32"), Some(Bson::Int64(42))));
+        assert!(matches!(document.get("double"), Some(Bson::Double(value)) if *value == 3.5));
+        assert!(
+            matches!(document.get("date"), Some(Bson::DateTime(value)) if value.timestamp_millis() == 1_781_099_971_287)
+        );
+        assert!(matches!(document.get("unsafe"), Some(Bson::Int64(2_326_645_729_978_441_729))));
+    }
+
+    #[test]
+    fn canonical_extended_json_preserves_nested_object_ids() {
         let oid = ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap();
         let nested_oid = ObjectId::parse_str("507f191e810c19729de860ea").unwrap();
         let value = Bson::Document(doc! {
@@ -1906,7 +2487,7 @@ mod tests {
             "owner": { "id": Bson::ObjectId(nested_oid) },
             "tags": [Bson::ObjectId(nested_oid)],
         })
-        .into_relaxed_extjson();
+        .into_canonical_extjson();
 
         assert_eq!(
             value,
@@ -1916,6 +2497,19 @@ mod tests {
                 "tags": [{ "$oid": "507f191e810c19729de860ea" }],
             })
         );
+    }
+
+    #[test]
+    fn canonical_extended_json_round_trips_unsafe_int64() {
+        let original = doc! {
+            "counter": Bson::Int64(2_326_645_729_978_441_729),
+        };
+        let extended_json = Bson::Document(original.clone()).into_canonical_extjson();
+
+        assert_eq!(extended_json, serde_json::json!({ "counter": { "$numberLong": "2326645729978441729" } }));
+
+        let round_tripped = json_object_to_document_extended_json(&extended_json).unwrap();
+        assert_eq!(round_tripped, original);
     }
 
     #[test]
@@ -2219,16 +2813,21 @@ mod tests {
     }
 
     #[test]
-    fn json_object_to_document_parses_legacy_date_display_strings() {
+    fn json_object_to_document_preserves_date_shaped_strings() {
         let value = serde_json::json!({
-            "created_at": "2025-08-14 02:25:43.718",
+            "$set": {
+                "create_time": "2025-04-01 19:46:03",
+                "nested": { "updated": "2025-08-14T02:25:43" },
+                "items": ["2025-08-14 02:25:43"],
+            }
         });
         let doc = json_object_to_document(&value).unwrap();
+        let set = doc.get_document("$set").unwrap();
 
-        assert!(matches!(
-            doc.get("created_at"),
-            Some(Bson::DateTime(value)) if value.timestamp_millis() == 1_755_138_343_718
-        ));
+        assert_eq!(set.get_str("create_time").unwrap(), "2025-04-01 19:46:03");
+        assert_eq!(set.get_document("nested").unwrap().get_str("updated").unwrap(), "2025-08-14T02:25:43");
+        assert_eq!(set.get_array("items").unwrap()[0].as_str().unwrap(), "2025-08-14 02:25:43");
+        assert!(is_update_operator_document(&doc));
     }
 
     #[test]

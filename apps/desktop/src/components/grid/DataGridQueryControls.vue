@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import DataGridConditionEditor from "@/components/grid/DataGridConditionEditor.vue";
 import DataGridFilterBuilder from "@/components/grid/DataGridFilterBuilder.vue";
+import type { DataGridConditionColumnOption } from "@/composables/useDataGridConditionEditor";
 import type { DataGridStructuredFilterRule } from "@/composables/useDataGridFilterBuilder";
 import type { DataGridConditionHistoryScope } from "@/lib/dataGrid/dataGridConditionHistory";
 import type { DataGridContextFilterMode } from "@/lib/dataGrid/dataGridSql";
@@ -22,6 +23,8 @@ const props = defineProps<{
   whereInput: string;
   orderByInput: string;
   columns: readonly string[];
+  conditionColumns: readonly DataGridConditionColumnOption[];
+  identifierQuote?: string;
   historyScope: DataGridConditionHistoryScope;
   canUseWhereSearch: boolean;
   compact: boolean;
@@ -37,7 +40,6 @@ const props = defineProps<{
   modeOptions: Array<{ value: DataGridContextFilterMode; labelKey: string }>;
   columnSearch: string;
   applyWhere: (value?: string) => void | boolean | Promise<void | boolean>;
-  clearWhere: () => void | Promise<void>;
   applyOrderBy: (value?: string) => void | boolean | Promise<void | boolean>;
   clearOrderBy: () => void | Promise<void>;
 }>();
@@ -106,6 +108,10 @@ function updateRule(id: string, patch: Partial<DataGridStructuredFilterRule>) {
   emit("updateRule", id, patch);
 }
 
+function clearWhere() {
+  emit("clearFilters");
+}
+
 onUnmounted(onResizeEnd);
 </script>
 
@@ -116,7 +122,7 @@ onUnmounted(onResizeEnd);
         <PopoverTrigger as-child>
           <button
             type="button"
-            class="relative flex h-5 w-5 shrink-0 items-center justify-center rounded border text-[11px] font-medium transition-colors"
+            class="relative flex h-5 w-5 -translate-x-1 shrink-0 items-center justify-center rounded border text-[11px] font-medium transition-colors"
             :class="filterButtonActive ? 'border-primary/40 bg-primary/10 text-primary hover:bg-primary/15' : 'border-border/70 text-muted-foreground hover:bg-accent hover:text-foreground'"
             :disabled="!canUseWhereSearch"
             @click="emit('ensureRule')"
@@ -125,7 +131,7 @@ onUnmounted(onResizeEnd);
             <span v-if="filterButtonCount" class="absolute -right-1 -top-1 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-primary px-1 text-[9px] leading-none text-primary-foreground">{{ filterButtonCount }}</span>
           </button>
         </PopoverTrigger>
-        <PopoverContent align="start" class="w-[380px] max-w-[calc(100vw-24px)] gap-3 p-3">
+        <PopoverContent align="start" class="w-[480px] max-w-[calc(100vw-24px)] gap-3 p-3">
           <div class="flex items-center justify-between gap-3">
             <div class="text-xs font-medium text-foreground">{{ t("grid.filter") }}</div>
             <Button variant="ghost" size="sm" class="h-7 px-2 text-xs" @click="emit('addRule')"><Plus class="mr-1 h-3.5 w-3.5" />{{ t("grid.filterBuilderAddRule") }}</Button>
@@ -160,7 +166,6 @@ onUnmounted(onResizeEnd);
             :column-search="columnSearch"
             :disabled="!canUseWhereSearch"
             :show-header="false"
-            :show-footer="false"
             @add="emit('addRule')"
             @apply="emit('applyFilters')"
             @reset="emit('resetFilters')"
@@ -174,7 +179,8 @@ onUnmounted(onResizeEnd);
       <DataGridConditionEditor
         :model-value="whereInput"
         kind="where"
-        :columns="columns"
+        :columns="conditionColumns"
+        :identifier-quote="identifierQuote"
         :history-scope="historyScope"
         placeholder="WHERE"
         :history-empty-text="t('grid.conditionHistoryEmpty')"
@@ -199,7 +205,8 @@ onUnmounted(onResizeEnd);
       <DataGridConditionEditor
         :model-value="orderByInput"
         kind="orderBy"
-        :columns="columns"
+        :columns="conditionColumns"
+        :identifier-quote="identifierQuote"
         :history-scope="historyScope"
         placeholder="ORDER BY"
         :history-empty-text="t('grid.conditionHistoryEmpty')"

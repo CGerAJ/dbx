@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, ref, nextTick, onBeforeUnmount, onMounted } from "vue";
+import { computed, ref, shallowRef, nextTick, onBeforeUnmount, onMounted, watch } from "vue";
+import type { CalendarDateTime } from "@internationalized/date";
 import { useI18n } from "vue-i18n";
 import { onClickOutside } from "@vueuse/core";
 import { DynamicScroller, DynamicScrollerItem, RecycleScroller } from "vue-virtual-scroller";
@@ -8,23 +9,25 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Switch } from "@/components/ui/switch";
-import { Sheet, SheetContent, SheetFooter, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import DateTimePicker from "@/components/ui/date-time-picker/DateTimePicker.vue";
+import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
 import JsonTree from "@/components/common/JsonTree.vue";
 import RedisJsonEditor from "@/components/redis/RedisJsonEditor.vue";
 import * as api from "@/lib/backend/api";
-import type { RedisBlob, RedisHashItem, RedisKeyInfo, RedisListItem, RedisSetItem, RedisStreamEntry, RedisValue, RedisZsetItem } from "@/lib/backend/api";
+import type { RedisBlob, RedisHashItem, RedisKeyInfo, RedisListItem, RedisSetItem, RedisStreamConsumer, RedisStreamEntry, RedisStreamGroup, RedisStreamPendingEntry, RedisValue, RedisZsetItem } from "@/lib/backend/api";
 import { useToast } from "@/composables/useToast";
 import { useTheme } from "@/composables/useTheme";
 import { useEditorFontFamilyStyle } from "@/composables/useEditorFontFamilyStyle";
 import { createShikiJsonHighlighter, type JsonHighlighter } from "@/lib/common/shikiJsonHighlighter";
 import { copyToClipboard } from "@/lib/common/clipboard";
 import { formatTtl } from "@/lib/common/ttlFormat";
-import { computeAutoRefreshTick, computeDisplayTtl, shouldStopAutoRefresh } from "@/lib/redis/redisAutoRefresh";
+import { computeAutoRefreshTick, computeDisplayTtl, computeTtlForExpiryEdit, shouldStopAutoRefresh } from "@/lib/redis/redisAutoRefresh";
 import {
   canRenderRedisValueFormat,
   canEditRedisMemberDetail,
-  clampRedisMemberDetailSheetWidth,
   formatRedisMemberDetail,
   getRedisMemberSelectionKey,
   isRedisBlob,
@@ -34,6 +37,7 @@ import {
   redisCollectionPageItems,
   redisJsonValueText,
   normalizeRedisJsonDraft,
+  redisClipboardSafeText,
   redisMemberCopyText,
   redisValueCopyText,
   redisValueCollectionItems,
@@ -42,9 +46,13 @@ import {
   type RedisCollectionItem,
   type RedisValueFormat,
 } from "@/lib/redis/redisValuePresentation";
+import { canFullHighlightRedisText, findRedisTextMatches, nextRedisSearchMatchIndex, REDIS_VALUE_SEARCH_MATCH_LIMIT, renderRedisTextSearchHtml, redisValueSearchStatus } from "@/lib/redis/redisValueSearch";
+import TextContentSearchBar from "@/components/common/TextContentSearchBar.vue";
 import { formatJsonSource } from "@/lib/common/safeJsonFormat";
+import { unixSecondsToCalendarDateTime } from "@/components/ui/date-time-picker/dateTimePicker";
+import { applyRedisExpiryPolicy, type RedisExpiryMode, redisExpiryModeForTtl, validateRedisExpiry } from "@/lib/redis/redisExpiry";
 
-const { t } = useI18n();
+const { t, locale } = useI18n();
 const { toast } = useToast();
 const { isDark } = useTheme();
 const editorFontFamilyStyle = useEditorFontFamilyStyle();
@@ -57,7 +65,12 @@ const props = defineProps<{
   metadata?: RedisKeyInfo | null;
 }>();
 
-const emit = defineEmits<{ deleted: []; loaded: [value: RedisValue] }>();
+const redisExpiryTransport = {
+  setTtl: api.redisSetTtl,
+  setExpireAt: api.redisSetExpireAt,
+};
+
+const emit = defineEmits<{ deleted: [keyRaw: string]; loaded: [value: RedisValue] }>();
 
 const REDIS_JSON_WRAP_STORAGE_KEY = "dbx-redis-json-word-wrap";
 const REDIS_VALUE_FORMAT_STORAGE_KEY = "dbx-redis-value-format";
@@ -68,6 +81,37 @@ const data = ref<RedisValue | null>(null);
 const loading = ref(false);
 const loadingMore = ref(false);
 let loadRequestId = 0;
+const streamTab = ref<"entries" | "groups">("entries");
+const streamGroups = ref<RedisStreamGroup[]>([]);
+const streamGroupsLoaded = ref(false);
+const streamGroupsLoading = ref(false);
+const streamGroupsError = ref("");
+const selectedStreamGroup = ref<RedisStreamGroup | null>(null);
+const selectedStreamConsumer = ref<RedisStreamConsumer | null>(null);
+const streamConsumers = ref<RedisStreamConsumer[]>([]);
+const streamConsumersLoading = ref(false);
+const streamConsumersError = ref("");
+const streamPendingEntries = ref<RedisStreamPendingEntry[]>([]);
+const streamPendingCursor = ref<string | undefined>();
+const streamPendingLoading = ref(false);
+const streamPendingLoadingMore = ref(false);
+const streamPendingError = ref("");
+const streamDateTimeFormatter = computed(
+  () =>
+    new Intl.DateTimeFormat(locale.value, {
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    }),
+);
+let streamGroupsRequestId = 0;
+let streamGroupDetailRequestId = 0;
+let streamConsumersRequestId = 0;
+let streamPendingRequestId = 0;
 const editValue = ref("");
 const savingString = ref(false);
 const savingJson = ref(false);
@@ -77,12 +121,19 @@ const newScore = ref("");
 const showDeleteConfirm = ref(false);
 const showMemberDetail = ref(false);
 const editingTtl = ref(false);
+const savingTtl = ref(false);
+const ttlExpiryMode = ref<RedisExpiryMode>("none");
 const ttlInput = ref("");
+const ttlExpireAt = shallowRef<CalendarDateTime | null>(null);
 const ttlInputEl = ref<InstanceType<typeof Input>>();
 const editTtlWrapper = ref<HTMLElement>();
-onClickOutside(editTtlWrapper, () => {
-  if (editingTtl.value) cancelEditTtl();
-});
+onClickOutside(
+  editTtlWrapper,
+  () => {
+    if (editingTtl.value && !savingTtl.value) cancelEditTtl();
+  },
+  { ignore: ["[data-date-time-picker-content]", "[data-redis-expiry-mode-content]"] },
+);
 const collectionItems = ref<RedisCollectionItem[]>([]);
 const scanCursor = ref<number | undefined>(undefined);
 const selectedMemberTitle = ref("");
@@ -92,8 +143,6 @@ const selectedMemberContext = ref<RedisMemberContext | null>(null);
 const isEditingMember = ref(false);
 const savingMember = ref(false);
 const memberEditValue = ref("");
-const memberDetailSheetWidth = ref(420);
-const isResizingMemberSheet = ref(false);
 const hashTableRef = ref<HTMLElement | null>(null);
 const hashFieldWidth = ref(280);
 const isResizingHashColumns = ref(false);
@@ -161,9 +210,27 @@ function stopAutoRefresh() {
 
 const hashSortBy = ref<"field" | "value" | null>(null);
 const hashSortDir = ref<"asc" | "desc">("asc");
+/**
+ * In-content find (Ctrl+F) for:
+ * - Redis STRING keys
+ * - Member detail dialog (set/list/hash/zset field values — string-like body)
+ * Hash field list keeps its own toolbar search. No collection-list filter.
+ */
+const valueSearchOpen = ref(false);
+const valueSearchQuery = ref("");
+const valueSearchMatchIndex = ref(0);
+const valueSearchHasNavigated = ref(false);
 const hashSearchQuery = ref("");
 const activeHashSearchQuery = ref("");
 const searchLoading = ref(false);
+const valueSearchBarRef = ref<{ focusInput: (select?: boolean) => void } | null>(null);
+type JsonEditorHandle = { openSearch: () => boolean; selectRange?: (from: number, to: number, options?: { focus?: boolean }) => boolean };
+const stringJsonEditorRef = ref<JsonEditorHandle | null>(null);
+const redisJsonEditorRef = ref<JsonEditorHandle | null>(null);
+const memberJsonEditorRef = ref<JsonEditorHandle | null>(null);
+const stringTextareaRef = ref<HTMLTextAreaElement | null>(null);
+const memberTextareaRef = ref<HTMLTextAreaElement | null>(null);
+const valueViewerSearchActive = ref(false);
 
 function toggleHashSort(column: "field" | "value") {
   if (hashSortBy.value === column && hashSortDir.value === "desc") {
@@ -307,10 +374,39 @@ const zsetRows = computed<RedisCollectionRow<RedisZsetItem>[]>(() =>
     : [],
 );
 
+const usesJsonEditorForMain = computed(() => (isStringLikeKind.value && stringValueView.value === "json" && Boolean(stringValueDetail.value?.json)) || redisKind.value === "json");
+const usesJsonEditorForMember = computed(() => isEditingHashJson.value);
+/** True when Ctrl+F content find applies (STRING, RedisJSON, or open member detail). */
+const valueSearchSupported = computed(() => showMemberDetail.value || isStringLikeKind.value || redisKind.value === "json");
+const contentSearchText = computed(() => {
+  if (showMemberDetail.value) {
+    if (isEditingMember.value || isEditingHashJson.value) return memberEditValue.value;
+    return detailTextForFormat(selectedMemberDetail.value, memberValueView.value);
+  }
+  if (redisKind.value === "json") return editValue.value;
+  if (!isStringLikeKind.value || !stringValueDetail.value) return "";
+  if (stringValueView.value === "json" && stringValueDetail.value.json) return editValue.value;
+  if (stringValueView.value === "utf8" && canEditCurrentStringFormat.value) return editValue.value;
+  return detailTextForFormat(stringValueDetail.value, stringValueView.value);
+});
+const contentSearchMatches = computed(() => findRedisTextMatches(contentSearchText.value, valueSearchQuery.value));
+const contentSearchMatchLimited = computed(() => contentSearchMatches.value.length >= REDIS_VALUE_SEARCH_MATCH_LIMIT);
+const contentSearchActiveIndex = computed(() => {
+  if (contentSearchMatches.value.length === 0) return 0;
+  return Math.min(valueSearchMatchIndex.value, contentSearchMatches.value.length - 1);
+});
+const valueSearchStatus = computed(() => redisValueSearchStatus(contentSearchActiveIndex.value, contentSearchMatches.value.length, contentSearchMatchLimited.value));
+const valueSearchMatchCount = computed(() => contentSearchMatches.value.length);
+const contentSearchHighlightedHtml = computed(() => {
+  if (!valueSearchOpen.value || !valueSearchQuery.value) return "";
+  return renderRedisTextSearchHtml(contentSearchText.value, valueSearchQuery.value, contentSearchActiveIndex.value);
+});
+const canHighlightContentSearch = computed(() => valueSearchOpen.value && Boolean(valueSearchQuery.value) && canFullHighlightRedisText(contentSearchText.value.length));
+const canHighlightStringSurface = computed(() => canHighlightContentSearch.value && !showMemberDetail.value);
+const canHighlightMemberSurface = computed(() => canHighlightContentSearch.value && showMemberDetail.value);
+
 let hashSearchTimer: ReturnType<typeof setTimeout> | null = null;
 let hashSearchRequestId = 0;
-let memberSheetResizeStartX = 0;
-let memberSheetResizeStartWidth = 0;
 let hashResizeStartX = 0;
 let hashResizeStartWidth = 0;
 let zsetResizeStartX = 0;
@@ -337,6 +433,256 @@ type RedisStreamRow = {
   index: number;
   entry: RedisStreamEntry;
 };
+
+function isSelectedStreamGroup(group: RedisStreamGroup, requestId = streamGroupDetailRequestId): boolean {
+  return requestId === streamGroupDetailRequestId && selectedStreamGroup.value?.name.raw_base64 === group.name.raw_base64;
+}
+
+function resetStreamGroupDetail() {
+  streamGroupDetailRequestId++;
+  streamConsumersRequestId++;
+  streamPendingRequestId++;
+  selectedStreamGroup.value = null;
+  selectedStreamConsumer.value = null;
+  streamConsumers.value = [];
+  streamConsumersLoading.value = false;
+  streamConsumersError.value = "";
+  streamPendingEntries.value = [];
+  streamPendingCursor.value = undefined;
+  streamPendingLoading.value = false;
+  streamPendingLoadingMore.value = false;
+  streamPendingError.value = "";
+}
+
+function resetStreamMonitoring() {
+  streamGroupsRequestId++;
+  resetStreamGroupDetail();
+  streamTab.value = "entries";
+  streamGroups.value = [];
+  streamGroupsLoaded.value = false;
+  streamGroupsLoading.value = false;
+  streamGroupsError.value = "";
+}
+
+async function loadStreamGroups(force = false): Promise<boolean> {
+  if (redisKind.value !== "stream") return false;
+  if (!force && (streamGroupsLoaded.value || streamGroupsLoading.value)) return streamGroupsLoaded.value;
+
+  const requestId = ++streamGroupsRequestId;
+  streamGroupsLoading.value = true;
+  streamGroupsError.value = "";
+  try {
+    const groups = await api.redisGetStreamGroups(props.connectionId, props.db, props.keyRaw);
+    if (requestId !== streamGroupsRequestId || redisKind.value !== "stream") return false;
+
+    streamGroups.value = groups;
+    streamGroupsLoaded.value = true;
+    const selected = selectedStreamGroup.value;
+    if (selected && !groups.some((group) => group.name.raw_base64 === selected.name.raw_base64)) {
+      resetStreamGroupDetail();
+    }
+    return true;
+  } catch (error) {
+    if (requestId === streamGroupsRequestId) streamGroupsError.value = errorMessage(error);
+    return false;
+  } finally {
+    if (requestId === streamGroupsRequestId) streamGroupsLoading.value = false;
+  }
+}
+
+async function loadStreamConsumers(group: RedisStreamGroup, requestId: number) {
+  if (!isSelectedStreamGroup(group, requestId)) return;
+  const consumerRequestId = ++streamConsumersRequestId;
+  streamConsumersLoading.value = true;
+  streamConsumersError.value = "";
+  try {
+    const consumers = await api.redisGetStreamConsumers(props.connectionId, props.db, props.keyRaw, group.name.raw_base64);
+    if (!isSelectedStreamGroup(group, requestId) || consumerRequestId !== streamConsumersRequestId) return;
+    streamConsumers.value = consumers;
+    const selectedConsumerRaw = selectedStreamConsumer.value?.name.raw_base64;
+    if (selectedConsumerRaw) {
+      const selectedConsumer = consumers.find((consumer) => consumer.name.raw_base64 === selectedConsumerRaw);
+      if (selectedConsumer) {
+        selectedStreamConsumer.value = selectedConsumer;
+      } else {
+        // A refresh can race with XGROUP DELCONSUMER. Do not leave a stale
+        // consumer detail open or allow its pending request to update the view.
+        resetStreamConsumerDetail();
+      }
+    }
+  } catch (error) {
+    if (isSelectedStreamGroup(group, requestId) && consumerRequestId === streamConsumersRequestId) {
+      streamConsumersError.value = errorMessage(error);
+    }
+  } finally {
+    if (isSelectedStreamGroup(group, requestId) && consumerRequestId === streamConsumersRequestId) {
+      streamConsumersLoading.value = false;
+    }
+  }
+}
+
+async function loadStreamPendingPage(group: RedisStreamGroup, cursor?: string, append = false, requestId = streamGroupDetailRequestId) {
+  if (!isSelectedStreamGroup(group, requestId)) return;
+  const pendingRequestId = ++streamPendingRequestId;
+  const consumerRaw = selectedStreamConsumer.value?.name.raw_base64;
+  if (append) {
+    streamPendingLoadingMore.value = true;
+  } else {
+    streamPendingLoading.value = true;
+    streamPendingError.value = "";
+    streamPendingEntries.value = [];
+    streamPendingCursor.value = undefined;
+  }
+
+  try {
+    const page = consumerRaw ? await api.redisGetStreamPending(props.connectionId, props.db, props.keyRaw, group.name.raw_base64, cursor, consumerRaw) : await api.redisGetStreamPending(props.connectionId, props.db, props.keyRaw, group.name.raw_base64, cursor);
+    if (!isSelectedStreamGroup(group, requestId) || pendingRequestId !== streamPendingRequestId || selectedStreamConsumer.value?.name.raw_base64 !== consumerRaw) return;
+    streamPendingEntries.value = append ? [...streamPendingEntries.value, ...page.entries] : page.entries;
+    streamPendingCursor.value = page.next_cursor;
+  } catch (error) {
+    if (isSelectedStreamGroup(group, requestId) && pendingRequestId === streamPendingRequestId && selectedStreamConsumer.value?.name.raw_base64 === consumerRaw) {
+      streamPendingError.value = errorMessage(error);
+    }
+  } finally {
+    if (isSelectedStreamGroup(group, requestId) && pendingRequestId === streamPendingRequestId && selectedStreamConsumer.value?.name.raw_base64 === consumerRaw) {
+      if (append) streamPendingLoadingMore.value = false;
+      else streamPendingLoading.value = false;
+    }
+  }
+}
+
+function selectStreamGroup(group: RedisStreamGroup, reload = false) {
+  if (!reload && selectedStreamGroup.value?.name.raw_base64 === group.name.raw_base64) return;
+
+  const preservedConsumer = reload && selectedStreamGroup.value?.name.raw_base64 === group.name.raw_base64 ? selectedStreamConsumer.value : null;
+  streamGroupDetailRequestId++;
+  streamConsumersRequestId++;
+  streamPendingRequestId++;
+  const requestId = streamGroupDetailRequestId;
+  selectedStreamGroup.value = group;
+  selectedStreamConsumer.value = preservedConsumer;
+  streamConsumers.value = [];
+  streamConsumersLoading.value = false;
+  streamConsumersError.value = "";
+  streamPendingEntries.value = [];
+  streamPendingCursor.value = undefined;
+  streamPendingLoading.value = false;
+  streamPendingLoadingMore.value = false;
+  streamPendingError.value = "";
+  void loadStreamConsumers(group, requestId);
+  if (selectedStreamConsumer.value) void loadStreamPendingPage(group, undefined, false, requestId);
+}
+
+function selectStreamConsumer(consumer: RedisStreamConsumer) {
+  const group = selectedStreamGroup.value;
+  if (!group || selectedStreamConsumer.value?.name.raw_base64 === consumer.name.raw_base64) return;
+
+  streamPendingRequestId++;
+  selectedStreamConsumer.value = consumer;
+  streamPendingEntries.value = [];
+  streamPendingCursor.value = undefined;
+  streamPendingLoading.value = false;
+  streamPendingLoadingMore.value = false;
+  streamPendingError.value = "";
+  void loadStreamPendingPage(group, undefined, false, streamGroupDetailRequestId);
+}
+
+function resetStreamConsumerDetail() {
+  if (!selectedStreamConsumer.value) return;
+
+  streamPendingRequestId++;
+  selectedStreamConsumer.value = null;
+  streamPendingEntries.value = [];
+  streamPendingCursor.value = undefined;
+  streamPendingLoading.value = false;
+  streamPendingLoadingMore.value = false;
+  streamPendingError.value = "";
+}
+
+function retryStreamGroups() {
+  void loadStreamGroups(true);
+}
+
+function retryStreamConsumers() {
+  const group = selectedStreamGroup.value;
+  if (!group) return;
+  void loadStreamConsumers(group, streamGroupDetailRequestId);
+}
+
+function retryStreamPending() {
+  const group = selectedStreamGroup.value;
+  if (!group || !selectedStreamConsumer.value) return;
+  void loadStreamPendingPage(group, undefined, false, streamGroupDetailRequestId);
+}
+
+function loadMoreStreamPending() {
+  const group = selectedStreamGroup.value;
+  const cursor = streamPendingCursor.value;
+  if (!group || !selectedStreamConsumer.value || !cursor || streamPendingLoading.value || streamPendingLoadingMore.value) return;
+  void loadStreamPendingPage(group, cursor, true, streamGroupDetailRequestId);
+}
+
+async function refreshValueAndStreamGroups() {
+  const refreshGroups = redisKind.value === "stream" && streamTab.value === "groups";
+  const selectedGroupRaw = selectedStreamGroup.value?.name.raw_base64;
+  try {
+    const applied = await load();
+    if (!applied || !refreshGroups || redisKind.value !== "stream") return;
+    const loaded = await loadStreamGroups(true);
+    if (!loaded || !selectedGroupRaw) return;
+    const selected = streamGroups.value.find((group) => group.name.raw_base64 === selectedGroupRaw);
+    if (selected) selectStreamGroup(selected, true);
+  } catch (error) {
+    toast(errorMessage(error), 3000);
+  }
+}
+
+function streamMetricInteger(value: number | string | undefined): bigint | null {
+  if (typeof value === "number") return Number.isSafeInteger(value) && value >= 0 ? BigInt(value) : null;
+  if (typeof value !== "string" || !/^\d+$/.test(value)) return null;
+  try {
+    return BigInt(value);
+  } catch {
+    return null;
+  }
+}
+
+function formatStreamMetric(value: number | string | undefined): string {
+  const integer = streamMetricInteger(value);
+  return integer == null ? "-" : integer.toLocaleString();
+}
+
+function formatStreamDuration(value: number | string | undefined): string {
+  const integer = streamMetricInteger(value);
+  if (integer == null) return "-";
+  if (integer > BigInt(Number.MAX_SAFE_INTEGER)) return `${integer.toLocaleString()} ms`;
+
+  const milliseconds = Number(integer);
+  if (milliseconds < 1_000) return `${milliseconds.toLocaleString()} ms`;
+  const seconds = milliseconds / 1_000;
+  if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)} s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ${Math.floor(seconds % 60)}s`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ${minutes % 60}m`;
+  return `${Math.floor(hours / 24)}d ${hours % 24}h`;
+}
+
+function formatStreamDurationTitle(value: number | string | undefined): string {
+  const formatted = formatStreamMetric(value);
+  return formatted === "-" ? formatted : `${formatted} ms`;
+}
+
+function formatStreamDateTime(timestamp: number): string {
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return "-";
+  return streamDateTimeFormatter.value.format(new Date(timestamp));
+}
+
+function formatStreamLastDelivery(value: number | string | undefined): string {
+  const idle = streamMetricInteger(value);
+  if (idle == null || idle > BigInt(Number.MAX_SAFE_INTEGER)) return "-";
+  return formatStreamDateTime(Date.now() - Number(idle));
+}
 
 function collectionCountLabel(kind: "items" | "fields" | "members", loaded: number, total?: number | null) {
   if (total == null || total === loaded) return t(`redis.${kind}`, { count: loaded });
@@ -548,7 +894,29 @@ async function load(options: { selectDefaultMember?: boolean; preserveDraft?: bo
   loading.value = true;
   try {
     const loadedValue = await api.redisGetValue(props.connectionId, props.db, props.keyRaw);
-    if (requestId !== loadRequestId || (options.preserveDraft && hasUnsavedRedisDraft.value)) return false;
+    if (requestId !== loadRequestId) return false;
+
+    // Redis reports a key that expired between refreshes as a `none` value.
+    // Tell the browser to remove it instead of rendering a stale detail shell.
+    if (loadedValue.redis_type === "none") {
+      data.value = null;
+      collectionItems.value = [];
+      scanCursor.value = undefined;
+      resetStreamMonitoring();
+      stopAutoRefresh();
+      emit("deleted", props.keyRaw);
+      return true;
+    }
+
+    if (options.preserveDraft && hasUnsavedRedisDraft.value) {
+      const currentValue = data.value;
+      if (currentValue) {
+        const preservedValue = { ...currentValue, ttl: loadedValue.ttl };
+        data.value = preservedValue;
+        emit("loaded", preservedValue);
+      }
+      return false;
+    }
 
     if (hashSearchTimer) clearTimeout(hashSearchTimer);
     hashSearchTimer = null;
@@ -556,10 +924,12 @@ async function load(options: { selectDefaultMember?: boolean; preserveDraft?: bo
     hashSearchQuery.value = "";
     activeHashSearchQuery.value = "";
     searchLoading.value = false;
+    resetValueSearch();
     data.value = loadedValue;
     emit("loaded", loadedValue);
     scanCursor.value = redisValueCollectionScanCursor(loadedValue);
     collectionItems.value = redisValueCollectionItems(loadedValue);
+    if (loadedValue.data.kind !== "stream") resetStreamMonitoring();
 
     // A foreground load replaces the current value, so it also starts a new
     // draft lifecycle. Member saves opt out until selection is restored.
@@ -670,7 +1040,7 @@ function discardRedisJsonEdit() {
 
 async function applyDeleteKey() {
   await api.redisDeleteKey(props.connectionId, props.db, props.keyRaw);
-  emit("deleted");
+  emit("deleted", props.keyRaw);
 }
 
 function requestDeleteKey() {
@@ -842,26 +1212,6 @@ function handleMemberDetailOpenChange(open: boolean) {
 
 function finishMemberDetailClose() {
   isEditingMember.value = false;
-}
-
-function stopResizeMemberSheet() {
-  isResizingMemberSheet.value = false;
-  window.removeEventListener("pointermove", resizeMemberSheet);
-  window.removeEventListener("pointerup", stopResizeMemberSheet);
-}
-
-function resizeMemberSheet(event: PointerEvent) {
-  if (!isResizingMemberSheet.value) return;
-  const delta = memberSheetResizeStartX - event.clientX;
-  memberDetailSheetWidth.value = clampRedisMemberDetailSheetWidth(memberSheetResizeStartWidth + delta, window.innerWidth);
-}
-
-function startResizeMemberSheet(event: PointerEvent) {
-  isResizingMemberSheet.value = true;
-  memberSheetResizeStartX = event.clientX;
-  memberSheetResizeStartWidth = memberDetailSheetWidth.value;
-  window.addEventListener("pointermove", resizeMemberSheet);
-  window.addEventListener("pointerup", stopResizeMemberSheet);
 }
 
 function clampHashFieldWidth(width: number) {
@@ -1123,27 +1473,108 @@ function requestZsetRemove(member: string | null) {
 }
 
 // TTL
-function startEditTtl() {
-  if (!data.value) return;
-  ttlInput.value = data.value.ttl > 0 ? String(data.value.ttl) : "";
-  editingTtl.value = true;
-  void nextTick(() => ttlInputEl.value?.$el?.focus());
+function currentEditableTtl(): number {
+  if (!data.value) return -1;
+  return computeTtlForExpiryEdit(autoRefreshEnabled.value, countdownTtl.value, data.value.ttl);
 }
 
+function expiryValidationMessage(reason: "ttl" | "date" | "past"): string {
+  if (reason === "ttl") return t("redis.expiryTtlInvalid");
+  if (reason === "date") return t("redis.expiryDateRequired");
+  return t("redis.expiryDatePast");
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function isRedisMissingKeyError(error: unknown): boolean {
+  return /^Redis(?:JSON)? key no longer exists(?:;|$)/.test(errorMessage(error));
+}
+
+async function refreshTtlState(missingSignal?: unknown): Promise<unknown | null> {
+  try {
+    await load({ preserveDraft: true });
+    return null;
+  } catch (error) {
+    // RedisJSON can lose a key between TYPE and JSON.GET. Retry that specific
+    // race, but do not remove a key based only on an earlier command result.
+    if (!isRedisMissingKeyError(missingSignal) && !isRedisMissingKeyError(error)) return error;
+    try {
+      await load({ preserveDraft: true });
+      return null;
+    } catch (retryError) {
+      if (isRedisMissingKeyError(retryError)) {
+        emit("deleted", props.keyRaw);
+        return null;
+      }
+      return retryError;
+    }
+  }
+}
+
+function focusTtlExpiryControl(mode = ttlExpiryMode.value) {
+  void nextTick(() => {
+    if (!editingTtl.value) return;
+    if (mode === "ttl") {
+      ttlInputEl.value?.$el?.focus();
+      return;
+    }
+
+    const selector = mode === "at" ? "[data-date-time-picker-trigger]" : "[data-slot='select-trigger']";
+    editTtlWrapper.value?.querySelector<HTMLElement>(selector)?.focus();
+  });
+}
+
+function startEditTtl() {
+  if (!data.value || savingTtl.value) return;
+  const ttl = currentEditableTtl();
+  ttlExpiryMode.value = redisExpiryModeForTtl(ttl);
+  ttlInput.value = ttl > 0 ? String(ttl) : "";
+  ttlExpireAt.value = null;
+  editingTtl.value = true;
+  focusTtlExpiryControl();
+}
+
+watch(ttlExpiryMode, (mode, previousMode) => {
+  const ttl = currentEditableTtl();
+  if (mode === "at" && previousMode !== "at" && ttl > 0) {
+    // Convert the live TTL at the moment of switching, not the stale fetched value.
+    ttlExpireAt.value = unixSecondsToCalendarDateTime(Math.ceil(Date.now() / 1_000) + ttl);
+  }
+  if (editingTtl.value && mode !== previousMode) focusTtlExpiryControl(mode);
+});
+
 async function saveTtl() {
-  const val = ttlInput.value.trim();
-  const ttl = val === "" || val === "-1" ? -1 : parseInt(val, 10);
-  if (isNaN(ttl)) {
-    toast(t("redis.ttlInvalid"), 3000);
+  if (savingTtl.value) return;
+  const validation = validateRedisExpiry(ttlExpiryMode.value, ttlInput.value, ttlExpireAt.value);
+  if (!validation.valid) {
+    const message = expiryValidationMessage(validation.reason);
+    toast(message, 3000);
     return;
   }
-  await api.redisSetTtl(props.connectionId, props.db, props.keyRaw, ttl);
-  editingTtl.value = false;
-  await load();
+  savingTtl.value = true;
+  try {
+    try {
+      await applyRedisExpiryPolicy(redisExpiryTransport, props.connectionId, props.db, props.keyRaw, validation.policy);
+    } catch (error) {
+      // The expiry command may have raced with a deletion or succeeded before a transport error.
+      await refreshTtlState(error);
+      toast(errorMessage(error), 3000);
+      return;
+    }
+    editingTtl.value = false;
+    const refreshError = await refreshTtlState();
+    if (refreshError) toast(errorMessage(refreshError), 3000);
+  } finally {
+    savingTtl.value = false;
+  }
 }
 
 function cancelEditTtl() {
+  if (savingTtl.value) return;
   editingTtl.value = false;
+  ttlExpireAt.value = null;
 }
 
 // Hash
@@ -1230,7 +1661,148 @@ function formatValue(val: unknown): string {
   return JSON.stringify(val, null, 2);
 }
 
+function resetValueSearch() {
+  valueSearchOpen.value = false;
+  valueSearchQuery.value = "";
+  valueSearchMatchIndex.value = 0;
+  valueSearchHasNavigated.value = false;
+}
+
+function openValueSearch(): boolean {
+  if (!data.value || !valueSearchSupported.value) return false;
+  valueSearchOpen.value = true;
+  valueSearchHasNavigated.value = false;
+  valueViewerSearchActive.value = true;
+  // Keep caret in the find input — do not jump focus into the value body.
+  void nextTick(() => {
+    valueSearchBarRef.value?.focusInput(true);
+  });
+  return true;
+}
+
+function closeValueSearch() {
+  valueSearchOpen.value = false;
+  valueSearchHasNavigated.value = false;
+  valueSearchMatchIndex.value = 0;
+  valueSearchQuery.value = "";
+}
+
+function moveContentSearchMatch(delta: -1 | 1) {
+  const count = contentSearchMatches.value.length;
+  if (count === 0) return;
+  valueSearchMatchIndex.value = nextRedisSearchMatchIndex(contentSearchActiveIndex.value, delta, count);
+  valueSearchHasNavigated.value = true;
+  void scrollContentSearchMatchIntoView();
+}
+
+function activateValueSearchMatch(delta: -1 | 1) {
+  if (contentSearchMatches.value.length === 0) return;
+  if (!valueSearchHasNavigated.value) {
+    valueSearchHasNavigated.value = true;
+    void scrollContentSearchMatchIntoView();
+    return;
+  }
+  moveContentSearchMatch(delta);
+}
+
+/** Scroll value body to the active match without stealing focus from the find input. */
+function scrollTextareaToMatch(textarea: HTMLTextAreaElement, match: { start: number; end: number }) {
+  const lineHeight = Number.parseFloat(getComputedStyle(textarea).lineHeight || "20") || 20;
+  const textBefore = textarea.value.slice(0, match.start);
+  const line = textBefore.split("\n").length - 1;
+  textarea.scrollTop = Math.max(0, line * lineHeight - textarea.clientHeight / 3);
+}
+
+/**
+ * Never focus the value body here — the find panel must keep the caret so typing stays in the search box.
+ * Enter / prev / next only change the active match index and scroll the body into view.
+ */
+async function scrollContentSearchMatchIntoView() {
+  await nextTick();
+  const match = contentSearchMatches.value[contentSearchActiveIndex.value];
+  if (!match) return;
+
+  // CM: update selection + scroll, but do not focus (keeps find input active).
+  if (showMemberDetail.value) {
+    if (usesJsonEditorForMember.value && memberJsonEditorRef.value?.selectRange?.(match.start, match.end, { focus: false })) return;
+    if (isEditingMember.value && memberTextareaRef.value) {
+      scrollTextareaToMatch(memberTextareaRef.value, match);
+      return;
+    }
+  } else if (redisKind.value === "json") {
+    if (redisJsonEditorRef.value?.selectRange?.(match.start, match.end, { focus: false })) return;
+  } else {
+    if (usesJsonEditorForMain.value && stringJsonEditorRef.value?.selectRange?.(match.start, match.end, { focus: false })) return;
+    if (stringValueView.value === "utf8" && canEditCurrentStringFormat.value && stringTextareaRef.value) {
+      scrollTextareaToMatch(stringTextareaRef.value, match);
+      return;
+    }
+  }
+
+  document.querySelector<HTMLElement>('[data-document-search-active="true"]')?.scrollIntoView({ block: "center", inline: "nearest" });
+}
+
+/** Ctrl/Cmd+F on STRING body or member detail → floating find. */
+function focusSearch(): boolean {
+  // Member detail is portaled; treat an open dialog as an active value surface.
+  if (!valueViewerSearchActive.value && !valueSearchOpen.value && !showMemberDetail.value) return false;
+  return openValueSearch();
+}
+
+function handleValueViewerPointerDown(event: PointerEvent) {
+  const target = event.target;
+  valueViewerSearchActive.value = target instanceof Element && !!target.closest("[data-redis-value-viewer], [data-redis-value-search], [data-text-content-search], [data-draggable-search-panel], [data-redis-member-detail]");
+}
+
+watch(valueSearchQuery, () => {
+  // Typing: recompute matches/highlights; keep caret in the find input.
+  valueSearchMatchIndex.value = 0;
+  valueSearchHasNavigated.value = false;
+  if (valueSearchOpen.value) void scrollContentSearchMatchIntoView();
+});
+
+watch(contentSearchText, () => {
+  valueSearchMatchIndex.value = 0;
+  valueSearchHasNavigated.value = false;
+  if (valueSearchOpen.value) void scrollContentSearchMatchIntoView();
+});
+
+watch(
+  () => [props.connectionId, props.db, props.keyRaw],
+  () => {
+    resetValueSearch();
+    valueViewerSearchActive.value = false;
+    resetStreamMonitoring();
+  },
+);
+
+watch(streamTab, (tab) => {
+  if (tab === "groups" && redisKind.value === "stream") void loadStreamGroups();
+});
+
+watch(stringValueView, () => {
+  if (!showMemberDetail.value) {
+    valueSearchMatchIndex.value = 0;
+    valueSearchHasNavigated.value = false;
+  }
+});
+
+watch(memberValueView, () => {
+  if (showMemberDetail.value) {
+    valueSearchMatchIndex.value = 0;
+    valueSearchHasNavigated.value = false;
+  }
+});
+
+watch(showMemberDetail, (open) => {
+  valueSearchMatchIndex.value = 0;
+  valueSearchHasNavigated.value = false;
+  // Closing the dialog ends member-scoped search.
+  if (!open && !isStringLikeKind.value) resetValueSearch();
+});
+
 onMounted(() => {
+  window.addEventListener("pointerdown", handleValueViewerPointerDown, true);
   void load();
   void createShikiJsonHighlighter({
     appearance: () => redisJsonAppearance.value,
@@ -1243,16 +1815,33 @@ onMounted(() => {
     });
 });
 onBeforeUnmount(() => {
+  window.removeEventListener("pointerdown", handleValueViewerPointerDown, true);
   stopAutoRefresh();
-  stopResizeMemberSheet();
   stopResizeHashColumns();
   stopResizeZsetColumns();
   if (hashSearchTimer) clearTimeout(hashSearchTimer);
 });
+
+defineExpose({ focusSearch });
 </script>
 
 <template>
-  <div class="h-full flex flex-col overflow-hidden" :style="editorFontFamilyStyle">
+  <div data-redis-value-viewer class="relative h-full flex flex-col overflow-hidden" :style="editorFontFamilyStyle">
+    <!-- STRING body find — mounted inside the value pane (not teleported out of focus). -->
+    <TextContentSearchBar
+      v-if="valueSearchOpen && data && valueSearchSupported && !showMemberDetail"
+      ref="valueSearchBarRef"
+      v-model="valueSearchQuery"
+      :status="valueSearchStatus"
+      :match-count="valueSearchMatchCount"
+      :show-navigation="true"
+      :placeholder="t('editor.search.find')"
+      @activate="activateValueSearchMatch"
+      @prev="moveContentSearchMatch(-1)"
+      @next="moveContentSearchMatch(1)"
+      @close="closeValueSearch"
+    />
+
     <div v-if="loading" class="flex-1 flex items-center justify-center text-muted-foreground">
       {{ t("common.loading") }}
     </div>
@@ -1262,7 +1851,7 @@ onBeforeUnmount(() => {
       <div class="shrink-0 border-b bg-background">
         <div class="flex h-9 items-center gap-2 px-4">
           <span class="dbx-editor-font-family min-w-0 flex-1 truncate text-sm font-semibold">{{ formatValue(data.key_display) }}</span>
-          <Button variant="ghost" size="icon" class="h-7 w-7 shrink-0 animate-none" :disabled="hasUnsavedRedisDraft" @click="load"><RefreshCw class="h-3.5 w-3.5 animate-none" /></Button>
+          <Button data-redis-value-refresh variant="ghost" size="icon" class="h-7 w-7 shrink-0 animate-none" :disabled="hasUnsavedRedisDraft" @click="refreshValueAndStreamGroups"><RefreshCw class="h-3.5 w-3.5 animate-none" /></Button>
           <Button variant="ghost" size="icon" class="h-7 w-7 shrink-0" :title="t('grid.copyValue')" :aria-label="t('grid.copyValue')" @click="copyValue"><Copy class="h-3.5 w-3.5" /></Button>
           <Button variant="ghost" size="icon" class="h-7 w-7 shrink-0" :title="t('redis.copyInsertStatement')" :aria-label="t('redis.copyInsertStatement')" @click="copyInsertStatement"><ClipboardCopy class="h-3.5 w-3.5" /></Button>
           <Button variant="ghost" size="icon" class="h-7 w-7 shrink-0 text-destructive" @click="requestDeleteKey"><Trash2 class="h-3.5 w-3.5" /></Button>
@@ -1272,12 +1861,27 @@ onBeforeUnmount(() => {
           <Badge variant="secondary" class="dbx-editor-font-family text-xs uppercase">{{ data.redis_type }}</Badge>
           <Badge v-if="metadataSizeLabel" variant="outline" class="text-xs text-muted-foreground"> {{ t("redis.columnSize") }}: {{ metadataSizeLabel }} </Badge>
           <template v-if="!editingTtl">
-            <Badge v-if="data.ttl > 0" variant="outline" class="text-xs cursor-pointer text-muted-foreground hover:bg-accent" @click="startEditTtl">TTL: {{ formatTtl(computeDisplayTtl(autoRefreshEnabled, countdownTtl, data.ttl), t) }}</Badge>
-            <Badge v-else-if="data.ttl === -1" variant="outline" class="text-xs cursor-pointer text-muted-foreground hover:bg-accent" @click="startEditTtl">{{ t("redis.noExpiry") }}</Badge>
+            <Badge v-if="data.ttl > 0" as="button" type="button" variant="outline" class="text-xs cursor-pointer text-muted-foreground hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50" :disabled="savingTtl" :aria-label="t('redis.expiry')" @click="startEditTtl">
+              TTL: {{ formatTtl(computeDisplayTtl(autoRefreshEnabled, countdownTtl, data.ttl), t) }}
+            </Badge>
+            <Badge v-else-if="data.ttl === -1" as="button" type="button" variant="outline" class="text-xs cursor-pointer text-muted-foreground hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50" :disabled="savingTtl" :aria-label="t('redis.expiry')" @click="startEditTtl">
+              {{ t("redis.noExpiry") }}
+            </Badge>
           </template>
-          <div ref="editTtlWrapper" v-else class="flex items-center gap-1">
-            <Input ref="ttlInputEl" v-model="ttlInput" class="h-6 w-20 text-xs" placeholder="seconds (-1=no expiry)" @keydown.enter="saveTtl" @keydown.escape="cancelEditTtl" />
-            <Button variant="ghost" size="icon" class="h-6 w-6" @click="saveTtl"><Save class="h-3 w-3" /></Button>
+          <div ref="editTtlWrapper" v-else class="flex min-w-0 max-w-full flex-wrap items-center gap-1">
+            <Select v-model="ttlExpiryMode" :disabled="savingTtl">
+              <SelectTrigger size="sm" class="h-6 max-w-[min(100%,14rem)] shrink-0 gap-1 py-0 pl-2 pr-1.5 text-[11px]" :aria-label="t('redis.expiry')">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent data-redis-expiry-mode-content class="min-w-[12rem]">
+                <SelectItem value="none">{{ t("redis.expiryNone") }}</SelectItem>
+                <SelectItem value="ttl">{{ t("redis.expiryTtl") }}</SelectItem>
+                <SelectItem value="at">{{ t("redis.expiryAt") }}</SelectItem>
+              </SelectContent>
+            </Select>
+            <Input v-if="ttlExpiryMode === 'ttl'" ref="ttlInputEl" v-model="ttlInput" class="h-6 w-28 shrink-0 text-xs" :disabled="savingTtl" inputmode="numeric" :placeholder="t('redis.createKeyTtlPlaceholder')" @keydown.enter="saveTtl" @keydown.escape="cancelEditTtl" />
+            <DateTimePicker v-else-if="ttlExpiryMode === 'at'" v-model="ttlExpireAt" compact :locale="locale" :disabled="savingTtl" />
+            <Button variant="ghost" size="icon" class="h-6 w-6 shrink-0" :disabled="savingTtl" :title="t('grid.save')" :aria-label="t('grid.save')" @click="saveTtl"><Save class="h-3 w-3" /></Button>
           </div>
           <Button variant="ghost" size="icon" class="h-6 w-6 shrink-0" :class="{ 'text-primary bg-accent': autoRefreshEnabled }" :title="t('redis.autoRefresh')" @click="toggleAutoRefresh">
             <Clock class="h-3.5 w-3.5" />
@@ -1309,7 +1913,17 @@ onBeforeUnmount(() => {
             <Switch size="sm" :model-value="redisJsonWordWrap" @update:model-value="setRedisJsonWordWrap(Boolean($event))" />
           </label>
         </div>
-        <RedisJsonEditor v-if="stringValueView === 'json' && stringValueDetail.json" v-model="editValue" class="min-h-0 flex-1" :save-disabled="savingString || !stringValueChanged" :read-only="savingString" :word-wrap="redisJsonWordWrap" @save="saveString" />
+        <RedisJsonEditor
+          v-if="stringValueView === 'json' && stringValueDetail.json"
+          ref="stringJsonEditorRef"
+          v-model="editValue"
+          class="min-h-0 flex-1"
+          :save-disabled="savingString || !stringValueChanged"
+          :read-only="savingString"
+          :word-wrap="redisJsonWordWrap"
+          :enable-builtin-find="false"
+          @save="saveString"
+        />
         <div v-else-if="stringValueView === 'javaserialize' && stringValueDetail.javaSerialized" class="dbx-editor-font-family min-h-0 flex-1 overflow-auto bg-background p-4 text-sm leading-6">
           <JsonTree :value="stringValueDetail.javaSerialized.value" :word-wrap="redisJsonWordWrap" :highlight-json="highlightRedisJson" />
         </div>
@@ -1318,19 +1932,22 @@ onBeforeUnmount(() => {
             <span>{{ t("grid.hexViewer") }}</span>
             <span>{{ t("grid.hexViewerByteCount", { count: stringValueDetail.byteCount }) }}</span>
           </div>
-          <pre v-if="stringValueDetail.hexRows.length > 0" class="dbx-editor-font-family w-full min-w-0 max-w-full select-all whitespace-pre-wrap break-all">{{ detailTextForFormat(stringValueDetail, "hex") }}</pre>
+          <pre v-if="stringValueDetail.hexRows.length > 0 && canHighlightStringSurface" class="dbx-editor-font-family w-full min-w-0 max-w-full select-all whitespace-pre-wrap break-all" v-html="contentSearchHighlightedHtml" />
+          <pre v-else-if="stringValueDetail.hexRows.length > 0" class="dbx-editor-font-family w-full min-w-0 max-w-full select-all whitespace-pre-wrap break-all">{{ detailTextForFormat(stringValueDetail, "hex") }}</pre>
           <div v-else class="text-muted-foreground">{{ t("grid.hexViewerEmpty") }}</div>
         </div>
+        <pre v-else-if="stringValueView === 'base64' && canHighlightStringSurface" class="dbx-editor-font-family min-h-0 w-full min-w-0 max-w-full flex-1 overflow-auto bg-background p-4 text-sm leading-6 whitespace-pre-wrap break-all" v-html="contentSearchHighlightedHtml" />
         <pre v-else-if="stringValueView === 'base64'" class="dbx-editor-font-family min-h-0 w-full min-w-0 max-w-full flex-1 overflow-auto bg-background p-4 text-sm leading-6 whitespace-pre-wrap break-all">{{ stringValueDetail.base64Text }}</pre>
         <textarea
           v-else-if="stringValueView === 'utf8' && canEditCurrentStringFormat"
+          ref="stringTextareaRef"
           v-model="editValue"
           class="dbx-editor-font-family flex-1 resize-none bg-background p-4 text-sm outline-none"
           :class="redisJsonWordWrap ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'"
           :readonly="!canEditCurrentStringFormat || savingString"
           spellcheck="false"
         />
-        <pre v-else-if="stringValueView === 'utf8'" class="dbx-editor-font-family min-h-0 w-full min-w-0 max-w-full flex-1 overflow-auto bg-background p-4 text-sm leading-6" :class="detailTextClass(stringValueView)">{{ detailTextForFormat(stringValueDetail, stringValueView) }}</pre>
+        <pre v-else-if="canHighlightStringSurface" class="dbx-editor-font-family min-h-0 w-full min-w-0 max-w-full flex-1 overflow-auto bg-background p-4 text-sm leading-6" :class="detailTextClass(stringValueView)" v-html="contentSearchHighlightedHtml" />
         <pre v-else class="dbx-editor-font-family min-h-0 w-full min-w-0 max-w-full flex-1 overflow-auto bg-background p-4 text-sm leading-6" :class="detailTextClass(stringValueView)">{{ detailTextForFormat(stringValueDetail, stringValueView) }}</pre>
         <div v-if="isBinaryStringValue" class="px-4 py-2 border-t text-xs text-muted-foreground shrink-0">
           {{ t("redis.binaryStringReadonlyHint") }}
@@ -1351,7 +1968,7 @@ onBeforeUnmount(() => {
             <Switch size="sm" :model-value="redisJsonWordWrap" @update:model-value="setRedisJsonWordWrap(Boolean($event))" />
           </label>
         </div>
-        <RedisJsonEditor v-model="editValue" class="min-h-0 flex-1" :save-disabled="savingJson || !redisJsonValueChanged" :read-only="savingJson" :word-wrap="redisJsonWordWrap" @save="saveJson" />
+        <RedisJsonEditor ref="redisJsonEditorRef" v-model="editValue" class="min-h-0 flex-1" :save-disabled="savingJson || !redisJsonValueChanged" :read-only="savingJson" :word-wrap="redisJsonWordWrap" :enable-builtin-find="false" @save="saveJson" />
         <div v-if="redisJsonValueChanged" class="px-4 py-2 border-t flex justify-end gap-2 shrink-0">
           <Button variant="ghost" size="sm" :disabled="savingJson" @click="discardRedisJsonEdit">{{ t("grid.discard") }}</Button>
           <Button size="sm" :disabled="savingJson" @click="saveJson"><Loader2 v-if="savingJson" class="w-3 h-3 mr-1 animate-spin" /><Save v-else class="w-3 h-3 mr-1" /> {{ t("grid.save") }}</Button>
@@ -1576,36 +2193,272 @@ onBeforeUnmount(() => {
         </RecycleScroller>
       </div>
 
-      <!-- Stream (readonly) -->
+      <!-- Stream monitoring -->
       <div v-else-if="redisKind === 'stream'" class="flex-1 flex flex-col overflow-hidden">
-        <div class="px-4 py-1 text-xs text-muted-foreground border-b shrink-0">
-          {{ t("redis.entries", { count: streamRows.length }) }}
-        </div>
-        <DynamicScroller class="flex-1 overflow-y-auto" :items="streamRows" :min-item-size="REDIS_STREAM_MIN_ROW_HEIGHT" :buffer="600" key-field="id">
-          <template #default="{ item: row, active }">
-            <DynamicScrollerItem :item="row" :active="active" :size-dependencies="[streamFieldCount(row)]" :data-index="row.index">
-              <div data-redis-stream-entry class="dbx-editor-font-family px-4 py-2 border-b text-sm hover:bg-accent/50">
-                <div class="mb-1 text-xs text-muted-foreground">{{ row.entry.id }}</div>
-                <div
-                  v-for="(field, fieldIndex) in row.entry.fields"
-                  :key="`${row.id}:${field.field}:${fieldIndex}`"
-                  class="grid grid-cols-[minmax(6rem,0.35fr)_1fr_56px] gap-3 py-0.5 group cursor-pointer"
-                  :class="{ 'bg-accent/60': isSelectedMember(field.field, field.value, streamFieldSelectionIdentity(row.entry.id, fieldIndex)) }"
-                  @click="viewMember(field.field, field.value, { kind: 'stream', field: field.field, canEdit: false }, streamFieldSelectionIdentity(row.entry.id, fieldIndex))"
-                >
-                  <span class="truncate text-blue-500">{{ field.field }}</span>
-                  <span class="truncate text-muted-foreground">{{ field.value }}</span>
-                  <span class="flex justify-end gap-1">
-                    <Button variant="ghost" size="icon" class="h-5 w-5 opacity-0 group-hover:opacity-100" :title="t('redis.viewMember')" @click.stop="viewMember(field.field, field.value, { kind: 'stream', field: field.field, canEdit: false }, streamFieldSelectionIdentity(row.entry.id, fieldIndex))"
-                      ><Eye class="w-3 h-3"
-                    /></Button>
-                    <Button variant="ghost" size="icon" class="h-5 w-5 opacity-0 group-hover:opacity-100" :title="t('redis.copyMember')" @click.stop="copyMember(field.value)"><Copy class="w-3 h-3" /></Button>
-                  </span>
+        <Tabs v-model="streamTab" :unmount-on-hide="false" class="h-full min-h-0 gap-0">
+          <div class="flex h-9 shrink-0 items-stretch overflow-x-auto border-b px-4">
+            <TabsList variant="line" class="h-full shrink-0 gap-0 p-0">
+              <TabsTrigger value="entries" data-redis-stream-entries-tab class="h-full flex-none rounded-none px-3 text-xs group-data-horizontal/tabs:after:bottom-0">{{ t("redis.streamData") }}</TabsTrigger>
+              <TabsTrigger
+                value="groups"
+                data-redis-stream-groups-tab
+                :class="['h-full flex-none rounded-none px-3 text-xs group-data-horizontal/tabs:after:bottom-0', selectedStreamGroup && 'data-active:text-foreground/60 group-data-[variant=line]/tabs-list:data-active:after:opacity-0']"
+                @click="resetStreamGroupDetail"
+              >
+                {{ t("redis.consumerGroups") }}
+              </TabsTrigger>
+            </TabsList>
+            <template v-if="streamTab === 'groups' && selectedStreamGroup">
+              <span class="mx-1 h-4 w-px shrink-0 self-center bg-border" aria-hidden="true" />
+              <button
+                data-redis-stream-group-crumb
+                type="button"
+                class="relative inline-flex h-full max-w-48 shrink-0 items-center border-b-2 px-3 text-left text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
+                :class="selectedStreamConsumer ? 'border-transparent text-foreground/60 hover:text-foreground' : 'border-foreground text-foreground'"
+                :title="formatValue(selectedStreamGroup.name)"
+                @click="resetStreamConsumerDetail"
+              >
+                <span class="dbx-editor-font-family truncate">{{ formatValue(selectedStreamGroup.name) }}</span>
+              </button>
+              <span v-if="selectedStreamConsumer" data-redis-stream-consumer-crumb class="dbx-editor-font-family inline-flex h-full max-w-48 shrink-0 items-center truncate border-b-2 border-foreground px-3 text-xs font-medium text-foreground" :title="formatValue(selectedStreamConsumer.name)">
+                <span class="truncate">{{ formatValue(selectedStreamConsumer.name) }}</span>
+              </span>
+            </template>
+          </div>
+
+          <TabsContent value="entries" class="m-0 min-h-0 flex-1 flex flex-col">
+            <div class="px-4 py-1 text-xs text-muted-foreground border-b shrink-0">
+              {{ t("redis.entries", { count: streamRows.length }) }}
+            </div>
+            <DynamicScroller class="flex-1 overflow-y-auto" :items="streamRows" :min-item-size="REDIS_STREAM_MIN_ROW_HEIGHT" :buffer="600" key-field="id">
+              <template #default="{ item: row, active }">
+                <DynamicScrollerItem :item="row" :active="active" :size-dependencies="[streamFieldCount(row)]" :data-index="row.index">
+                  <div data-redis-stream-entry class="dbx-editor-font-family px-4 py-2 border-b text-sm hover:bg-accent/50">
+                    <div class="mb-1 text-xs text-muted-foreground">{{ row.entry.id }}</div>
+                    <div
+                      v-for="(field, fieldIndex) in row.entry.fields"
+                      :key="`${row.id}:${field.field}:${fieldIndex}`"
+                      class="grid grid-cols-[minmax(6rem,0.35fr)_1fr_56px] gap-3 py-0.5 group cursor-pointer"
+                      :class="{ 'bg-accent/60': isSelectedMember(field.field, field.value, streamFieldSelectionIdentity(row.entry.id, fieldIndex)) }"
+                      @click="viewMember(field.field, field.value, { kind: 'stream', field: field.field, canEdit: false }, streamFieldSelectionIdentity(row.entry.id, fieldIndex))"
+                    >
+                      <span class="truncate text-blue-500">{{ field.field }}</span>
+                      <span class="truncate text-muted-foreground">{{ field.value }}</span>
+                      <span class="flex justify-end gap-1">
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          class="h-5 w-5 opacity-0 group-hover:opacity-100"
+                          :title="t('redis.viewMember')"
+                          @click.stop="viewMember(field.field, field.value, { kind: 'stream', field: field.field, canEdit: false }, streamFieldSelectionIdentity(row.entry.id, fieldIndex))"
+                          ><Eye class="w-3 h-3"
+                        /></Button>
+                        <Button variant="ghost" size="icon" class="h-5 w-5 opacity-0 group-hover:opacity-100" :title="t('redis.copyMember')" @click.stop="copyMember(field.value)"><Copy class="w-3 h-3" /></Button>
+                      </span>
+                    </div>
+                  </div>
+                </DynamicScrollerItem>
+              </template>
+            </DynamicScroller>
+          </TabsContent>
+
+          <TabsContent value="groups" class="m-0 min-h-0 flex-1 flex flex-col">
+            <template v-if="!selectedStreamGroup">
+              <div class="flex shrink-0 items-center gap-2 border-b px-4 py-1.5 text-xs text-muted-foreground">
+                <span>{{ t("redis.consumerGroups") }}</span>
+                <Loader2 v-if="streamGroupsLoading" class="h-3 w-3 animate-spin" />
+              </div>
+
+              <div v-if="streamGroupsLoading && !streamGroupsLoaded" class="flex flex-1 items-center justify-center text-xs text-muted-foreground">
+                <Loader2 class="mr-2 h-4 w-4 animate-spin" />
+                {{ t("common.loading") }}
+              </div>
+              <div v-else-if="streamGroupsError && streamGroups.length === 0" class="flex flex-1 flex-col items-center justify-center gap-3 p-4 text-center text-xs text-muted-foreground">
+                <span>{{ t("redis.streamGroupsLoadFailed") }}: {{ streamGroupsError }}</span>
+                <Button data-redis-stream-groups-retry variant="outline" size="sm" class="h-7 text-xs" @click="retryStreamGroups">{{ t("common.retry") }}</Button>
+              </div>
+              <div v-else class="min-h-0 flex-1 overflow-auto">
+                <div v-if="streamGroupsError" class="flex items-center gap-2 border-b bg-destructive/5 px-4 py-2 text-xs text-destructive">
+                  <span class="min-w-0 flex-1 truncate">{{ t("redis.streamGroupsLoadFailed") }}: {{ streamGroupsError }}</span>
+                  <Button data-redis-stream-groups-retry variant="ghost" size="sm" class="h-6 text-xs text-destructive" @click="retryStreamGroups">{{ t("common.retry") }}</Button>
+                </div>
+                <div v-if="streamGroups.length === 0" class="flex h-full min-h-40 items-center justify-center p-4 text-xs text-muted-foreground">
+                  {{ t("redis.noConsumerGroups") }}
+                </div>
+                <table v-else data-redis-stream-groups class="w-full min-w-[780px] border-collapse text-left text-sm">
+                  <thead class="sticky top-0 bg-muted/95 text-xs text-muted-foreground backdrop-blur">
+                    <tr>
+                      <th class="px-4 py-2 font-medium">{{ t("redis.group") }}</th>
+                      <th class="px-3 py-2 text-right font-medium">{{ t("redis.consumers") }}</th>
+                      <th class="px-3 py-2 text-right font-medium">{{ t("redis.pending") }}</th>
+                      <th class="px-3 py-2 font-medium">{{ t("redis.lastDeliveredId") }}</th>
+                      <th class="px-3 py-2 text-right font-medium">{{ t("redis.entriesRead") }}</th>
+                      <th class="px-4 py-2 text-right font-medium">{{ t("redis.lag") }}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="group in streamGroups" :key="group.name.raw_base64" data-redis-stream-group-row class="cursor-pointer border-t hover:bg-accent/50" @click="selectStreamGroup(group)">
+                      <td class="dbx-editor-font-family max-w-72 truncate px-4 py-2" :title="formatValue(group.name)">{{ formatValue(group.name) }}</td>
+                      <td class="px-3 py-2 text-right tabular-nums">{{ formatStreamMetric(group.consumers) }}</td>
+                      <td class="px-3 py-2 text-right tabular-nums">{{ formatStreamMetric(group.pending) }}</td>
+                      <td class="dbx-editor-font-family max-w-56 truncate px-3 py-2 text-muted-foreground" :title="group.last_delivered_id">{{ group.last_delivered_id }}</td>
+                      <td class="px-3 py-2 text-right tabular-nums">{{ formatStreamMetric(group.entries_read) }}</td>
+                      <td class="px-4 py-2 text-right tabular-nums">{{ formatStreamMetric(group.lag) }}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </template>
+
+            <template v-else>
+              <div data-redis-stream-group-detail class="min-h-0 flex-1 overflow-auto bg-muted/20 p-3">
+                <div class="mx-auto flex w-full max-w-[1120px] flex-col gap-3">
+                  <div v-if="selectedStreamConsumer" data-redis-stream-consumer-summary class="grid grid-cols-3 gap-px overflow-hidden rounded-lg border bg-border">
+                    <div class="bg-card px-3 py-2.5">
+                      <div class="text-xs text-muted-foreground">{{ t("redis.pending") }}</div>
+                      <div class="mt-1 text-lg font-semibold tabular-nums">{{ formatStreamMetric(selectedStreamConsumer.pending) }}</div>
+                    </div>
+                    <div class="bg-card px-3 py-2.5">
+                      <div class="text-xs text-muted-foreground">{{ t("redis.idle") }}</div>
+                      <div class="mt-1 text-lg font-semibold tabular-nums" :title="formatStreamDurationTitle(selectedStreamConsumer.idle_ms)">{{ formatStreamDuration(selectedStreamConsumer.idle_ms) }}</div>
+                    </div>
+                    <div class="bg-card px-3 py-2.5">
+                      <div class="text-xs text-muted-foreground">{{ t("redis.inactive") }}</div>
+                      <div class="mt-1 text-lg font-semibold tabular-nums" :title="formatStreamDurationTitle(selectedStreamConsumer.inactive_ms)">{{ formatStreamDuration(selectedStreamConsumer.inactive_ms) }}</div>
+                    </div>
+                  </div>
+                  <div v-else data-redis-stream-group-summary class="grid grid-cols-3 gap-px overflow-hidden rounded-lg border bg-border">
+                    <div class="bg-card px-3 py-2.5">
+                      <div class="text-xs text-muted-foreground">{{ t("redis.consumers") }}</div>
+                      <div class="mt-1 text-lg font-semibold tabular-nums">{{ formatStreamMetric(selectedStreamGroup.consumers) }}</div>
+                    </div>
+                    <div class="bg-card px-3 py-2.5">
+                      <div class="text-xs text-muted-foreground">{{ t("redis.pending") }}</div>
+                      <div class="mt-1 text-lg font-semibold tabular-nums">{{ formatStreamMetric(selectedStreamGroup.pending) }}</div>
+                    </div>
+                    <div class="bg-card px-3 py-2.5">
+                      <div class="text-xs text-muted-foreground">{{ t("redis.lag") }}</div>
+                      <div class="mt-1 text-lg font-semibold tabular-nums">{{ formatStreamMetric(selectedStreamGroup.lag) }}</div>
+                    </div>
+                  </div>
+
+                  <section v-if="!selectedStreamConsumer" data-redis-stream-consumers class="overflow-hidden rounded-lg border bg-card text-card-foreground">
+                    <div class="flex min-h-10 items-center gap-2 border-b px-3 py-2">
+                      <span class="text-sm font-medium">{{ t("redis.streamConsumers") }}</span>
+                      <Badge v-if="streamConsumers.length" variant="secondary" class="h-5 min-w-5 justify-center px-1.5 text-[10px] tabular-nums">{{ formatStreamMetric(streamConsumers.length) }}</Badge>
+                      <Loader2 v-if="streamConsumersLoading" class="ml-auto h-3.5 w-3.5 animate-spin text-muted-foreground" />
+                    </div>
+
+                    <div v-if="streamConsumersLoading && streamConsumers.length === 0" class="flex items-center gap-2 px-3 py-6 text-xs text-muted-foreground">
+                      <Loader2 class="h-3.5 w-3.5 animate-spin" />
+                      {{ t("common.loading") }}
+                    </div>
+                    <div v-else-if="streamConsumersError && streamConsumers.length === 0" class="flex items-center gap-2 px-3 py-5 text-xs text-destructive">
+                      <span class="min-w-0 flex-1 truncate">{{ t("redis.streamConsumersLoadFailed") }}: {{ streamConsumersError }}</span>
+                      <Button data-redis-stream-consumers-retry variant="ghost" size="sm" class="h-7 text-xs text-destructive" @click="retryStreamConsumers">{{ t("common.retry") }}</Button>
+                    </div>
+                    <template v-else>
+                      <div v-if="streamConsumersError" class="flex items-center gap-2 border-b bg-destructive/5 px-3 py-2 text-xs text-destructive">
+                        <span class="min-w-0 flex-1 truncate">{{ t("redis.streamConsumersLoadFailed") }}: {{ streamConsumersError }}</span>
+                        <Button data-redis-stream-consumers-retry variant="ghost" size="sm" class="h-6 text-xs text-destructive" @click="retryStreamConsumers">{{ t("common.retry") }}</Button>
+                      </div>
+                      <div v-if="streamConsumers.length === 0" class="px-3 py-6 text-center text-xs text-muted-foreground">{{ t("redis.noStreamConsumers") }}</div>
+                      <table v-else data-redis-stream-consumers-table class="w-full table-fixed border-collapse text-sm">
+                        <colgroup>
+                          <col class="w-1/4" />
+                          <col class="w-1/4" />
+                          <col class="w-1/4" />
+                          <col class="w-1/4" />
+                        </colgroup>
+                        <thead class="bg-muted/50 text-xs text-muted-foreground">
+                          <tr data-redis-stream-consumer-header>
+                            <th scope="col" class="px-3 py-1.5 text-left font-medium">{{ t("redis.consumer") }}</th>
+                            <th scope="col" class="px-2 py-1.5 text-right font-medium">{{ t("redis.pending") }}</th>
+                            <th scope="col" class="px-2 py-1.5 text-right font-medium">{{ t("redis.idle") }}</th>
+                            <th scope="col" class="px-3 py-1.5 text-right font-medium">{{ t("redis.inactive") }}</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <tr v-for="consumer in streamConsumers" :key="consumer.name.raw_base64" class="border-t hover:bg-muted/20">
+                            <td class="px-3 py-2 text-left">
+                              <button
+                                data-redis-stream-consumer-row
+                                type="button"
+                                class="block w-full min-w-0 rounded-sm text-left outline-none transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
+                                :title="t('redis.openConsumerDetails')"
+                                @click="selectStreamConsumer(consumer)"
+                              >
+                                <span class="dbx-editor-font-family block truncate">{{ formatValue(consumer.name) }}</span>
+                              </button>
+                            </td>
+                            <td class="px-2 py-2 text-right tabular-nums">{{ formatStreamMetric(consumer.pending) }}</td>
+                            <td class="px-2 py-2 text-right tabular-nums" :title="formatStreamDurationTitle(consumer.idle_ms)">{{ formatStreamDuration(consumer.idle_ms) }}</td>
+                            <td class="px-3 py-2 text-right tabular-nums" :title="formatStreamDurationTitle(consumer.inactive_ms)">{{ formatStreamDuration(consumer.inactive_ms) }}</td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    </template>
+                  </section>
+
+                  <section v-if="selectedStreamConsumer" data-redis-stream-pending class="overflow-hidden rounded-lg border bg-card text-card-foreground">
+                    <div class="flex min-h-10 items-center gap-2 border-b px-3 py-2">
+                      <span class="text-sm font-medium">{{ t("redis.pendingEntries") }}</span>
+                      <Badge v-if="selectedStreamConsumer" variant="outline" class="dbx-editor-font-family min-w-0 max-w-48 truncate px-1.5 text-[10px]" :title="formatValue(selectedStreamConsumer.name)">{{ formatValue(selectedStreamConsumer.name) }}</Badge>
+                      <Badge v-if="streamPendingEntries.length" variant="secondary" class="h-5 min-w-5 justify-center px-1.5 text-[10px] tabular-nums">{{ formatStreamMetric(streamPendingEntries.length) }}</Badge>
+                      <Loader2 v-if="streamPendingLoading || streamPendingLoadingMore" class="ml-auto h-3.5 w-3.5 animate-spin text-muted-foreground" />
+                    </div>
+
+                    <div v-if="streamPendingLoading && streamPendingEntries.length === 0" class="flex items-center gap-2 px-3 py-6 text-xs text-muted-foreground">
+                      <Loader2 class="h-3.5 w-3.5 animate-spin" />
+                      {{ t("common.loading") }}
+                    </div>
+                    <div v-else-if="streamPendingError && streamPendingEntries.length === 0" class="flex items-center gap-2 px-3 py-5 text-xs text-destructive">
+                      <span class="min-w-0 flex-1 truncate">{{ t("redis.pendingEntriesLoadFailed") }}: {{ streamPendingError }}</span>
+                      <Button data-redis-stream-pending-retry variant="ghost" size="sm" class="h-7 text-xs text-destructive" @click="retryStreamPending">{{ t("common.retry") }}</Button>
+                    </div>
+                    <template v-else>
+                      <div v-if="streamPendingError" class="flex items-center gap-2 border-b bg-destructive/5 px-3 py-2 text-xs text-destructive">
+                        <span class="min-w-0 flex-1 truncate">{{ t("redis.pendingEntriesLoadFailed") }}: {{ streamPendingError }}</span>
+                        <Button data-redis-stream-pending-retry variant="ghost" size="sm" class="h-6 text-xs text-destructive" @click="retryStreamPending">{{ t("common.retry") }}</Button>
+                      </div>
+                      <div v-if="streamPendingEntries.length === 0" class="px-3 py-6 text-center text-xs text-muted-foreground">{{ t("redis.noPendingEntries") }}</div>
+                      <table v-else data-redis-stream-pending-table class="w-full table-fixed border-collapse text-sm">
+                        <colgroup>
+                          <col class="w-[44%]" />
+                          <col class="w-[36%]" />
+                          <col class="w-[20%]" />
+                        </colgroup>
+                        <thead class="bg-muted/50 text-xs text-muted-foreground">
+                          <tr data-redis-stream-pending-header>
+                            <th scope="col" class="px-3 py-1.5 text-left font-medium">{{ t("redis.entryId") }}</th>
+                            <th scope="col" class="px-2 py-1.5 text-left font-medium">{{ t("redis.lastDelivered") }}</th>
+                            <th scope="col" class="px-3 py-1.5 text-right font-medium">{{ t("redis.deliveries") }}</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <tr v-for="entry in streamPendingEntries" :key="entry.id" class="border-t hover:bg-muted/20">
+                            <td class="px-3 py-2 text-left" :title="entry.id">
+                              <div class="dbx-editor-font-family truncate">{{ entry.id }}</div>
+                            </td>
+                            <td class="px-2 py-2 text-left tabular-nums" :title="formatStreamDurationTitle(entry.idle_ms)">{{ formatStreamLastDelivery(entry.idle_ms) }}</td>
+                            <td class="px-3 py-2 text-right tabular-nums">{{ formatStreamMetric(entry.deliveries) }}</td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    </template>
+
+                    <div v-if="streamPendingCursor" class="border-t p-2">
+                      <Button data-redis-stream-pending-more variant="outline" size="sm" class="h-7 w-full text-xs" :disabled="streamPendingLoadingMore" @click="loadMoreStreamPending">
+                        <Loader2 v-if="streamPendingLoadingMore" class="mr-1.5 h-3 w-3 animate-spin" />
+                        {{ t("redis.loadMorePending") }}
+                      </Button>
+                    </div>
+                  </section>
                 </div>
               </div>
-            </DynamicScrollerItem>
-          </template>
-        </DynamicScroller>
+            </template>
+          </TabsContent>
+        </Tabs>
       </div>
 
       <!-- Unknown -->
@@ -1616,25 +2469,33 @@ onBeforeUnmount(() => {
 
     <DangerConfirmDialog v-model:open="showDeleteConfirm" :message="t('dangerDialog.deleteMessage')" :details="deleteDetails" :confirm-label="t('dangerDialog.deleteConfirm')" @confirm="confirmDelete" />
 
-    <Sheet :open="showMemberDetail" @update:open="handleMemberDetailOpenChange">
-      <SheetContent
-        side="right"
-        class="gap-0 p-0 sm:max-w-[calc(100vw-2rem)]"
-        :class="{ 'select-none': isResizingMemberSheet }"
-        :style="[editorFontFamilyStyle, { width: `${memberDetailSheetWidth}px`, maxWidth: 'calc(100vw - 2rem)' }]"
-        @close-auto-focus="finishMemberDetailClose"
-        @pointer-down-outside.prevent
-        @interact-outside.prevent
-      >
-        <div class="absolute inset-y-0 left-0 z-10 w-2 -translate-x-1 cursor-col-resize border-l border-transparent hover:border-primary/60" @pointerdown.prevent="startResizeMemberSheet" />
-        <SheetHeader class="border-b px-5 py-4 pr-12">
-          <SheetTitle class="flex items-center gap-2">
+    <Dialog :open="showMemberDetail" @update:open="handleMemberDetailOpenChange">
+      <DialogContent data-redis-member-detail class="relative flex h-[min(760px,85vh)] w-[calc(100vw-2rem)] flex-col gap-0 overflow-hidden p-0 sm:max-w-[960px]" :style="editorFontFamilyStyle" @close-auto-focus="finishMemberDetailClose" @pointer-down-outside.prevent @interact-outside.prevent>
+        <!--
+          Inside DialogContent (focus trap). absolute — not fixed — so dialog
+          transform/overflow do not break hit-testing or caret.
+        -->
+        <TextContentSearchBar
+          v-if="valueSearchOpen && showMemberDetail"
+          ref="valueSearchBarRef"
+          v-model="valueSearchQuery"
+          :status="valueSearchStatus"
+          :match-count="valueSearchMatchCount"
+          :show-navigation="true"
+          :placeholder="t('editor.search.find')"
+          @activate="activateValueSearchMatch"
+          @prev="moveContentSearchMatch(-1)"
+          @next="moveContentSearchMatch(1)"
+          @close="closeValueSearch"
+        />
+        <DialogHeader class="border-b px-5 py-4 pr-12">
+          <DialogTitle class="flex items-center gap-2">
             <span class="truncate">{{ selectedMemberTitle ? formatValue(selectedMemberTitle) : t("redis.memberDetail") }}</span>
             <Badge variant="outline" class="shrink-0 text-xs">{{ redisFormatLabel(memberValueView, selectedMemberDetail.rawLabel) }}</Badge>
-          </SheetTitle>
-        </SheetHeader>
+          </DialogTitle>
+        </DialogHeader>
         <template v-if="isEditingMember">
-          <textarea v-model="memberEditValue" class="dbx-editor-font-family min-h-0 flex-1 resize-none bg-background p-5 text-[13px] leading-6 outline-none" :readonly="savingMember" spellcheck="false" />
+          <textarea ref="memberTextareaRef" v-model="memberEditValue" class="dbx-editor-font-family min-h-0 flex-1 resize-none bg-background p-5 text-[13px] leading-6 outline-none" :readonly="savingMember" spellcheck="false" />
         </template>
         <template v-else>
           <div class="flex h-9 items-center gap-2 border-b px-5 text-xs">
@@ -1659,7 +2520,7 @@ onBeforeUnmount(() => {
               <Switch size="sm" :model-value="redisJsonWordWrap" @update:model-value="setRedisJsonWordWrap(Boolean($event))" />
             </label>
           </div>
-          <RedisJsonEditor v-if="isEditingHashJson" v-model="memberEditValue" class="min-h-0 flex-1" :save-disabled="savingMember || !memberValueChanged" :read-only="savingMember" :word-wrap="redisJsonWordWrap" @save="saveMemberEdit" />
+          <RedisJsonEditor v-if="isEditingHashJson" ref="memberJsonEditorRef" v-model="memberEditValue" class="min-h-0 flex-1" :save-disabled="savingMember || !memberValueChanged" :read-only="savingMember" :word-wrap="redisJsonWordWrap" :enable-builtin-find="false" @save="saveMemberEdit" />
           <div v-else-if="memberValueView === 'json' && selectedMemberDetail.json" class="dbx-editor-font-family min-h-0 flex-1 overflow-auto bg-background p-5 text-[13px] leading-6">
             <JsonTree :value="selectedMemberDetail.json.value" :word-wrap="redisJsonWordWrap" :highlight-json="highlightRedisJson" />
           </div>
@@ -1671,13 +2532,16 @@ onBeforeUnmount(() => {
               <span>{{ t("grid.hexViewer") }}</span>
               <span>{{ t("grid.hexViewerByteCount", { count: selectedMemberDetail.byteCount }) }}</span>
             </div>
-            <pre v-if="selectedMemberDetail.hexRows.length > 0" class="dbx-editor-font-family w-full min-w-0 max-w-full select-all whitespace-pre-wrap break-all">{{ detailTextForFormat(selectedMemberDetail, "hex") }}</pre>
+            <pre v-if="selectedMemberDetail.hexRows.length > 0 && canHighlightMemberSurface" class="dbx-editor-font-family w-full min-w-0 max-w-full select-all whitespace-pre-wrap break-all" v-html="contentSearchHighlightedHtml" />
+            <pre v-else-if="selectedMemberDetail.hexRows.length > 0" class="dbx-editor-font-family w-full min-w-0 max-w-full select-all whitespace-pre-wrap break-all">{{ detailTextForFormat(selectedMemberDetail, "hex") }}</pre>
             <div v-else class="text-muted-foreground">{{ t("grid.hexViewerEmpty") }}</div>
           </div>
+          <pre v-else-if="memberValueView === 'base64' && canHighlightMemberSurface" class="dbx-editor-font-family min-h-0 w-full min-w-0 max-w-full flex-1 overflow-auto bg-background p-5 text-[13px] leading-6 whitespace-pre-wrap break-all" v-html="contentSearchHighlightedHtml" />
           <pre v-else-if="memberValueView === 'base64'" class="dbx-editor-font-family min-h-0 w-full min-w-0 max-w-full flex-1 overflow-auto bg-background p-5 text-[13px] leading-6 whitespace-pre-wrap break-all">{{ selectedMemberDetail.base64Text }}</pre>
+          <pre v-else-if="canHighlightMemberSurface" class="dbx-editor-font-family min-h-0 w-full min-w-0 max-w-full flex-1 overflow-auto bg-background p-5 text-[13px] leading-6" :class="detailTextClass(memberValueView)" v-html="contentSearchHighlightedHtml" />
           <pre v-else class="dbx-editor-font-family min-h-0 w-full min-w-0 max-w-full flex-1 overflow-auto bg-background p-5 text-[13px] leading-6" :class="detailTextClass(memberValueView)">{{ detailTextForFormat(selectedMemberDetail, memberValueView) }}</pre>
         </template>
-        <SheetFooter class="shrink-0 border-t px-5 py-3">
+        <DialogFooter class="mx-0 mb-0 shrink-0 border-t px-5 py-3">
           <template v-if="isEditingMember">
             <Button variant="ghost" :disabled="savingMember" @click="cancelEditMember">
               {{ t("grid.discard") }}
@@ -1702,12 +2566,40 @@ onBeforeUnmount(() => {
             <Pencil class="h-4 w-4" />
             {{ t("redis.editMember") }}
           </Button>
-          <Button variant="outline" @click="copyText(detailTextForFormat(selectedMemberDetail, memberValueView))">
+          <Button variant="outline" @click="copyText(redisClipboardSafeText(detailTextForFormat(selectedMemberDetail, memberValueView)))">
             <Copy class="h-4 w-4" />
             {{ t("redis.copyMember") }}
           </Button>
-        </SheetFooter>
-      </SheetContent>
-    </Sheet>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   </div>
 </template>
+
+<style scoped>
+:deep(.document-search-match),
+:deep(.redis-value-search-match) {
+  border-radius: 2px;
+  background: #fde68a;
+  color: inherit;
+  padding: 0;
+}
+
+:deep(.document-search-match-active),
+:deep(.redis-value-search-match-active) {
+  background: #f59e0b;
+  color: #111827;
+  outline: 1px solid #d97706;
+}
+
+:global(.dark) :deep(.document-search-match),
+:global(.dark) :deep(.redis-value-search-match) {
+  background: #854d0e;
+}
+
+:global(.dark) :deep(.document-search-match-active),
+:global(.dark) :deep(.redis-value-search-match-active) {
+  background: #fbbf24;
+  color: #111827;
+}
+</style>

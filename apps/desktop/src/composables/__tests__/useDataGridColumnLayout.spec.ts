@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 
-import { effectScope, ref } from "vue";
+import { effectScope, nextTick, ref } from "vue";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { dataGridColumnOffsets, dataGridHorizontalColumnWindow, useDataGridColumnLayout, useDataGridColumnLayoutState } from "@/composables/useDataGridColumnLayout";
 
@@ -48,6 +48,112 @@ describe("useDataGridColumnLayout", () => {
     expect(state.visibleColumnIndexes.value).toEqual([0, 1, 2]);
     state.persistColumnOrder([1, 0, 2]);
     expect(state.orderedDisplayableColumnIndexes.value).toEqual([1, 0, 2]);
+    scope.stop();
+  });
+
+  it("reapplies a persisted null-column preference without losing manual visibility state", async () => {
+    const scope = effectScope();
+    const hideNullColumns = ref(true);
+    const allNullColumnIndexes = ref([2]);
+    const state = scope.run(() =>
+      useDataGridColumnLayoutState({
+        columns: ref(["id", "name", "empty"]),
+        sourceColumns: ref(undefined),
+        commentByColumn: ref(new Map()),
+        displayableColumnIndexes: ref([0, 1, 2]),
+        allNullColumnIndexes,
+        columnOrderKeys: ref(["id\0\0", "name\0\0", "empty\0\0"]),
+        layoutScopeKey: ref("persisted-null-layout"),
+        tableScopeKey: ref(""),
+        hideNullColumns,
+        onHideNullColumnsChange: (value) => {
+          hideNullColumns.value = value;
+        },
+      }),
+    )!;
+
+    expect(state.nullColumnsHidden.value).toBe(true);
+    expect(state.visibleColumnIndexes.value).toEqual([0, 1]);
+
+    state.toggleColumnVisibility(1);
+    hideNullColumns.value = false;
+    await nextTick();
+    expect(state.visibleColumnIndexes.value).toEqual([0, 2]);
+
+    hideNullColumns.value = true;
+    await nextTick();
+    expect(state.visibleColumnIndexes.value).toEqual([0]);
+
+    allNullColumnIndexes.value = [];
+    await nextTick();
+    expect(state.nullColumnsHidden.value).toBe(true);
+    expect(state.visibleColumnIndexes.value).toEqual([0, 2]);
+
+    allNullColumnIndexes.value = [2];
+    await nextTick();
+    state.resetColumnVisibility();
+    expect(state.visibleColumnIndexes.value).toEqual([0, 1]);
+
+    state.toggleAllNullColumns();
+    expect(hideNullColumns.value).toBe(false);
+    expect(state.visibleColumnIndexes.value).toEqual([0, 1, 2]);
+    scope.stop();
+  });
+
+  it("restores manually hidden columns after the grid scope is recreated", () => {
+    const hiddenColumnKeys = ref<string[]>([]);
+    const options = {
+      columns: ref(["id", "name", "email"]),
+      sourceColumns: ref(undefined),
+      commentByColumn: ref(new Map()),
+      displayableColumnIndexes: ref([0, 1, 2]),
+      allNullColumnIndexes: ref([]),
+      columnOrderKeys: ref(["id\0\0", "name\0\0", "email\0\0"]),
+      layoutScopeKey: ref("visibility-recreated-layout"),
+      tableScopeKey: ref(""),
+      initialHiddenColumnKeys: hiddenColumnKeys,
+      onHiddenColumnKeysChange: (keys: string[]) => {
+        hiddenColumnKeys.value = keys;
+      },
+    };
+    const firstScope = effectScope();
+    const firstState = firstScope.run(() => useDataGridColumnLayoutState(options))!;
+
+    firstState.toggleColumnVisibility(1);
+    expect(hiddenColumnKeys.value).toEqual(["name\0\0"]);
+    firstScope.stop();
+
+    const recreatedScope = effectScope();
+    const recreatedState = recreatedScope.run(() => useDataGridColumnLayoutState(options))!;
+    expect(recreatedState.visibleColumnIndexes.value).toEqual([0, 2]);
+    recreatedState.showAllColumns();
+    expect(hiddenColumnKeys.value).toEqual([]);
+    recreatedScope.stop();
+  });
+
+  it("persists a null column when it is manually hidden after showing all columns", () => {
+    const onHiddenColumnKeysChange = vi.fn();
+    const scope = effectScope();
+    const state = scope.run(() =>
+      useDataGridColumnLayoutState({
+        columns: ref(["id", "empty"]),
+        sourceColumns: ref(undefined),
+        commentByColumn: ref(new Map()),
+        displayableColumnIndexes: ref([0, 1]),
+        allNullColumnIndexes: ref([1]),
+        columnOrderKeys: ref(["id\0\0", "empty\0\0"]),
+        layoutScopeKey: ref("visibility-null-column-layout"),
+        tableScopeKey: ref(""),
+        hideNullColumns: ref(true),
+        onHiddenColumnKeysChange,
+      }),
+    )!;
+
+    expect(state.visibleColumnIndexes.value).toEqual([0]);
+    state.showAllColumns();
+    state.toggleColumnVisibility(1);
+
+    expect(onHiddenColumnKeysChange).toHaveBeenLastCalledWith(["empty\0\0"]);
     scope.stop();
   });
 
@@ -137,5 +243,224 @@ describe("useDataGridColumnLayout", () => {
     expect(document.body.style.userSelect).toBe("");
     window.dispatchEvent(new PointerEvent("pointerup", { clientX: 180, clientY: 10 }));
     expect(persist).toHaveBeenCalledTimes(1);
+  });
+
+  describe("frozen columns", () => {
+    it("starts with frozenColumnCount of 0", () => {
+      const scope = effectScope();
+      const state = scope.run(() =>
+        useDataGridColumnLayoutState({
+          columns: ref(["id", "name", "email"]),
+          sourceColumns: ref(undefined),
+          commentByColumn: ref(new Map()),
+          displayableColumnIndexes: ref([0, 1, 2]),
+          allNullColumnIndexes: ref([]),
+          columnOrderKeys: ref(["id\0\0", "name\0\0", "email\0\0"]),
+          layoutScopeKey: ref("frozen-test-layout"),
+          tableScopeKey: ref(""),
+        }),
+      )!;
+      expect(state.frozenColumnCount.value).toBe(0);
+      scope.stop();
+    });
+
+    it("freezeToColumn sets frozenColumnCount to visibleColIdx + 1", () => {
+      const scope = effectScope();
+      const state = scope.run(() =>
+        useDataGridColumnLayoutState({
+          columns: ref(["id", "name", "email"]),
+          sourceColumns: ref(undefined),
+          commentByColumn: ref(new Map()),
+          displayableColumnIndexes: ref([0, 1, 2]),
+          allNullColumnIndexes: ref([]),
+          columnOrderKeys: ref(["id\0\0", "name\0\0", "email\0\0"]),
+          layoutScopeKey: ref("frozen-test-layout-2"),
+          tableScopeKey: ref(""),
+        }),
+      )!;
+
+      state.freezeToColumn(0);
+      expect(state.frozenColumnCount.value).toBe(1);
+
+      state.freezeToColumn(2);
+      expect(state.frozenColumnCount.value).toBe(3);
+
+      scope.stop();
+    });
+
+    it("unfreezeAllColumns resets frozenColumnCount to 0", () => {
+      const scope = effectScope();
+      const state = scope.run(() =>
+        useDataGridColumnLayoutState({
+          columns: ref(["id", "name", "email"]),
+          sourceColumns: ref(undefined),
+          commentByColumn: ref(new Map()),
+          displayableColumnIndexes: ref([0, 1, 2]),
+          allNullColumnIndexes: ref([]),
+          columnOrderKeys: ref(["id\0\0", "name\0\0", "email\0\0"]),
+          layoutScopeKey: ref("frozen-test-layout-3"),
+          tableScopeKey: ref(""),
+        }),
+      )!;
+
+      state.freezeToColumn(1);
+      expect(state.frozenColumnCount.value).toBe(2);
+
+      state.unfreezeAllColumns();
+      expect(state.frozenColumnCount.value).toBe(0);
+
+      scope.stop();
+    });
+
+    it("persists frozenColumnCount to localStorage", () => {
+      const scope = effectScope();
+      const state = scope.run(() =>
+        useDataGridColumnLayoutState({
+          columns: ref(["id", "name", "email"]),
+          sourceColumns: ref(undefined),
+          commentByColumn: ref(new Map()),
+          displayableColumnIndexes: ref([0, 1, 2]),
+          allNullColumnIndexes: ref([]),
+          columnOrderKeys: ref(["id\0\0", "name\0\0", "email\0\0"]),
+          layoutScopeKey: ref("frozen-persist-layout"),
+          tableScopeKey: ref(""),
+        }),
+      )!;
+
+      state.freezeToColumn(1);
+      const raw = localStorage.getItem("dbx-data-grid-frozen-columns:frozen-persist-layout");
+      expect(raw).not.toBeNull();
+      expect(JSON.parse(raw!)).toEqual({ version: 1, frozenCount: 2 });
+
+      scope.stop();
+    });
+
+    it("removes localStorage key when unfreezing all columns", () => {
+      const scope = effectScope();
+      const state = scope.run(() =>
+        useDataGridColumnLayoutState({
+          columns: ref(["id", "name", "email"]),
+          sourceColumns: ref(undefined),
+          commentByColumn: ref(new Map()),
+          displayableColumnIndexes: ref([0, 1, 2]),
+          allNullColumnIndexes: ref([]),
+          columnOrderKeys: ref(["id\0\0", "name\0\0", "email\0\0"]),
+          layoutScopeKey: ref("frozen-remove-layout"),
+          tableScopeKey: ref(""),
+        }),
+      )!;
+
+      state.freezeToColumn(0);
+      expect(localStorage.getItem("dbx-data-grid-frozen-columns:frozen-remove-layout")).not.toBeNull();
+
+      state.unfreezeAllColumns();
+      expect(localStorage.getItem("dbx-data-grid-frozen-columns:frozen-remove-layout")).toBeNull();
+
+      scope.stop();
+    });
+
+    it("restores frozenColumnCount from localStorage on load", async () => {
+      localStorage.setItem("dbx-data-grid-frozen-columns:frozen-restore-layout", JSON.stringify({ version: 1, frozenCount: 2 }));
+
+      const scope = effectScope();
+      const state = scope.run(() =>
+        useDataGridColumnLayoutState({
+          columns: ref(["id", "name", "email"]),
+          sourceColumns: ref(undefined),
+          commentByColumn: ref(new Map()),
+          displayableColumnIndexes: ref([0, 1, 2]),
+          allNullColumnIndexes: ref([]),
+          columnOrderKeys: ref(["id\0\0", "name\0\0", "email\0\0"]),
+          layoutScopeKey: ref("frozen-restore-layout"),
+          tableScopeKey: ref(""),
+        }),
+      )!;
+
+      await nextTick();
+      expect(state.frozenColumnCount.value).toBe(2);
+
+      scope.stop();
+    });
+
+    it("restores the pre-freeze order after reload before unfreezing selected columns", async () => {
+      const options = {
+        columns: ref(["id", "name", "email"]),
+        sourceColumns: ref(undefined),
+        commentByColumn: ref(new Map()),
+        displayableColumnIndexes: ref([0, 1, 2]),
+        allNullColumnIndexes: ref([]),
+        columnOrderKeys: ref(["id\0\0", "name\0\0", "email\0\0"]),
+        layoutScopeKey: ref("frozen-reload-layout"),
+        tableScopeKey: ref(""),
+      };
+      const firstScope = effectScope();
+      const firstState = firstScope.run(() => useDataGridColumnLayoutState(options))!;
+
+      firstState.freezeSelectedColumns([2]);
+      expect(firstState.orderedDisplayableColumnIndexes.value).toEqual([2, 0, 1]);
+      firstScope.stop();
+
+      const reloadedScope = effectScope();
+      const reloadedState = reloadedScope.run(() => useDataGridColumnLayoutState(options))!;
+      await nextTick();
+      reloadedState.unfreezeAllColumns();
+
+      expect(reloadedState.frozenColumnCount.value).toBe(0);
+      expect(reloadedState.orderedDisplayableColumnIndexes.value).toEqual([0, 1, 2]);
+      reloadedScope.stop();
+    });
+
+    it("shrinks the persisted frozen count when visible columns are hidden", async () => {
+      const scope = effectScope();
+      const state = scope.run(() =>
+        useDataGridColumnLayoutState({
+          columns: ref(["id", "name", "email"]),
+          sourceColumns: ref(undefined),
+          commentByColumn: ref(new Map()),
+          displayableColumnIndexes: ref([0, 1, 2]),
+          allNullColumnIndexes: ref([]),
+          columnOrderKeys: ref(["id\0\0", "name\0\0", "email\0\0"]),
+          layoutScopeKey: ref("frozen-hidden-layout"),
+          tableScopeKey: ref(""),
+        }),
+      )!;
+
+      state.freezeToColumn(2);
+      state.toggleColumnVisibility(1);
+      await nextTick();
+
+      expect(state.frozenColumnCount.value).toBe(2);
+      expect(JSON.parse(localStorage.getItem("dbx-data-grid-frozen-columns:frozen-hidden-layout")!)).toMatchObject({ frozenCount: 2 });
+      scope.stop();
+    });
+
+    it("allows changing frozen count from one value to another", () => {
+      const scope = effectScope();
+      const state = scope.run(() =>
+        useDataGridColumnLayoutState({
+          columns: ref(["id", "name", "email", "phone"]),
+          sourceColumns: ref(undefined),
+          commentByColumn: ref(new Map()),
+          displayableColumnIndexes: ref([0, 1, 2, 3]),
+          allNullColumnIndexes: ref([]),
+          columnOrderKeys: ref(["id\0\0", "name\0\0", "email\0\0", "phone\0\0"]),
+          layoutScopeKey: ref("frozen-change-layout"),
+          tableScopeKey: ref(""),
+        }),
+      )!;
+
+      state.freezeToColumn(1);
+      expect(state.frozenColumnCount.value).toBe(2);
+
+      // 增加冻结列数
+      state.freezeToColumn(3);
+      expect(state.frozenColumnCount.value).toBe(4);
+
+      // 减少冻结列数
+      state.freezeToColumn(0);
+      expect(state.frozenColumnCount.value).toBe(1);
+
+      scope.stop();
+    });
   });
 });

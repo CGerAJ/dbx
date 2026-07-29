@@ -3,15 +3,18 @@ import { columnOrderKeysForIndexes, isDefaultColumnOrder, moveVisibleColumnIndex
 import { columnHeaderCanvasPointerDisabled, columnHeaderClickShouldBeSuppressed, columnHeaderPreviewOffsetForColumn, columnHeaderTooltipDisabled } from "@/lib/dataGrid/dataGridColumnHeaderInteraction";
 import {
   loadDataGridColumnOrder,
+  loadDataGridColumnFrozenState,
   loadTableDataGridColumnOrder,
   notifyTableDataGridColumnOrderChanged,
   removeDataGridColumnOrder,
+  removeDataGridColumnFrozenCount,
   removeTableDataGridColumnOrder,
   saveDataGridColumnOrder,
+  saveDataGridColumnFrozenCount,
   saveTableDataGridColumnOrder,
   type TableDataGridColumnOrderChangedDetail,
 } from "@/lib/dataGrid/dataGridColumnLayoutStorage";
-import { filterColumnVisibilityOptions, hiddenColumnIndexesWithAllNullColumns, invertedHiddenColumnIndexes, nextHiddenColumnIndexes, removeAutoHiddenColumnIndexes, visibleColumnIndexesForFilter } from "@/lib/dataGrid/dataGridColumnVisibility";
+import { filterColumnVisibilityOptions, hiddenColumnIndexesForKeys, hiddenColumnIndexesWithAllNullColumns, hiddenColumnKeysForIndexes, invertedHiddenColumnIndexes, nextHiddenColumnIndexes, removeAutoHiddenColumnIndexes, visibleColumnIndexesForFilter } from "@/lib/dataGrid/dataGridColumnVisibility";
 
 export type RenderedDataGridColumn = {
   visibleColIdx: number;
@@ -73,12 +76,20 @@ export function useDataGridColumnLayoutState(options: {
   columnOrderKeys: MaybeRefOrGetter<readonly string[]>;
   layoutScopeKey: MaybeRefOrGetter<string>;
   tableScopeKey: MaybeRefOrGetter<string>;
+  initialHiddenColumnKeys?: MaybeRefOrGetter<readonly string[] | undefined>;
+  hideNullColumns?: MaybeRefOrGetter<boolean>;
+  onHiddenColumnKeysChange?: (keys: string[]) => void;
+  onHideNullColumnsChange?: (value: boolean) => void;
   onRefreshMetrics?: () => void;
 }) {
-  const hiddenColumnIndexes = ref<Set<number>>(new Set());
-  const nullColumnsHidden = ref(false);
+  const hiddenColumnIndexes = ref<Set<number>>(hiddenColumnIndexesForKeys(toValue(options.initialHiddenColumnKeys), toValue(options.columnOrderKeys), toValue(options.displayableColumnIndexes)));
+  const localNullColumnsHidden = ref(false);
+  const nullColumnsHidden = computed(() => (options.hideNullColumns === undefined ? localNullColumnsHidden.value : toValue(options.hideNullColumns)));
   const autoHiddenNullColumnIndexes = ref<Set<number>>(new Set());
   const persistedColumnOrderKeys = ref<string[]>([]);
+  const frozenColumnCount = ref(0);
+  // 冻结选中列前的列序快照，取消冻结时还原
+  const columnOrderSnapshotBeforeFreeze = ref<string[] | null>(null);
   const orderedDisplayableColumnIndexes = computed(() => orderedColumnIndexes({ availableIndexes: toValue(options.displayableColumnIndexes), columnKeys: toValue(options.columnOrderKeys), orderedKeys: persistedColumnOrderKeys.value }));
   const visibleColumnIndexes = computed(() => visibleColumnIndexesForFilter(orderedDisplayableColumnIndexes.value, hiddenColumnIndexes.value));
   const displayableColumnCount = computed(() => toValue(options.displayableColumnIndexes).length);
@@ -94,19 +105,93 @@ export function useDataGridColumnLayoutState(options: {
   function isColumnVisible(columnIndex: number) {
     return !hiddenColumnIndexes.value.has(columnIndex);
   }
+  function persistHiddenColumnKeys() {
+    options.onHiddenColumnKeysChange?.(hiddenColumnKeysForIndexes(hiddenColumnIndexes.value, autoHiddenNullColumnIndexes.value, toValue(options.columnOrderKeys), toValue(options.displayableColumnIndexes)));
+  }
   function toggleColumnVisibility(columnIndex: number) {
     hiddenColumnIndexes.value = nextHiddenColumnIndexes({ columnIndex, hiddenIndexes: hiddenColumnIndexes.value, totalColumns: displayableColumnCount.value });
+    if (!hiddenColumnIndexes.value.has(columnIndex) && autoHiddenNullColumnIndexes.value.delete(columnIndex)) {
+      autoHiddenNullColumnIndexes.value = new Set(autoHiddenNullColumnIndexes.value);
+    }
+    persistHiddenColumnKeys();
   }
   function showAllColumns() {
     hiddenColumnIndexes.value = new Set();
+    autoHiddenNullColumnIndexes.value = new Set();
+    persistHiddenColumnKeys();
   }
   function invertColumnVisibility() {
     hiddenColumnIndexes.value = invertedHiddenColumnIndexes([...toValue(options.displayableColumnIndexes)], hiddenColumnIndexes.value);
+    autoHiddenNullColumnIndexes.value = new Set();
+    persistHiddenColumnKeys();
+  }
+  function showColumn(columnIndex: number) {
+    if (!hiddenColumnIndexes.value.has(columnIndex)) return;
+    hiddenColumnIndexes.value.delete(columnIndex);
+    hiddenColumnIndexes.value = new Set(hiddenColumnIndexes.value);
+    autoHiddenNullColumnIndexes.value.delete(columnIndex);
+    autoHiddenNullColumnIndexes.value = new Set(autoHiddenNullColumnIndexes.value);
+    persistHiddenColumnKeys();
   }
   function loadColumnOrder() {
     const tableScopeKey = toValue(options.tableScopeKey);
     const tableOrder = tableScopeKey ? loadTableDataGridColumnOrder(tableScopeKey) : [];
     persistedColumnOrderKeys.value = tableOrder.length ? tableOrder : loadDataGridColumnOrder(toValue(options.layoutScopeKey), toValue(options.columnOrderKeys));
+  }
+  function loadFrozenColumnCount() {
+    const state = loadDataGridColumnFrozenState(toValue(options.layoutScopeKey));
+    frozenColumnCount.value = Math.min(state.frozenCount, visibleColumnIndexes.value.length);
+    columnOrderSnapshotBeforeFreeze.value = state.orderBeforeFreeze;
+  }
+  function setFrozenColumnCount(count: number) {
+    const clampedCount = Math.max(0, Math.min(count, visibleColumnIndexes.value.length));
+    frozenColumnCount.value = clampedCount;
+    if (clampedCount > 0) {
+      saveDataGridColumnFrozenCount(toValue(options.layoutScopeKey), clampedCount, columnOrderSnapshotBeforeFreeze.value);
+    } else {
+      removeDataGridColumnFrozenCount(toValue(options.layoutScopeKey));
+    }
+  }
+  function freezeToColumn(visibleColIdx: number) {
+    setFrozenColumnCount(visibleColIdx + 1);
+  }
+  function freezeSelectedColumns(selectedVisibleColIdxs: number[]) {
+    if (selectedVisibleColIdxs.length === 0) return;
+    const sorted = [...selectedVisibleColIdxs].sort((a, b) => a - b);
+    const visibleIdxs = visibleColumnIndexes.value;
+    // 获取选中列的 actualColIdx
+    const selectedActualIdxs = sorted.map((vIdx) => visibleIdxs[vIdx]).filter((idx): idx is number => idx !== undefined);
+    if (selectedActualIdxs.length === 0) return;
+    const selectedSet = new Set(selectedActualIdxs);
+    // 非选中列保持原序
+    const currentOrder = orderedDisplayableColumnIndexes.value;
+    const nonSelectedActualIdxs = currentOrder.filter((idx) => !selectedSet.has(idx));
+    // 保存冻结前的列序快照（仅在首次冻结时保存，避免连续冻结覆盖快照）
+    if (columnOrderSnapshotBeforeFreeze.value === null) {
+      columnOrderSnapshotBeforeFreeze.value = [...persistedColumnOrderKeys.value];
+    }
+    // 新列序：选中列在前 + 非选中列在后
+    persistColumnOrder([...selectedActualIdxs, ...nonSelectedActualIdxs]);
+    setFrozenColumnCount(selectedActualIdxs.length);
+  }
+  function unfreezeAllColumns() {
+    setFrozenColumnCount(0);
+    // 还原冻结前的列序
+    if (columnOrderSnapshotBeforeFreeze.value !== null) {
+      const snapshot = columnOrderSnapshotBeforeFreeze.value;
+      columnOrderSnapshotBeforeFreeze.value = null;
+      if (snapshot.length === 0) {
+        resetColumnOrder();
+      } else {
+        persistedColumnOrderKeys.value = snapshot;
+        saveDataGridColumnOrder(toValue(options.layoutScopeKey), toValue(options.columnOrderKeys), snapshot);
+        const tableScopeKey = toValue(options.tableScopeKey);
+        if (tableScopeKey) {
+          saveTableDataGridColumnOrder(tableScopeKey, snapshot);
+          notifyTableDataGridColumnOrderChanged(tableScopeKey);
+        }
+      }
+    }
   }
   function persistColumnOrder(indexes: number[]) {
     const tableScopeKey = toValue(options.tableScopeKey);
@@ -137,16 +222,25 @@ export function useDataGridColumnLayoutState(options: {
     persistedColumnOrderKeys.value = [];
     if (options.onRefreshMetrics) nextTick(options.onRefreshMetrics);
   }
-  function showAllNullColumns() {
+  function setNullColumnsHidden(value: boolean) {
+    if (options.hideNullColumns === undefined) localNullColumnsHidden.value = value;
+    else options.onHideNullColumnsChange?.(value);
+  }
+  function applyNullColumnVisibility(hidden: boolean) {
     hiddenColumnIndexes.value = removeAutoHiddenColumnIndexes(hiddenColumnIndexes.value, autoHiddenNullColumnIndexes.value);
     autoHiddenNullColumnIndexes.value = new Set();
-    nullColumnsHidden.value = false;
-  }
-  function hideAllNullColumns() {
+    if (!hidden) return;
     const next = hiddenColumnIndexesWithAllNullColumns({ availableIndexes: [...toValue(options.displayableColumnIndexes)], hiddenIndexes: hiddenColumnIndexes.value, allNullIndexes: new Set(toValue(options.allNullColumnIndexes)) });
     hiddenColumnIndexes.value = next.hiddenIndexes;
     autoHiddenNullColumnIndexes.value = next.autoHiddenIndexes;
-    nullColumnsHidden.value = next.autoHiddenIndexes.size > 0;
+  }
+  function showAllNullColumns() {
+    setNullColumnsHidden(false);
+    applyNullColumnVisibility(false);
+  }
+  function hideAllNullColumns() {
+    setNullColumnsHidden(true);
+    applyNullColumnVisibility(true);
   }
   function toggleAllNullColumns() {
     if (nullColumnsHidden.value) showAllNullColumns();
@@ -160,22 +254,28 @@ export function useDataGridColumnLayoutState(options: {
     if (options.onRefreshMetrics) nextTick(options.onRefreshMetrics);
   }
 
-  function resetColumnVisibility() {
-    hiddenColumnIndexes.value = new Set();
+  function resetColumnVisibility(hiddenColumnKeys: readonly string[] = []) {
+    hiddenColumnIndexes.value = hiddenColumnIndexesForKeys(hiddenColumnKeys, toValue(options.columnOrderKeys), toValue(options.displayableColumnIndexes));
     autoHiddenNullColumnIndexes.value = new Set();
-    nullColumnsHidden.value = false;
+    applyNullColumnVisibility(nullColumnsHidden.value);
   }
 
+  watch([() => nullColumnsHidden.value, () => [...toValue(options.allNullColumnIndexes)], () => [...toValue(options.displayableColumnIndexes)]], ([hidden]) => applyNullColumnVisibility(hidden as boolean), { immediate: true });
   watch(
-    () => [...toValue(options.allNullColumnIndexes)],
-    () => {
-      if (!nullColumnsHidden.value) return;
-      hiddenColumnIndexes.value = removeAutoHiddenColumnIndexes(hiddenColumnIndexes.value, autoHiddenNullColumnIndexes.value);
-      autoHiddenNullColumnIndexes.value = new Set();
-      hideAllNullColumns();
+    () => visibleColumnIndexes.value.length,
+    (visibleCount) => {
+      if (frozenColumnCount.value > visibleCount) setFrozenColumnCount(visibleCount);
     },
+    { flush: "sync" },
   );
-  watch([() => toValue(options.layoutScopeKey), () => toValue(options.tableScopeKey)], loadColumnOrder, { immediate: true });
+  watch(
+    [() => toValue(options.layoutScopeKey), () => toValue(options.tableScopeKey)],
+    () => {
+      loadColumnOrder();
+      loadFrozenColumnCount();
+    },
+    { immediate: true },
+  );
 
   return {
     hiddenColumnIndexes,
@@ -192,11 +292,16 @@ export function useDataGridColumnLayoutState(options: {
     toggleColumnVisibility,
     showAllColumns,
     invertColumnVisibility,
+    showColumn,
     persistColumnOrder,
     resetColumnOrder,
     toggleAllNullColumns,
     resetColumnVisibility,
     onTableDataGridColumnOrderChanged,
+    frozenColumnCount,
+    freezeToColumn,
+    freezeSelectedColumns,
+    unfreezeAllColumns,
   };
 }
 
@@ -217,8 +322,10 @@ export function useDataGridColumnLayout(options: {
   onCanvasDrawSchedule?: () => void;
   onRefreshMetrics?: () => void;
   onPersistColumnOrder?: (indexes: number[]) => void;
+  frozenColumnCount?: MaybeRefOrGetter<number>;
 }) {
   const renderedColumnOffsets = computed(() => dataGridColumnOffsets(toValue(options.renderedColumnWidths)));
+  const frozenColumnCount = computed(() => toValue(options.frozenColumnCount ?? 0));
   const horizontalColumnWindow = computed(() =>
     dataGridHorizontalColumnWindow({
       widths: toValue(options.renderedColumnWidths),
@@ -234,15 +341,46 @@ export function useDataGridColumnLayout(options: {
     const columnNames = toValue(options.columnNames);
     const visibleIndexes = toValue(options.visibleColumnIndexes);
     const window = horizontalColumnWindow.value;
-    return visibleIndexes.slice(window.start, window.end).map((actualColIdx, offset) => ({
-      visibleColIdx: window.start + offset,
-      actualColIdx,
-      name: columnNames[actualColIdx] ?? "",
-    }));
+    const frozen = frozenColumnCount.value;
+    // 无冻结列时保持原始行为
+    if (frozen === 0) {
+      return visibleIndexes.slice(window.start, window.end).map((actualColIdx, offset) => ({
+        visibleColIdx: window.start + offset,
+        actualColIdx,
+        name: columnNames[actualColIdx] ?? "",
+      }));
+    }
+    const result: RenderedDataGridColumn[] = [];
+    // 冻结列始终包含在渲染窗口中（0 ~ frozen-1）
+    for (let i = 0; i < frozen && i < visibleIndexes.length; i++) {
+      result.push({ visibleColIdx: i, actualColIdx: visibleIndexes[i], name: columnNames[visibleIndexes[i]] ?? "" });
+    }
+    // 非冻结列从 max(window.start, frozen) 到 window.end
+    const nonFrozenStart = Math.max(window.start, frozen);
+    for (let i = nonFrozenStart; i < window.end && i < visibleIndexes.length; i++) {
+      result.push({ visibleColIdx: i, actualColIdx: visibleIndexes[i], name: columnNames[visibleIndexes[i]] ?? "" });
+    }
+    return result;
+  });
+  // 冻结列占位宽度：非冻结列的前置占位需要排除冻结列
+  const frozenWidth = computed(() => renderedColumnOffsets.value[frozenColumnCount.value] ?? 0);
+  const horizontalColumnWindowBeforeWidth = computed(() => {
+    const window = horizontalColumnWindow.value;
+    const frozen = frozenColumnCount.value;
+    if (frozen === 0) return window.beforeWidth ?? 0;
+    // 非冻结列从 max(window.start, frozen) 开始，前置占位 = 该列偏移 - 冻结列宽度
+    const nonFrozenStart = Math.max(window.start, frozen);
+    return Math.max(0, (renderedColumnOffsets.value[nonFrozenStart] ?? 0) - (renderedColumnOffsets.value[frozen] ?? 0));
   });
 
   function renderedColumnStyle(visibleColIdx: number) {
-    return { width: `var(--col-w-${visibleColIdx})` };
+    const style: Record<string, string | number> = { width: `var(--col-w-${visibleColIdx})` };
+    if (visibleColIdx < frozenColumnCount.value) {
+      style.position = "sticky";
+      style.left = `${columnContentOffsetLeft(visibleColIdx)}px`;
+      style.zIndex = 10;
+    }
+    return style;
   }
 
   function columnContentOffsetLeft(visibleColIdx: number): number {
@@ -469,6 +607,10 @@ export function useDataGridColumnLayout(options: {
   function columnHeaderStyle(visibleColIdx: number) {
     const style = renderedColumnStyle(visibleColIdx);
     const offset = columnHeaderPreviewOffset(visibleColIdx);
+    // 冻结列头需要更高 z-index（与列头行号 z-20 一致）以覆盖非冻结列头
+    if (visibleColIdx < frozenColumnCount.value) {
+      (style as Record<string, string | number>).zIndex = 20;
+    }
     if (!offset) return style;
     return { ...style, transform: `translateX(${offset}px)`, transition: columnHeaderDragState.value?.sourceVisibleIndex === visibleColIdx ? undefined : "transform 120ms ease-out" };
   }
@@ -496,6 +638,8 @@ export function useDataGridColumnLayout(options: {
     renderedGridColumns,
     renderedColumnStyle,
     columnContentOffsetLeft,
+    frozenWidth,
+    horizontalColumnWindowBeforeWidth,
     columnHeaderDragState,
     columnHeaderResizeActive,
     columnHeaderTooltipsDisabled,

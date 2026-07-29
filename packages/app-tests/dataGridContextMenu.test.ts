@@ -23,7 +23,13 @@ test("set NULL applies a real null value only to editable selections", () => {
   assert.doesNotMatch(handler, /fillSelectionWithValue\(["'](?:NULL)?["']\)/);
 });
 
-test("editable cell selections expose set NULL before bulk edit", () => {
+test("column-header context menus defer copy statement generation", () => {
+  const handler = dataGridSource.match(/function onHeaderContext\([^]*?\n\}/)?.[0] ?? "";
+
+  assert.doesNotMatch(handler, /prefetchCopyStatements/);
+});
+
+test("editable cell selections expose generation after bulk edit", () => {
   const icon = {};
   const action = () => {};
   const items = createDataGridCellContextMenuItems({
@@ -39,6 +45,7 @@ test("editable cell selections expose set NULL before bulk edit", () => {
     actions: { cellDetails: action, columnDetails: action, rowDetails: action, setNull: action, bulkEdit: action, transpose: action },
     copySubmenu: { label: "copy" },
     selectionSubmenu: { label: "selection" },
+    generateSubmenu: { label: "generate", disabled: true },
   });
 
   assert.deepEqual(
@@ -47,6 +54,7 @@ test("editable cell selections expose set NULL before bulk edit", () => {
       { label: "copy", disabled: undefined },
       { label: "set null", disabled: true },
       { label: "bulk edit", disabled: true },
+      { label: "generate", disabled: true },
     ],
   );
 });

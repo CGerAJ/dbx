@@ -71,6 +71,127 @@ BEGIN
    SELECT 1 + 2 INTO PRE_TRD_DATE FROM DUAL;
 END;`;
 
+const gaussDbNestedProcedure = `CREATE OR REPLACE PROCEDURE public.dbx_issue_4318()
+AS
+BEGIN
+  BEGIN
+    NULL;
+  END;
+  NULL;
+END;`;
+
+const gaussDbDollarQuotedFunctionScript = `DROP FUNCTION IF EXISTS dbx_issue_4572_tmp_md5_uuid;
+
+CREATE OR REPLACE FUNCTION dbx_issue_4572_tmp_md5_uuid (v_str IN TEXT) RETURNS varchar(36) LANGUAGE PLPGSQL IMMUTABLE AS $function$
+DECLARE
+    str1 TEXT;
+BEGIN
+    str1 := md5(v_str);
+    RETURN CAST(str1 AS varchar(36));
+END$function$;
+
+DROP FUNCTION IF EXISTS dbx_issue_4572_tmp_missing;`;
+
+const gaussDbIssue4573Script = `CREATE OR REPLACE PROCEDURE createIndex (
+  dbName IN VARCHAR(32),
+  tableName IN VARCHAR(64),
+  indexInfo IN VARCHAR(64),
+  indexColumns IN VARCHAR(128)
+) AS
+DECLARE STMT TEXT;
+
+DECLARE flag int;
+
+BEGIN
+SELECT
+  count(*) INTO flag
+FROM
+  PG_CATALOG.PG_INDEXES
+WHERE
+  schemaname = dbName
+  AND TABLENAME = tableName
+  AND INDEXNAME = indexInfo;
+
+IF flag = 0 THEN STMT := 'CREATE INDEX ' || indexInfo || ' ON ' || dbName || '.' || tableName || '(' || indexColumns || ')';
+
+EXECUTE STMT;
+
+END IF;
+
+END;
+
+SELECT 1 AS after_procedure;
+SELECT 2 AS final_statement;`;
+
+const xuguProgrammableObjectFixtures = [
+  `CREATE OR REPLACE PROCEDURE dbx_xugu_procedure AS
+  v_value INTEGER;
+BEGIN
+  v_value := 1;
+END;`,
+  `CREATE PROCEDURE dbx_xugu_procedure_without_replace AS
+  v_value INTEGER;
+BEGIN
+  v_value := 1;
+END;`,
+  `CREATE OR REPLACE FUNCTION dbx_xugu_function RETURN INTEGER AS
+BEGIN
+  RETURN 1;
+END;`,
+  `CREATE FUNCTION dbx_xugu_function_without_replace RETURN INTEGER AS
+BEGIN
+  RETURN 1;
+END;`,
+  `CREATE OR REPLACE TRIGGER dbx_xugu_trigger
+BEFORE INSERT ON dbx_xugu_events
+FOR EACH ROW
+BEGIN
+  NULL;
+END;`,
+  `CREATE TRIGGER dbx_xugu_trigger_without_replace
+BEFORE INSERT ON dbx_xugu_events
+FOR EACH ROW
+BEGIN
+  NULL;
+END;`,
+  `CREATE OR REPLACE PACKAGE BODY dbx_xugu_package AS
+  PROCEDURE ping AS
+  BEGIN
+    NULL;
+  END ping;
+END dbx_xugu_package;`,
+  `CREATE PACKAGE BODY dbx_xugu_package_without_replace AS
+  PROCEDURE ping AS
+  BEGIN
+    NULL;
+  END ping;
+END dbx_xugu_package_without_replace;`,
+  `CREATE OR REPLACE FORCE PACKAGE BODY dbx_xugu_force_package AS
+  PROCEDURE ping AS
+  BEGIN
+    NULL;
+  END ping;
+END dbx_xugu_force_package;`,
+  `CREATE OR REPLACE NOFORCE PACKAGE BODY dbx_xugu_noforce_package AS
+  PROCEDURE ping AS
+  BEGIN
+    NULL;
+  END ping;
+END dbx_xugu_noforce_package;`,
+  `CREATE OR REPLACE TYPE BODY dbx_xugu_type AS
+  MEMBER PROCEDURE ping IS
+  BEGIN
+    NULL;
+  END;
+END;`,
+  `CREATE TYPE BODY dbx_xugu_type_without_replace AS
+  MEMBER PROCEDURE ping IS
+  BEGIN
+    NULL;
+  END;
+END;`,
+];
+
 const mysqlRoutineFixture = `CREATE PROCEDURE p()
 BEGIN
   SELECT 1;
@@ -210,6 +331,71 @@ describe("splitSqlStatementRanges", () => {
     expect(rangeSqlTexts(splitSqlStatementRanges(oracleIssue2405PlSql, "oracle"))).toEqual([oracleIssue2405PlSql]);
   });
 
+  it("keeps nested GaussDB procedure blocks together", () => {
+    expect(rangeSqlTexts(splitSqlStatementRanges(gaussDbNestedProcedure, "gaussdb"))).toEqual([gaussDbNestedProcedure]);
+  });
+
+  it("separates GaussDB dollar-quoted functions from surrounding statements", () => {
+    const ranges = splitSqlStatementRanges(gaussDbDollarQuotedFunctionScript, "gaussdb");
+    expect(rangeSqlTexts(ranges)).toEqual([
+      "DROP FUNCTION IF EXISTS dbx_issue_4572_tmp_md5_uuid",
+      gaussDbDollarQuotedFunctionScript.slice(gaussDbDollarQuotedFunctionScript.indexOf("CREATE"), gaussDbDollarQuotedFunctionScript.lastIndexOf(";\n\nDROP")),
+      "DROP FUNCTION IF EXISTS dbx_issue_4572_tmp_missing",
+    ]);
+  });
+
+  it("separates the issue #4573 GaussDB procedure from following statements", () => {
+    expect(rangeSqlTexts(splitSqlStatementRanges(gaussDbIssue4573Script, "gaussdb"))).toEqual([gaussDbIssue4573Script.slice(0, gaussDbIssue4573Script.indexOf("\n\nSELECT 1")), "SELECT 1 AS after_procedure", "SELECT 2 AS final_statement"]);
+  });
+
+  it("keeps Xugu programmable object DDL together and retains its terminator", () => {
+    for (const sql of xuguProgrammableObjectFixtures) {
+      const ranges = splitSqlStatementRanges(`${sql}\nSELECT 1;`, "xugu");
+      expect(rangeSqlTexts(ranges)).toEqual([sql, "SELECT 1"]);
+      expect(ranges[0].sql.trimEnd()).toMatch(/END(?:\s+\w+)?;$/);
+    }
+  });
+
+  it("splits Xugu package specification without a slash before following SQL", () => {
+    const packageSpec = `CREATE OR REPLACE PACKAGE pkg_utils AS
+  FUNCTION get_version RETURN VARCHAR2;
+  PROCEDURE log_message(msg VARCHAR2);
+END pkg_utils;`;
+    const forcePackageSpec = `CREATE OR REPLACE FORCE PACKAGE pkg_utils AS
+  PROCEDURE ping;
+END pkg_utils;`;
+    const packageSpecWithoutReplace = `CREATE PACKAGE pkg_utils_without_replace AS
+  PROCEDURE ping;
+END pkg_utils_without_replace;`;
+
+    expect(rangeSqlTexts(splitSqlStatementRanges(`${packageSpec}\nSELECT 1;`, "xugu"))).toEqual([packageSpec, "SELECT 1"]);
+    expect(rangeSqlTexts(splitSqlStatementRanges(`${packageSpec}\n/\nSELECT 1;`, "xugu"))).toEqual([packageSpec, "SELECT 1"]);
+    expect(rangeSqlTexts(splitSqlStatementRanges(`${forcePackageSpec}\nSELECT 1;`, "xugu"))).toEqual([forcePackageSpec, "SELECT 1"]);
+    expect(rangeSqlTexts(splitSqlStatementRanges(`${packageSpecWithoutReplace}\nSELECT 1;`, "xugu"))).toEqual([packageSpecWithoutReplace, "SELECT 1"]);
+  });
+
+  it("splits plain CREATE TYPE AS OBJECT on semicolon without waiting for END", () => {
+    const sql = "CREATE OR REPLACE TYPE address_t AS OBJECT (id INT);\nSELECT 1;";
+    expect(rangeSqlTexts(splitSqlStatementRanges(sql, "xugu"))).toEqual(["CREATE OR REPLACE TYPE address_t AS OBJECT (id INT)", "SELECT 1"]);
+    expect(rangeSqlTexts(splitSqlStatementRanges("CREATE TYPE address_t_without_replace AS OBJECT (id INT);\nSELECT 1;", "xugu"))).toEqual(["CREATE TYPE address_t_without_replace AS OBJECT (id INT)", "SELECT 1"]);
+  });
+
+  it("keeps Oracle-style CASE expressions inside Xugu and Oracle routines", () => {
+    const routine = `CREATE OR REPLACE FUNCTION dbx_case_expr RETURN NUMBER AS
+BEGIN
+  RETURN CASE WHEN 1 = 1 THEN CASE WHEN 2 = 2 THEN 1 ELSE 2 END ELSE 0 END;
+END;`;
+    const caseStatementRoutine = `CREATE OR REPLACE PROCEDURE dbx_case_statement AS
+BEGIN
+  CASE WHEN 1 = 1 THEN NULL; ELSE NULL; END CASE;
+END;`;
+
+    for (const database of ["xugu", "oracle"] as const) {
+      expect(rangeSqlTexts(splitSqlStatementRanges(`${routine}\nSELECT 1;`, database))).toEqual([routine, "SELECT 1"]);
+      expect(rangeSqlTexts(splitSqlStatementRanges(`${caseStatementRoutine}\nSELECT 1;`, database))).toEqual([caseStatementRoutine, "SELECT 1"]);
+    }
+  });
+
   it("keeps SAP HANA DO blocks together", () => {
     const ranges = splitSqlStatementRanges(sapHanaDoBlockFixture, "saphana");
 
@@ -220,6 +406,54 @@ describe("splitSqlStatementRanges", () => {
 });
 
 describe("statementRangeAtCursor", () => {
+  it("splits Elasticsearch REST requests without semicolons", () => {
+    const sql = `# node information
+GET /_nodes/stats/jvm?pretty
+
+// search orders
+POST /orders/_search
+{
+  "query": { "match_all": {} }
+}
+
+HEAD /orders`;
+
+    expect(rangeSqlTexts(splitSqlStatementRanges(sql, "elasticsearch"))).toEqual(["GET /_nodes/stats/jvm?pretty", 'POST /orders/_search\n{\n  "query": { "match_all": {} }\n}', "HEAD /orders"]);
+    expect(hasMultipleExecutionTargets(sql, "elasticsearch")).toBe(true);
+  });
+
+  it("targets the Elasticsearch request following a comment", () => {
+    const sql = "# JVM statistics\nGET /_nodes/stats/jvm?pretty\n\nGET /_cluster/health";
+
+    expect(statementRangeAtCursor(sql, indexOf(sql, "JVM"), "elasticsearch")?.sql).toBe("GET /_nodes/stats/jvm?pretty");
+    expect(statementRangeAtCursor(sql, indexOf(sql, "cluster"), "elasticsearch")?.sql).toBe("GET /_cluster/health");
+  });
+
+  it("splits and targets Elasticsearch requests after block comments", () => {
+    const sql = `/* node information
+   including JVM details */
+GET /_nodes/stats/jvm?pretty
+
+/* cluster information */
+GET /_cluster/health`;
+
+    expect(rangeSqlTexts(splitSqlStatementRanges(sql, "elasticsearch"))).toEqual(["GET /_nodes/stats/jvm?pretty", "GET /_cluster/health"]);
+    expect(statementRangeAtCursor(sql, indexOf(sql, "JVM details"), "elasticsearch")?.sql).toBe("GET /_nodes/stats/jvm?pretty");
+    expect(statementRangeAtCursor(sql, indexOf(sql, "cluster information"), "elasticsearch")?.sql).toBe("GET /_cluster/health");
+  });
+
+  it("ignores request-looking lines inside Elasticsearch block comments", () => {
+    const sql = `GET /_cluster/health
+
+/* disabled cleanup
+DELETE /important-index
+*/
+GET /_cat/indices`;
+
+    expect(rangeSqlTexts(splitSqlStatementRanges(sql, "elasticsearch"))).toEqual(["GET /_cluster/health", "GET /_cat/indices"]);
+    expect(statementRangeAtCursor(sql, indexOf(sql, "important-index"), "elasticsearch")?.sql).toBe("GET /_cat/indices");
+  });
+
   it("returns the first statement when the cursor is inside it", () => {
     const sql = "SELECT 1;\nSELECT 2;";
     const pos = indexOf(sql, "1");
@@ -393,6 +627,73 @@ COMMENT = '测试';`;
     expect(statementRangeAtCursor(sql, indexOf(sql, "ALTER"), "mysql")?.sql.trim()).toBe(sql.slice(0, -1));
     expect(statementRangeAtCursor(sql, indexOf(sql, "ALTER COLUMN"), "mysql")?.sql.trim()).toBe(sql.slice(0, -1));
     expect(rangeSqlTexts(executableStatementRanges(sql, "mysql"))).toEqual([sql.slice(0, -1)]);
+  });
+
+  it("keeps MySQL ALTER TABLE truncate partition clauses with the statement", () => {
+    const sql = "ALTER TABLE ems.r_r_curve_e_hour\nTRUNCATE PARTITION p202602, p202603, p202604, p202605, p202606;";
+
+    expect(statementRangeAtCursor(sql, indexOf(sql, "ALTER"), "mysql")?.sql.trim()).toBe(sql.slice(0, -1));
+    expect(statementRangeAtCursor(sql, indexOf(sql, "TRUNCATE"), "mysql")?.sql.trim()).toBe(sql.slice(0, -1));
+    expect(rangeSqlTexts(executableStatementRanges(sql, "mysql"))).toEqual([sql.slice(0, -1)]);
+  });
+
+  it("keeps MySQL truncate partition clauses when comments separate ALTER TABLE", () => {
+    const sql = "ALTER /* online ddl */ TABLE t\nTRUNCATE PARTITION p0;";
+
+    expect(statementRangeAtCursor(sql, indexOf(sql, "TRUNCATE"), "mysql")?.sql.trim()).toBe(sql.slice(0, -1));
+    expect(rangeSqlTexts(executableStatementRanges(sql, "mysql"))).toEqual([sql.slice(0, -1)]);
+  });
+
+  it("keeps MySQL truncate partition clauses when comments precede PARTITION", () => {
+    const sql = "ALTER TABLE t\nTRUNCATE /* keep */ PARTITION p0;";
+
+    expect(statementRangeAtCursor(sql, indexOf(sql, "TRUNCATE"), "mysql")?.sql.trim()).toBe(sql.slice(0, -1));
+    expect(rangeSqlTexts(executableStatementRanges(sql, "mysql"))).toEqual([sql.slice(0, -1)]);
+  });
+
+  it("keeps standalone truncate table statements separate from preceding alter statements", () => {
+    const sql = "ALTER TABLE events ADD COLUMN source varchar(100)\nTRUNCATE TABLE events;";
+
+    expect(rangeSqlTexts(executableStatementRanges(sql, "mysql"))).toEqual(["ALTER TABLE events ADD COLUMN source varchar(100)", "TRUNCATE TABLE events"]);
+    expect(rangeSqlTexts(executableStatementRanges(sql, "postgres"))).toEqual(["ALTER TABLE events ADD COLUMN source varchar(100)", "TRUNCATE TABLE events"]);
+  });
+
+  it("keeps issue #4045 ClickHouse ALTER TABLE UPDATE mutation together", () => {
+    const sql = `ALTER TABLE m2_db.history_data5
+UPDATE value = 14.06
+WHERE uuid IN (
+    SELECT uuid
+    FROM m2_db.pt_uuid_mapping
+    WHERE point_id = 'TEST_Location_1_L2_METER_2_AE_DIFF_H'
+)
+AND ts = toDateTime('2026-07-15 12:00:00');`;
+
+    expect(statementRangeAtCursor(sql, indexOf(sql, "ALTER"), "clickhouse")?.sql.trim()).toBe(sql.slice(0, -1));
+    expect(statementRangeAtCursor(sql, indexOf(sql, "UPDATE"), "clickhouse")?.sql.trim()).toBe(sql.slice(0, -1));
+    expect(rangeSqlTexts(executableStatementRanges(sql, "clickhouse"))).toEqual([sql.slice(0, -1)]);
+  });
+
+  it("keeps a simple ClickHouse ALTER TABLE UPDATE mutation together", () => {
+    const sql = "ALTER TABLE `events` ON CLUSTER 'analytics'\nUPDATE value = 1\nWHERE id = 42;";
+
+    expect(statementRangeAtCursor(sql, indexOf(sql, "UPDATE"), "clickhouse")?.sql.trim()).toBe(sql.slice(0, -1));
+    expect(rangeSqlTexts(executableStatementRanges(sql, "clickhouse"))).toEqual([sql.slice(0, -1)]);
+  });
+
+  it("separates statements after a ClickHouse ALTER TABLE UPDATE mutation", () => {
+    const mutation = "ALTER TABLE events\nUPDATE value = 1\nWHERE id = 42";
+    const sql = `${mutation};\nSELECT * FROM events;\nUPDATE audit SET processed = 1;`;
+
+    expect(rangeSqlTexts(executableStatementRanges(sql, "clickhouse"))).toEqual([mutation, "SELECT * FROM events", "UPDATE audit SET processed = 1"]);
+  });
+
+  it("does not merge independent UPDATE statements into other ALTER statements", () => {
+    const otherDatabaseSql = "ALTER TABLE events\nUPDATE audit SET processed = 1;";
+    const clickHouseSql = "ALTER TABLE events ADD COLUMN source String\nUPDATE audit SET processed = 1;";
+
+    expect(rangeSqlTexts(executableStatementRanges(otherDatabaseSql, "postgres"))).toEqual(["ALTER TABLE events", "UPDATE audit SET processed = 1"]);
+    expect(rangeSqlTexts(executableStatementRanges(otherDatabaseSql, "mysql"))).toEqual(["ALTER TABLE events", "UPDATE audit SET processed = 1"]);
+    expect(rangeSqlTexts(executableStatementRanges(clickHouseSql, "clickhouse"))).toEqual(["ALTER TABLE events ADD COLUMN source String", "UPDATE audit SET processed = 1"]);
   });
 
   it("keeps insert-select with the INSERT statement", () => {
@@ -605,6 +906,16 @@ WHERE request_json LIKE '%"paperFlag":null%';`;
     }
   });
 
+  it("returns the full GaussDB procedure for cursors after a nested block", () => {
+    const outerNull = indexOf(gaussDbNestedProcedure, "NULL;", 2);
+    expect(statementRangeAtCursor(gaussDbNestedProcedure, outerNull, "gaussdb")?.sql.trim()).toBe(gaussDbNestedProcedure);
+  });
+
+  it("returns only the issue #4573 GaussDB procedure for a gutter cursor", () => {
+    const expected = gaussDbIssue4573Script.slice(0, gaussDbIssue4573Script.indexOf("\n\nSELECT 1"));
+    expect(statementRangeAtCursor(gaussDbIssue4573Script, indexOf(gaussDbIssue4573Script, "count(*)"), "gaussdb")?.sql.trim()).toBe(expected);
+  });
+
   it("returns the full SAP HANA DO block for cursors inside nested statements", () => {
     const range = statementRangeAtCursor(sapHanaDoBlockFixture, indexOf(sapHanaDoBlockFixture, "Result"), "saphana");
 
@@ -721,6 +1032,14 @@ describe("buildExecutionCandidates", () => {
     const sql = "SELECT 1;\nSELECT 2;";
     const candidates = buildExecutionCandidates(sql, indexOf(sql, "2"));
     expect(candidateKinds(candidates)).toEqual(["cursor", "all"]);
+  });
+
+  it("preserves leading optimizer hints in current statement candidates", () => {
+    const hintedSql = "/*+ SET(polar_csi.enable_query on) SET(polar_csi.cost_threshold 0)*/\nselect count(1) from xxx";
+    const sql = `select 1;\n${hintedSql};`;
+    const candidates = buildExecutionCandidates(sql, indexOf(sql, "count"), "postgres");
+
+    expect(candidates[0].sql).toBe(hintedSql);
   });
 
   it("uses the cursor statement for the first candidate when there is no selection", () => {
@@ -840,7 +1159,7 @@ describe("hasMultipleExecutionTargets", () => {
 });
 
 describe("supportsExecutionTargetPicker", () => {
-  it("enables the picker for SQL database connections and Redis", () => {
+  it("enables the picker for SQL database connections, Redis, and Elasticsearch", () => {
     expect(supportsExecutionTargetPicker("mysql")).toBe(true);
     expect(supportsExecutionTargetPicker("postgres")).toBe(true);
     expect(supportsExecutionTargetPicker("sqlserver")).toBe(true);
@@ -848,7 +1167,7 @@ describe("supportsExecutionTargetPicker", () => {
     expect(supportsExecutionTargetPicker("jdbc")).toBe(true);
     expect(supportsExecutionTargetPicker("redis")).toBe(true);
     expect(supportsExecutionTargetPicker("mongodb")).toBe(false);
-    expect(supportsExecutionTargetPicker("elasticsearch")).toBe(false);
+    expect(supportsExecutionTargetPicker("elasticsearch")).toBe(true);
     expect(supportsExecutionTargetPicker("qdrant")).toBe(false);
     expect(supportsExecutionTargetPicker("milvus")).toBe(false);
     expect(supportsExecutionTargetPicker("weaviate")).toBe(false);

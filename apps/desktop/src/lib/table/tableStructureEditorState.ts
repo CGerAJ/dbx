@@ -288,6 +288,7 @@ const DATA_TYPE_OPTION_ALIASES: Partial<Record<DatabaseType, string>> = {
   questdb: "questdb",
   redshift: "postgres",
   highgo: "postgres",
+  uxdb: "postgres",
   vastbase: "postgres",
   kingbase: "postgres",
   dameng: "oracle",
@@ -466,7 +467,7 @@ export function parseExtraToColumnExtra(extra: string | null | undefined, databa
     if (lower.includes("on update current_timestamp")) {
       result.onUpdateCurrentTimestamp = true;
     }
-  } else if (databaseType === "postgres" || databaseType === "gaussdb" || databaseType === "kwdb" || databaseType === "opengauss" || databaseType === "questdb" || databaseType === "highgo" || databaseType === "vastbase" || databaseType === "kingbase") {
+  } else if (databaseType === "postgres" || databaseType === "gaussdb" || databaseType === "kwdb" || databaseType === "opengauss" || databaseType === "questdb" || databaseType === "highgo" || databaseType === "uxdb" || databaseType === "vastbase" || databaseType === "kingbase") {
     const identityMatch = lower.match(/generated\s+(by\s+default|always)\s+as\s+identity/i);
     if (identityMatch) {
       const sequenceMatch = lower.match(/start\s+with\s*(-?\d+)\s+increment\s+by\s*(-?\d+)/i);
@@ -632,17 +633,41 @@ function stripSqlServerDefaultOuterParens(defaultValue: string): string {
 }
 
 function columnDefaultForEditor(column: ColumnInfo, databaseType?: DatabaseType): string {
-  const defaultValue = column.column_default ?? "";
+  if (column.column_default === null) return "";
+  const defaultValue = column.column_default;
+  if (databaseType === "mysql" && defaultValue === "" && isMysqlCharacterDataType(column.data_type)) {
+    // MySQL metadata uses an empty string for DEFAULT '', so keep it distinct from no default.
+    return "''";
+  }
   if (databaseType === "postgres") return stripPostgresStringDefaultCast(defaultValue, column.data_type);
   if (databaseType === "sqlserver") return stripSqlServerDefaultOuterParens(defaultValue);
   return defaultValue;
+}
+
+const CHARACTER_LENGTH_METADATA_TYPES = new Set(["binary", "char", "character", "character varying", "nchar", "nvarchar", "nvarchar2", "varbinary", "varchar", "varchar2"]);
+const NUMERIC_PRECISION_METADATA_TYPES = new Set(["decimal", "number", "numeric"]);
+
+function columnDataTypeForEditor(column: ColumnInfo, databaseType?: DatabaseType): string {
+  const parsed = splitDataType(column.data_type);
+  if (parsed.params) return column.data_type;
+
+  const baseType = parsed.baseType.trim().replace(/\s+/g, " ");
+  const normalized = baseType.toLowerCase();
+  if (CHARACTER_LENGTH_METADATA_TYPES.has(normalized) && Number.isInteger(column.character_maximum_length) && Number(column.character_maximum_length) > 0) {
+    return combineDataTypeForDatabase(databaseType, baseType, String(column.character_maximum_length));
+  }
+  if (NUMERIC_PRECISION_METADATA_TYPES.has(normalized) && Number.isInteger(column.numeric_precision) && Number(column.numeric_precision) > 0) {
+    const scale = Number.isInteger(column.numeric_scale) && Number(column.numeric_scale) >= 0 ? `,${column.numeric_scale}` : "";
+    return combineDataTypeForDatabase(databaseType, baseType, `${column.numeric_precision}${scale}`);
+  }
+  return column.data_type;
 }
 
 export function createColumnDrafts(columns: ColumnInfo[], databaseType?: DatabaseType): EditableStructureColumn[] {
   return columns.map((column, index) => {
     const defaultValue = columnDefaultForEditor(column, databaseType);
     const enumValues = isMysqlEnumDataType(databaseType, column.data_type) ? [...(column.enum_values ?? [])] : undefined;
-    const dataType = enumValues?.length ? mysqlEnumDataType(enumValues) : column.data_type;
+    const dataType = enumValues?.length ? mysqlEnumDataType(enumValues) : columnDataTypeForEditor(column, databaseType);
     return {
       id: `existing:${column.name}`,
       name: column.name,
@@ -789,6 +814,10 @@ export function createTriggerDrafts(triggers: TriggerInfo[]): EditableStructureT
     original: trigger,
     markedForDrop: false,
   }));
+}
+
+export function canEditStructuredTriggerDraft(databaseType: DatabaseType | undefined, trigger: EditableStructureTrigger): boolean {
+  return !trigger.original || (databaseType !== undefined && databaseType !== "oracle");
 }
 
 export function toColumnNames(columns: string[]): string {
@@ -992,6 +1021,7 @@ function isTemporalPrecisionType(dbType: DatabaseType | undefined, baseType: str
     case "kwdb":
     case "opengauss":
     case "highgo":
+    case "uxdb":
     case "vastbase":
     case "kingbase":
     case "redshift":
@@ -1085,7 +1115,7 @@ export function isDataTypeLengthDisabled(_dbType: DatabaseType | undefined, base
     return key !== "geohash" && key !== "decimal";
   } else if (_dbType === "manticoresearch") {
     return key !== "bit" && key !== "float_vector";
-  } else if (_dbType === "postgres" || _dbType === "gaussdb" || _dbType === "kwdb" || _dbType === "opengauss" || _dbType === "highgo" || _dbType === "vastbase" || _dbType === "kingbase") {
+  } else if (_dbType === "postgres" || _dbType === "gaussdb" || _dbType === "kwdb" || _dbType === "opengauss" || _dbType === "highgo" || _dbType === "uxdb" || _dbType === "vastbase" || _dbType === "kingbase") {
     return POSTGRES_TYPE_LENGTH_DISABLES.includes(key);
   } else if (isOracleLikeStructureType(_dbType)) {
     // Dameng/Oracle integer aliases have fixed precision; MySQL-style display widths generate invalid DDL.

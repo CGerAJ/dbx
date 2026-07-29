@@ -7,6 +7,12 @@ test("table and view rows open data without toggling structure groups", () => {
   assert.equal(treeNodeRowAction("view", true), "open-data");
 });
 
+test("single click navigation mode opens source-capable rows", () => {
+  assert.equal(treeNodeRowAction("procedure", false), "open-source");
+  assert.equal(treeNodeRowAction("trigger", false), "open-source");
+  assert.equal(treeNodeRowAction("sequence", false), "open-source");
+});
+
 test("double click navigation mode selects rows on single click", () => {
   assert.equal(treeNodeRowAction("table", true, "double"), "none");
   assert.equal(treeNodeRowAction("view", true, "double"), "none");
@@ -14,9 +20,12 @@ test("double click navigation mode selects rows on single click", () => {
   assert.equal(treeNodeRowAction("saved-sql-file", false, "double"), "none");
 });
 
-test("table rows refresh on double click in both navigation modes", () => {
-  assert.equal(treeNodeRowDoubleClickAction("table", true, "single"), "refresh-data");
-  assert.equal(treeNodeRowDoubleClickAction("table", true, "double"), "refresh-data");
+test("table double click avoids a second action in single activation mode", () => {
+  assert.equal(treeNodeRowDoubleClickAction("table", true, "single"), "none");
+});
+
+test("table double click activates data in double activation mode", () => {
+  assert.equal(treeNodeRowDoubleClickAction("table", true, "double"), "activate-data");
 });
 
 test("double click navigation mode opens other actionable rows on double click", () => {
@@ -62,6 +71,8 @@ test("double-click follow-up clicks do not run row actions", () => {
   assert.equal(shouldRunTreeNodeRowAction("toggle", 3), false);
   assert.equal(shouldRunTreeNodeRowAction("open-data", 1), true);
   assert.equal(shouldRunTreeNodeRowAction("open-data", 2), false);
+  assert.equal(shouldRunTreeNodeRowAction("open-source", 1), true);
+  assert.equal(shouldRunTreeNodeRowAction("open-source", 2), false);
   assert.equal(shouldRunTreeNodeRowAction("none", 1), false);
 });
 
@@ -74,6 +85,7 @@ test("maps source-capable sidebar nodes to object source kinds", () => {
   assert.equal(objectSourceKindForTreeNode("view"), "VIEW");
   assert.equal(objectSourceKindForTreeNode("procedure"), "PROCEDURE");
   assert.equal(objectSourceKindForTreeNode("function"), "FUNCTION");
+  assert.equal(objectSourceKindForTreeNode("trigger"), "TRIGGER");
   assert.equal(objectSourceKindForTreeNode("sequence"), "SEQUENCE");
   assert.equal(objectSourceKindForTreeNode("package"), "PACKAGE");
   assert.equal(objectSourceKindForTreeNode("package-body"), "PACKAGE_BODY");

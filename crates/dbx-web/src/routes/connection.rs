@@ -51,6 +51,18 @@ pub struct SaveConnectionsRequest {
     pub configs: Vec<ConnectionConfig>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpAddConnectionRequest {
+    pub config: ConnectionConfig,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpRemoveConnectionRequest {
+    pub connection_id: String,
+}
+
 fn is_connection_info_capability_unsupported(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
     error.contains("connectioninfo")
@@ -99,14 +111,14 @@ pub async fn test_connection(
     run_temporary_connection_test(&state.app, body.config, false)
         .await
         .map(|result| Json(result.message))
-        .map_err(AppError)
+        .map_err(AppError::from)
 }
 
 pub async fn test_connection_with_info(
     State(state): State<Arc<WebState>>,
     Json(body): Json<ConnectRequest>,
 ) -> Result<Json<ConnectionTestResult>, AppError> {
-    run_temporary_connection_test(&state.app, body.config, true).await.map(Json).map_err(AppError)
+    run_temporary_connection_test(&state.app, body.config, true).await.map(Json).map_err(AppError::from)
 }
 
 pub async fn connect_db(
@@ -114,6 +126,14 @@ pub async fn connect_db(
     Json(body): Json<ConnectRequest>,
 ) -> Result<Json<String>, AppError> {
     let config = body.config;
+    if config.db_type == dbx_core::models::connection::DatabaseType::Sqlite {
+        dbx_core::db::sqlite::validate_persistent_attachments(
+            &config.host,
+            &config.password,
+            !config.attached_databases.is_empty(),
+        )
+        .map_err(AppError::from)?;
+    }
     let app = &state.app;
     let connection_id = config.id.clone();
     let attempt = app.begin_connection_attempt_with_client_attempt(&connection_id, body.client_attempt).await;
@@ -122,7 +142,7 @@ pub async fn connect_db(
     app.reset_connection_transport_for_config(&connection_id, &config).await;
     app.configs.write().await.insert(connection_id.clone(), config.clone());
 
-    app.get_or_create_pool_for_connection_attempt(&connection_id, None, attempt).await.map_err(AppError)?;
+    app.get_or_create_pool_for_connection_attempt(&connection_id, None, attempt).await.map_err(AppError::from)?;
 
     Ok(Json(connection_id))
 }
@@ -131,7 +151,12 @@ pub async fn connected_database_info(
     State(state): State<Arc<WebState>>,
     Json(body): Json<ConnectionIdentifierQuoteRequest>,
 ) -> Result<Json<Option<DatabaseConnectionInfo>>, AppError> {
-    state.app.connection_database_info(&body.connection_id, body.database.as_deref()).await.map(Json).map_err(AppError)
+    state
+        .app
+        .connection_database_info(&body.connection_id, body.database.as_deref())
+        .await
+        .map(Json)
+        .map_err(AppError::from)
 }
 
 pub async fn save_connection_database_info(
@@ -143,7 +168,7 @@ pub async fn save_connection_database_info(
         .save_connection_database_info(&body.connection_id, body.database_info)
         .await
         .map(|_| Json(()))
-        .map_err(AppError)
+        .map_err(AppError::from)
 }
 
 pub async fn connection_final_proxy_port(
@@ -152,7 +177,15 @@ pub async fn connection_final_proxy_port(
 ) -> Result<Json<u16>, AppError> {
     let runtime_config = body.config.canonicalized();
     if !runtime_config.has_effective_transport_layers() {
-        return Err(AppError("Connection has no configured transport layers".to_string()));
+        return Err(AppError::from("Connection has no configured transport layers".to_string()));
+    }
+    if runtime_config.db_type == dbx_core::models::connection::DatabaseType::Sqlite {
+        dbx_core::db::sqlite::validate_persistent_attachments(
+            &runtime_config.host,
+            &runtime_config.password,
+            !runtime_config.attached_databases.is_empty(),
+        )
+        .map_err(AppError::from)?;
     }
 
     let app = &state.app;
@@ -160,7 +193,7 @@ pub async fn connection_final_proxy_port(
     let db_config = dbx_core::connection::metadata_connection_config(&runtime_config);
     app.configs.write().await.insert(connection_id.clone(), runtime_config);
 
-    let (_, port) = app.connection_host_port(&connection_id, &db_config).await.map_err(AppError)?;
+    let (_, port) = app.connection_host_port(&connection_id, &db_config).await.map_err(AppError::from)?;
     Ok(Json(port))
 }
 
@@ -196,7 +229,7 @@ pub async fn check_connection_health(
     State(state): State<Arc<WebState>>,
     Json(body): Json<DisconnectRequest>,
 ) -> Result<Json<()>, AppError> {
-    state.app.check_connection_health(&body.connection_id).await.map_err(AppError)?;
+    state.app.check_connection_health(&body.connection_id).await.map_err(AppError::from)?;
     Ok(Json(()))
 }
 
@@ -209,7 +242,7 @@ pub async fn connection_identifier_quote(
         .connection_identifier_quote(&body.connection_id, body.database.as_deref())
         .await
         .map(Json)
-        .map_err(AppError)
+        .map_err(AppError::from)
 }
 
 pub async fn close_database_connection(
@@ -218,14 +251,24 @@ pub async fn close_database_connection(
 ) -> Result<Json<bool>, AppError> {
     let database = body.database.trim();
     let database = if database.is_empty() { None } else { Some(database) };
-    state.app.close_database_pool(&body.connection_id, database).await.map(Json).map_err(AppError)
+    state.app.close_database_pool(&body.connection_id, database).await.map(Json).map_err(AppError::from)
 }
 
 pub async fn save_connections(
     State(state): State<Arc<WebState>>,
     Json(body): Json<SaveConnectionsRequest>,
 ) -> Result<Json<()>, AppError> {
-    state.app.storage.save_connections(&body.configs).await.map_err(AppError)?;
+    for config in &body.configs {
+        if config.db_type == dbx_core::models::connection::DatabaseType::Sqlite {
+            dbx_core::db::sqlite::validate_persistent_attachments(
+                &config.host,
+                &config.password,
+                !config.attached_databases.is_empty(),
+            )
+            .map_err(AppError::from)?;
+        }
+    }
+    state.app.storage.save_connections(&body.configs).await.map_err(AppError::from)?;
     let sync = sync_connection_configs(&state, &body.configs).await;
     remove_connection_pools_for_connection_ids(&state, &sync.connection_pool_ids_to_drop).await;
     drop_nacos_adapters_for_connection_ids(&state, &sync.nacos_adapter_ids_to_drop).await;
@@ -233,8 +276,33 @@ pub async fn save_connections(
     Ok(Json(()))
 }
 
+pub async fn mcp_add_connection(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<McpAddConnectionRequest>,
+) -> Result<Json<ConnectionConfig>, AppError> {
+    let saved = state.app.storage.add_connection_for_mcp(body.config).await.map_err(AppError::from)?;
+    state.app.configs.write().await.insert(saved.id.clone(), saved.clone());
+    Ok(Json(saved))
+}
+
+pub async fn mcp_remove_connection(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<McpRemoveConnectionRequest>,
+) -> Result<Json<bool>, AppError> {
+    let connection_id = body.connection_id;
+    let removed = state.app.storage.remove_connection_for_mcp(&connection_id).await.map_err(AppError::from)?;
+    if removed {
+        state.app.configs.write().await.remove(&connection_id);
+        state.app.remove_connection_pools_detached(&connection_id).await;
+        state.app.nacos_registry.drop_connection(&connection_id).await;
+        #[cfg(feature = "mq-admin")]
+        state.app.mq_registry.drop_connection(&connection_id).await;
+    }
+    Ok(Json(removed))
+}
+
 pub async fn load_connections(State(state): State<Arc<WebState>>) -> Result<Json<Vec<ConnectionConfig>>, AppError> {
-    let configs = state.app.storage.load_connections().await.map_err(AppError)?;
+    let configs = state.app.storage.load_connections().await.map_err(AppError::from)?;
     let sync = sync_connection_configs(&state, &configs).await;
     remove_connection_pools_for_connection_ids(&state, &sync.connection_pool_ids_to_drop).await;
     drop_nacos_adapters_for_connection_ids(&state, &sync.nacos_adapter_ids_to_drop).await;
@@ -322,31 +390,32 @@ async fn remove_connection_pools_for_connection_ids(state: &WebState, connection
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "mq-admin")]
-    use super::connect_db;
     use super::{
-        disconnect_db, load_connections, save_connection_database_info, save_connections, test_connection,
-        test_connection_with_info, ConnectRequest, DisconnectRequest, SaveConnectionDatabaseInfoRequest,
-        SaveConnectionsRequest,
+        connect_db, connection_final_proxy_port, disconnect_db, load_connections, mcp_add_connection,
+        mcp_remove_connection, save_connection_database_info, save_connections, test_connection,
+        test_connection_with_info, ConnectRequest, DisconnectRequest, McpAddConnectionRequest,
+        McpRemoveConnectionRequest, SaveConnectionDatabaseInfoRequest, SaveConnectionsRequest,
     };
-    use crate::state::{LoginRateLimit, WebState};
+    use crate::state::WebState;
     use axum::extract::State;
     use axum::Json;
     use dbx_core::connection::{AppState, PoolKind};
-    use dbx_core::models::connection::{ConnectionConfig, DatabaseConnectionInfo, DatabaseType};
-    use dbx_core::storage::Storage;
-    use std::collections::{HashMap, HashSet};
+    use dbx_core::models::connection::{
+        AttachedDatabaseConfig, ConnectionConfig, DatabaseConnectionInfo, DatabaseType, ProxyTunnelConfig, ProxyType,
+        TransportLayerConfig,
+    };
+    use dbx_core::storage::{McpGlobalPolicy, Storage};
     use std::sync::Arc;
     #[cfg(feature = "mq-admin")]
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     #[cfg(feature = "mq-admin")]
     use tokio::net::TcpListener;
-    use tokio::sync::{Mutex, RwLock};
 
     fn sqlite_config(id: &str, path: &str) -> ConnectionConfig {
         ConnectionConfig {
             id: id.to_string(),
             name: "SQLite".to_string(),
+            note: String::new(),
             db_type: DatabaseType::Sqlite,
             driver_profile: None,
             driver_label: None,
@@ -359,6 +428,7 @@ mod tests {
             database: None,
             visible_databases: None,
             visible_schemas: None,
+            show_system_schemas: false,
             attached_databases: Vec::new(),
             init_script: None,
             color: None,
@@ -415,18 +485,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
         let app = Arc::new(AppState::new_with_plugin_dir(storage, dir.join("plugins")));
-        let state = Arc::new(WebState {
-            app,
-            data_dir: dir.clone(),
-            public_base_path: "/".to_string(),
-            password_disabled: false,
-            password_hash: RwLock::new(None),
-            sessions: RwLock::new(HashSet::new()),
-            sse_channels: RwLock::new(HashMap::new()),
-            sql_file_executions: RwLock::new(HashMap::new()),
-            login_rate_limit: Mutex::new(LoginRateLimit { fail_count: 0, locked_until: None }),
-            export_files: RwLock::new(HashMap::new()),
-        });
+        let state = Arc::new(WebState::for_tests(app, dir.clone()));
         (state, dir)
     }
 
@@ -442,18 +501,73 @@ mod tests {
             Json(ConnectRequest { config: config.clone(), client_attempt: None }),
         )
         .await
-        .unwrap_or_else(|error| panic!("{}", error.0));
+        .unwrap_or_else(|error| panic!("{}", error.message));
         assert_eq!(legacy.0, "Connection successful");
 
         let detailed =
             test_connection_with_info(State(state.clone()), Json(ConnectRequest { config, client_attempt: None }))
                 .await
-                .unwrap_or_else(|error| panic!("{}", error.0));
+                .unwrap_or_else(|error| panic!("{}", error.message));
         assert_eq!(detailed.0.message, "Connection successful");
         assert_eq!(detailed.0.database_info, None);
         assert!(state.app.configs.read().await.keys().all(|key| !key.starts_with("__test_")));
         assert!(state.app.connections.read().await.keys().all(|key| !key.starts_with("__test_")));
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn invalid_persistent_sqlite_attachments_do_not_replace_live_web_state() {
+        let (state, dir) = test_web_state().await;
+        let initial = sqlite_config("sqlite-memory", ":memory:");
+        let pool = dbx_core::db::sqlite::connect_path(":memory:").await.unwrap();
+        dbx_core::db::sqlite::execute_query(
+            &pool,
+            "CREATE TABLE retained(value TEXT); INSERT INTO retained VALUES ('yes');",
+        )
+        .await
+        .unwrap();
+        state.app.configs.write().await.insert(initial.id.clone(), initial.clone());
+        state.app.connections.write().await.insert(initial.id.clone(), PoolKind::Sqlite(pool.clone()));
+
+        let mut invalid = initial.clone();
+        invalid.attached_databases.push(AttachedDatabaseConfig {
+            name: "analytics".to_string(),
+            path: dir.join("analytics.sqlite").to_string_lossy().to_string(),
+        });
+        let connect_error =
+            connect_db(State(state.clone()), Json(ConnectRequest { config: invalid.clone(), client_attempt: None }))
+                .await
+                .unwrap_err();
+        assert!(connect_error.message.contains("in-memory main database"), "{}", connect_error.message);
+
+        invalid.transport_layers.push(TransportLayerConfig::Proxy(ProxyTunnelConfig {
+            id: "proxy".to_string(),
+            name: "Proxy".to_string(),
+            enabled: true,
+            proxy_type: ProxyType::Socks5,
+            host: "127.0.0.1".to_string(),
+            port: 1080,
+            username: String::new(),
+            password: String::new(),
+            test_target: None,
+            profile_id: String::new(),
+        }));
+        let proxy_error = connection_final_proxy_port(
+            State(state.clone()),
+            Json(ConnectRequest { config: invalid, client_attempt: None }),
+        )
+        .await
+        .unwrap_err();
+        assert!(proxy_error.message.contains("in-memory main database"), "{}", proxy_error.message);
+
+        assert!(state.app.connections.read().await.contains_key(&initial.id));
+        assert_eq!(state.app.configs.read().await.get(&initial.id), Some(&initial));
+        let retained = dbx_core::db::sqlite::execute_query(&pool, "SELECT value FROM retained;").await.unwrap();
+        assert_eq!(retained.rows[0][0], serde_json::json!("yes"));
+
+        drop(pool);
+        drop(state);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -504,6 +618,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_connection_routes_preserve_unrelated_concurrent_changes() {
+        let (state, dir) = test_web_state().await;
+        let mut existing = sqlite_config("existing", &dir.join("before.db").to_string_lossy());
+        state.app.storage.save_connections(std::slice::from_ref(&existing)).await.unwrap();
+        state
+            .app
+            .storage
+            .save_mcp_global_policy(&McpGlobalPolicy {
+                read_only: false,
+                allow_dangerous_sql: false,
+                allowed_connection_ids: Some(vec![existing.id.clone()]),
+            })
+            .await
+            .unwrap();
+
+        // Simulate a Web UI edit after the MCP client last observed the list.
+        existing.host = dir.join("after.db").to_string_lossy().into_owned();
+        state.app.storage.save_connections(std::slice::from_ref(&existing)).await.unwrap();
+        let added = sqlite_config("added", &dir.join("added.db").to_string_lossy());
+        let result =
+            mcp_add_connection(State(state.clone()), Json(McpAddConnectionRequest { config: added.clone() })).await;
+        assert!(result.is_ok());
+
+        let persisted = state.app.storage.load_connections().await.unwrap();
+        assert_eq!(persisted.len(), 2);
+        assert_eq!(
+            persisted.iter().find(|config| config.id == existing.id).map(|config| config.host.as_str()),
+            Some(existing.host.as_str())
+        );
+        assert!(persisted.iter().any(|config| config.id == added.id));
+        assert!(state.app.configs.read().await.contains_key(&added.id));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn mcp_connection_routes_recheck_read_only_and_allowlist_in_the_mutation_transaction() {
+        let (state, dir) = test_web_state().await;
+        let kept = sqlite_config("kept", &dir.join("kept.db").to_string_lossy());
+        let removed = sqlite_config("removed", &dir.join("removed.db").to_string_lossy());
+        state.app.storage.save_connections(&[kept.clone(), removed.clone()]).await.unwrap();
+        state
+            .app
+            .storage
+            .save_mcp_global_policy(&McpGlobalPolicy {
+                read_only: false,
+                allow_dangerous_sql: false,
+                allowed_connection_ids: Some(vec![removed.id.clone()]),
+            })
+            .await
+            .unwrap();
+
+        let removed_result = mcp_remove_connection(
+            State(state.clone()),
+            Json(McpRemoveConnectionRequest { connection_id: removed.id.clone() }),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{}", error.message));
+        assert!(removed_result.0);
+        assert_eq!(state.app.storage.load_connections().await.unwrap()[0].id, kept.id);
+
+        let scope_error = mcp_remove_connection(
+            State(state.clone()),
+            Json(McpRemoveConnectionRequest { connection_id: kept.id.clone() }),
+        )
+        .await
+        .unwrap_err();
+        assert!(scope_error.message.starts_with("CONNECTION_OUT_OF_SCOPE:"));
+
+        state
+            .app
+            .storage
+            .save_mcp_global_policy(&McpGlobalPolicy {
+                read_only: true,
+                allow_dangerous_sql: false,
+                allowed_connection_ids: None,
+            })
+            .await
+            .unwrap();
+        let read_only_error = mcp_add_connection(
+            State(state.clone()),
+            Json(McpAddConnectionRequest { config: sqlite_config("new", &dir.join("new.db").to_string_lossy()) }),
+        )
+        .await
+        .unwrap_err();
+        assert!(read_only_error.message.starts_with("MCP_READ_ONLY:"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn save_connection_database_info_preserves_connected_pool() {
         let (state, dir) = test_web_state().await;
         let config = mq_config("mq-info", "http://127.0.0.1:8080");
@@ -533,6 +738,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[cfg(feature = "mq-admin")]
     #[tokio::test]
     async fn save_connections_drops_cached_mq_adapter_for_updated_config() {
         let (state, dir) = test_web_state().await;
@@ -592,7 +798,7 @@ mod tests {
         let (state, dir) = test_web_state().await;
         let initial = mq_config("mq-conn", "http://127.0.0.1:8080");
         let updated = mq_config("mq-conn", "http://127.0.0.1:8081");
-        state.app.storage.save_connections(&[updated.clone()]).await.unwrap();
+        state.app.storage.save_connections(std::slice::from_ref(&updated)).await.unwrap();
         state.app.configs.write().await.insert(initial.id.clone(), initial.clone());
         state.app.connections.write().await.insert(initial.id.clone(), PoolKind::MessageQueue);
 

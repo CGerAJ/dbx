@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch, watchEffect } from "vue";
 import { useI18n } from "vue-i18n";
-import { Play, Loader2, Square, Database, Check, Table2, AlignLeft, GitBranch, Save, FolderOpen, Layers, X, Shield, Download, RotateCcw, AlertTriangle, ClipboardPaste } from "@lucide/vue";
+import { Play, Loader2, Square, Database, Check, Table2, AlignLeft, GitBranch, Save, FolderOpen, Layers, X, Shield, Download, RotateCcw, AlertTriangle, ClipboardPaste, Minimize2 } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { SearchableSelect } from "@/components/ui/searchable-select";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip";
@@ -39,6 +39,7 @@ const emit = defineEmits<{
   explain: [];
   "update:explainMode": [mode: "explain" | "autotrace"];
   formatSql: [];
+  compressSql: [];
   toggleSqlKeywordCase: [];
   saveSql: [];
   openSql: [];
@@ -217,11 +218,11 @@ function databaseOptionIsProduction(database: string): boolean {
             variant="ghost"
             size="icon"
             class="h-6 w-6"
-            :class="isTransactionActive || autoCommit === false ? 'text-orange-600 bg-orange-100 dark:text-orange-300 dark:bg-orange-900/30' : 'text-muted-foreground/50'"
+            :class="isTransactionActive || autoCommit === false ? 'bg-orange-100 text-orange-600 dark:bg-orange-900/30 dark:text-orange-300' : 'text-orange-600/70 hover:bg-orange-500/10 hover:text-orange-700 dark:text-orange-300/70 dark:hover:text-orange-200'"
             :disabled="activeTab.isExecuting || activeTab.isExplaining"
             @click="emit('update:autoCommit', autoCommit === false)"
           >
-            <span class="font-bold" style="font-size: 9px">Tx</span>
+            <span class="text-xs font-bold leading-none">Tx</span>
           </Button>
         </TooltipTrigger>
         <TooltipContent>{{ transactionTooltip }}</TooltipContent>
@@ -255,11 +256,19 @@ function databaseOptionIsProduction(database: string): boolean {
       </Tooltip>
       <Tooltip>
         <TooltipTrigger as-child>
+          <Button variant="ghost" size="icon" class="h-6 w-6 text-amber-600 hover:bg-amber-500/10 hover:text-amber-700 dark:text-amber-300 dark:hover:text-amber-200" :disabled="activeTab.isExecuting || activeTab.isExplaining || !activeTab.sql.trim()" @click="emit('compressSql')">
+            <Minimize2 class="h-3.5 w-3.5" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>{{ t("toolbar.compressSql") }}</TooltipContent>
+      </Tooltip>
+      <Tooltip>
+        <TooltipTrigger as-child>
           <Button
             variant="ghost"
             size="icon"
-            class="h-6 w-6 font-mono text-[11px] leading-none"
-            :class="keywordCaseIsLower ? 'bg-amber-500/10 text-amber-700 hover:bg-amber-500/20 hover:text-amber-800 dark:text-amber-300 dark:hover:text-amber-200' : 'text-muted-foreground hover:bg-muted hover:text-foreground'"
+            class="h-6 w-6 font-mono text-sm font-semibold leading-none"
+            :class="keywordCaseIsLower ? 'bg-amber-500/10 text-amber-700 hover:bg-amber-500/20 hover:text-amber-800 dark:text-amber-300 dark:hover:text-amber-200' : 'text-amber-600/70 hover:bg-amber-500/10 hover:text-amber-700 dark:text-amber-300/70 dark:hover:text-amber-200'"
             :aria-label="keywordCaseToggleTooltip"
             @click="emit('toggleSqlKeywordCase')"
           >
@@ -326,10 +335,12 @@ function databaseOptionIsProduction(database: string): boolean {
           :search-placeholder="t('editor.searchConnection')"
           :empty-text="t('grid.noSearchResults')"
           :loading-text="t('common.loading')"
+          trigger-variant="ghost"
           trigger-class="font-medium text-foreground"
+          trigger-icon-class="h-3 w-3"
           :display-name="connectionDisplayName"
           list-class="w-96 max-w-[calc(100vw-2rem)]"
-          item-class="h-9"
+          item-class="min-h-9 h-auto py-1"
           @update:model-value="(connectionId) => emit('changeConnection', connectionId)"
         >
           <template #trigger-label="{ label }">
@@ -344,7 +355,9 @@ function databaseOptionIsProduction(database: string): boolean {
             <div class="flex min-w-0 items-center gap-2">
               <DatabaseIcon :db-type="connectionIconType(connectionById(option))" class="h-3.5 w-3.5 shrink-0" />
               <div class="flex min-w-0 flex-1 items-center gap-2">
-                <TruncatedTextTooltip :text="connectionGroupLabel(option)" class="block min-w-0 max-w-48 shrink-0 rounded-sm bg-muted/70 px-1.5 py-0.5 text-[11px] text-muted-foreground" side="left" :side-offset="8" />
+                <span class="block min-w-0 max-w-48 shrink-0 whitespace-normal break-words rounded-sm bg-muted/70 px-1.5 py-0.5 text-[11px] leading-tight text-muted-foreground">
+                  {{ connectionGroupLabel(option) }}
+                </span>
                 <TruncatedTextTooltip :text="label" class="block min-w-[7rem] flex-1 text-sm font-medium" side="left" :side-offset="8" />
               </div>
             </div>
@@ -365,7 +378,9 @@ function databaseOptionIsProduction(database: string): boolean {
           :loading-text="t('common.loading')"
           :loading="loadingDatabaseOptions[activeConnection?.id || '']"
           :display-name="databaseDisplayName"
+          trigger-variant="ghost"
           trigger-class="gap-1.5"
+          trigger-icon-class="h-3 w-3"
           @update:model-value="(database) => emit('changeDatabase', database)"
           @update:open="
             (open: boolean) => {
@@ -408,7 +423,9 @@ function databaseOptionIsProduction(database: string): boolean {
           :loading-text="t('common.loading')"
           :loading="!!activeConnection && isLoadingSchemas(activeConnection.id, schemaDatabaseKey)"
           :clear-selected-option="supportsClearableQuerySchema(activeConnection?.db_type)"
+          trigger-variant="ghost"
           trigger-class="gap-1.5"
+          trigger-icon-class="h-3 w-3"
           @update:model-value="(schema) => emit('changeSchema', schema || undefined)"
           @update:open="
             (open: boolean) => {

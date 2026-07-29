@@ -8,7 +8,7 @@ use crate::sql_dialect::{
     firebird_rows_clause, pagination_strategy, quote_table_identifier, PaginationContext, TablePaginationStrategy,
 };
 use sqlparser::ast::{Expr, GroupByExpr, SelectItem, SetExpr, Statement};
-use sqlparser::dialect::{GenericDialect, MsSqlDialect};
+use sqlparser::dialect::{ClickHouseDialect, GenericDialect, MsSqlDialect};
 use sqlparser::parser::Parser;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -136,8 +136,10 @@ pub fn build_query_pagination_execution_plan(
         return plan;
     }
 
-    if options.use_agent_cursor && options.pagination.offset == 0 {
-        if !options.first_page_uses_actual_sql {
+    let can_use_first_page_cursor = options.use_agent_cursor && options.pagination.offset == 0;
+    let prefer_server_pagination = options.database_type == Some(DatabaseType::Kingbase);
+    if can_use_first_page_cursor && !prefer_server_pagination {
+        if !options.first_page_uses_actual_sql && options.sql == options.query_base_sql {
             plan.sql_to_execute = options.query_base_sql;
         }
         plan.page_limit = Some(options.pagination.limit);
@@ -147,7 +149,7 @@ pub fn build_query_pagination_execution_plan(
     }
 
     let paginated = build_paginated_query_sql(PaginatedQuerySqlOptions {
-        original_sql: options.sql,
+        original_sql: options.sql.clone(),
         database_type: options.database_type,
         limit: options.pagination.limit,
         offset: options.pagination.offset,
@@ -157,6 +159,17 @@ pub fn build_query_pagination_execution_plan(
         plan.page_sql = paginated.sql;
         plan.page_limit = Some(options.pagination.limit);
         plan.page_offset = Some(options.pagination.offset);
+    } else if can_use_first_page_cursor {
+        // Kingbase JDBC may buffer an entire result in auto-commit mode, so use
+        // LIMIT/OFFSET whenever the statement can be rewritten safely. Keep the
+        // Agent cursor as a bounded fallback for multi-statement or dialect-
+        // specific SQL that the pagination parser cannot transform.
+        if !options.first_page_uses_actual_sql && options.sql == options.query_base_sql {
+            plan.sql_to_execute = options.query_base_sql;
+        }
+        plan.page_limit = Some(options.pagination.limit);
+        plan.page_offset = Some(options.pagination.offset);
+        plan.use_agent_result_session = true;
     }
     plan
 }
@@ -252,8 +265,13 @@ pub fn build_sorted_query_sql(options: SortedQuerySqlOptions) -> QuerySqlBuildRe
     let aliases = build_derived_column_aliases(&options.result_columns);
     let use_derived_column_aliases = options.database_type != Some(DatabaseType::Mysql)
         && options.database_type != Some(DatabaseType::ClickHouse)
+        // Doris accepts the derived-table alias but not its column-name list.
+        && options.database_type != Some(DatabaseType::Doris)
         && options.database_type != Some(DatabaseType::Sqlite)
-        && options.database_type != Some(DatabaseType::DuckDb);
+        && options.database_type != Some(DatabaseType::DuckDb)
+        && options.database_type != Some(DatabaseType::Dameng)
+        && options.database_type != Some(DatabaseType::Oracle)
+        && options.database_type != Some(DatabaseType::OceanbaseOracle);
     let sort_alias = if use_derived_column_aliases {
         aliases
             .get(options.column_index)
@@ -269,7 +287,22 @@ pub fn build_sorted_query_sql(options: SortedQuerySqlOptions) -> QuerySqlBuildRe
     } else {
         options.result_columns.get(options.column_index).cloned().unwrap_or_else(|| options.column.clone())
     };
-    let quoted_column = quote_table_identifier(options.database_type, &sort_alias);
+    // Oracle-compatible derived tables do not accept a PostgreSQL-style
+    // column alias list. Use the selected column position when duplicate
+    // labels would otherwise make ORDER BY ambiguous.
+    let use_sort_ordinal = !use_derived_column_aliases
+        && matches!(
+            options.database_type,
+            Some(DatabaseType::Dameng | DatabaseType::Oracle | DatabaseType::OceanbaseOracle)
+        )
+        && options.result_columns.get(options.column_index).is_some_and(|column| {
+            options.result_columns.iter().filter(|candidate| candidate.eq_ignore_ascii_case(column)).count() > 1
+        });
+    let sort_reference = if use_sort_ordinal {
+        (options.column_index + 1).to_string()
+    } else {
+        quote_table_identifier(options.database_type, &sort_alias)
+    };
     let wrapped_statement = if options.database_type == Some(DatabaseType::SqlServer) {
         sql_server_statement_for_derived_table(&statement)
     } else {
@@ -283,11 +316,11 @@ pub fn build_sorted_query_sql(options: SortedQuerySqlOptions) -> QuerySqlBuildRe
             .collect::<Vec<_>>()
             .join(", ");
         ok(format!(
-            "SELECT * FROM ({wrapped_statement}) t({alias_list}) ORDER BY {quoted_column} {};",
+            "SELECT * FROM ({wrapped_statement}) t({alias_list}) ORDER BY {sort_reference} {};",
             options.direction.as_sql()
         ))
     } else {
-        ok(format!("SELECT * FROM ({wrapped_statement}) t ORDER BY {quoted_column} {};", options.direction.as_sql()))
+        ok(format!("SELECT * FROM ({wrapped_statement}) t ORDER BY {sort_reference} {};", options.direction.as_sql()))
     }
 }
 
@@ -963,7 +996,7 @@ fn add_standard_limit(
     offset: usize,
     dedup_projection_count: Option<usize>,
 ) -> String {
-    let order_sql = dedup_projection_count.map_or(String::new(), |count| format_positional_order_by(count));
+    let order_sql = dedup_projection_count.map_or(String::new(), format_positional_order_by);
 
     if has_top_level_limit(statement) {
         if !order_sql.is_empty() {
@@ -1002,8 +1035,7 @@ fn add_outer_standard_limit(
 
 fn add_clickhouse_limit(statement: &str, limit_sql: &str) -> String {
     let limit_sql = limit_sql.trim();
-    let settings_index =
-        top_level_sql_tokens(statement).iter().find(|token| token.text == "SETTINGS").map(|token| token.start);
+    let settings_index = clickhouse_settings_clause_index(statement);
 
     if let Some(index) = settings_index {
         let statement_before_settings = statement[..index].trim_end();
@@ -1012,6 +1044,31 @@ fn add_clickhouse_limit(statement: &str, limit_sql: &str) -> String {
     }
 
     append_sql_suffix(statement, &format!("{limit_sql};"))
+}
+
+fn clickhouse_settings_clause_index(statement: &str) -> Option<usize> {
+    let parsed_settings = Parser::parse_sql(&ClickHouseDialect {}, statement).ok().and_then(|statements| {
+        let [Statement::Query(query)] = statements.as_slice() else {
+            return None;
+        };
+        Some(query.settings.is_some())
+    });
+    if parsed_settings == Some(false) {
+        return None;
+    }
+
+    // Keep the lexical fallback for valid ClickHouse syntax that sqlparser does not yet support.
+    top_level_sql_tokens(statement)
+        .iter()
+        .rev()
+        .find(|token| token.text == "SETTINGS" && !is_qualified_identifier_part(statement, token))
+        .map(|token| token.start)
+}
+
+fn is_qualified_identifier_part(sql: &str, token: &SqlToken) -> bool {
+    let token_end = token.start + token.text.len();
+    sql[..token.start].chars().rev().find(|ch| !ch.is_whitespace()) == Some('.')
+        || sql[token_end..].chars().find(|ch| !ch.is_whitespace()) == Some('.')
 }
 
 fn derived_table_sql(prefix: &str, statement: &str, suffix: &str) -> String {
@@ -1806,6 +1863,48 @@ WHERE u.id = picked.id;
     }
 
     #[test]
+    fn clickhouse_settings_table_is_not_treated_as_settings_clause() {
+        let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: "SELECT * FROM system.settings".to_string(),
+            database_type: Some(DatabaseType::ClickHouse),
+            limit: 100,
+            offset: 0,
+        });
+
+        assert!(result.ok);
+        assert_eq!(result.sql.unwrap(), "SELECT * FROM system.settings LIMIT 100;");
+    }
+
+    #[test]
+    fn clickhouse_settings_identifier_is_not_treated_as_settings_clause() {
+        let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: "SELECT settings FROM (SELECT 1 AS settings)".to_string(),
+            database_type: Some(DatabaseType::ClickHouse),
+            limit: 100,
+            offset: 0,
+        });
+
+        assert!(result.ok);
+        assert_eq!(result.sql.unwrap(), "SELECT settings FROM (SELECT 1 AS settings) LIMIT 100;");
+    }
+
+    #[test]
+    fn clickhouse_settings_identifier_keeps_trailing_settings_clause() {
+        let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: "SELECT settings FROM (SELECT 1 AS settings) SETTINGS max_threads = 1".to_string(),
+            database_type: Some(DatabaseType::ClickHouse),
+            limit: 100,
+            offset: 0,
+        });
+
+        assert!(result.ok);
+        assert_eq!(
+            result.sql.unwrap(),
+            "SELECT settings FROM (SELECT 1 AS settings) LIMIT 100 SETTINGS max_threads = 1;"
+        );
+    }
+
+    #[test]
     fn clickhouse_query_plan_places_limit_before_settings() {
         let sql = "SELECT * FROM system.clusters SETTINGS max_execution_time = 0";
         let plan = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
@@ -2279,6 +2378,43 @@ WHERE u.id = picked.id;
     }
 
     #[test]
+    fn kingbase_prefers_server_pagination_over_agent_cursor() {
+        let plan = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+            sql: "SELECT * FROM events".to_string(),
+            query_base_sql: "SELECT * FROM events".to_string(),
+            database_type: Some(DatabaseType::Kingbase),
+            pagination: QueryPagination { limit: 500, offset: 0, session_id: None },
+            use_agent_cursor: true,
+            first_page_uses_actual_sql: false,
+        });
+
+        assert_eq!(plan.sql_to_execute, "SELECT * FROM events LIMIT 500;");
+        assert_eq!(plan.page_sql, Some(plan.sql_to_execute.clone()));
+        assert_eq!(plan.page_limit, Some(500));
+        assert_eq!(plan.page_offset, Some(0));
+        assert!(!plan.use_agent_result_session);
+    }
+
+    #[test]
+    fn kingbase_falls_back_to_agent_cursor_for_unrewritable_queries() {
+        let sql = "SELECT * FROM events; SELECT 1";
+        let plan = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+            sql: sql.to_string(),
+            query_base_sql: sql.to_string(),
+            database_type: Some(DatabaseType::Kingbase),
+            pagination: QueryPagination { limit: 500, offset: 0, session_id: None },
+            use_agent_cursor: true,
+            first_page_uses_actual_sql: false,
+        });
+
+        assert_eq!(plan.sql_to_execute, sql);
+        assert!(plan.page_sql.is_none());
+        assert_eq!(plan.page_limit, Some(500));
+        assert_eq!(plan.page_offset, Some(0));
+        assert!(plan.use_agent_result_session);
+    }
+
+    #[test]
     fn export_agent_cursor_first_page_keeps_actual_sorted_sql() {
         let plan = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
             sql: "SELECT * FROM (SELECT * FROM events) t ORDER BY created_at DESC".to_string(),
@@ -2369,6 +2505,37 @@ WHERE u.id = picked.id;
     }
 
     #[test]
+    fn builds_doris_sorted_query_without_alias_list() {
+        let result = build_sorted_query_sql(SortedQuerySqlOptions {
+            original_sql: "SELECT id, name FROM users LIMIT 100".to_string(),
+            database_type: Some(DatabaseType::Doris),
+            result_columns: vec!["id".to_string(), "name".to_string()],
+            column_index: 0,
+            column: "id".to_string(),
+            direction: QuerySortDirection::Desc,
+        });
+
+        assert_eq!(result.sql.unwrap(), "SELECT * FROM (SELECT id, name FROM users LIMIT 100) t ORDER BY `id` DESC;");
+    }
+
+    #[test]
+    fn builds_starrocks_sorted_query_with_alias_list() {
+        let result = build_sorted_query_sql(SortedQuerySqlOptions {
+            original_sql: "SELECT id, name FROM users LIMIT 100".to_string(),
+            database_type: Some(DatabaseType::StarRocks),
+            result_columns: vec!["id".to_string(), "name".to_string()],
+            column_index: 0,
+            column: "id".to_string(),
+            direction: QuerySortDirection::Desc,
+        });
+
+        assert_eq!(
+            result.sql.unwrap(),
+            "SELECT * FROM (SELECT id, name FROM users LIMIT 100) t(`id`, `name`) ORDER BY `id` DESC;"
+        );
+    }
+
+    #[test]
     fn strips_sqlserver_order_by_for_sorted_query() {
         let result = build_sorted_query_sql(SortedQuerySqlOptions {
             original_sql: "SELECT id, name FROM users ORDER BY id DESC".to_string(),
@@ -2383,6 +2550,68 @@ WHERE u.id = picked.id;
             result.sql.unwrap(),
             "SELECT * FROM (SELECT id, name FROM users) t([id], [name]) ORDER BY [name] ASC;"
         );
+    }
+
+    #[test]
+    fn builds_dameng_sorted_query_without_alias_list() {
+        let result = build_sorted_query_sql(SortedQuerySqlOptions {
+            original_sql: "SELECT id, name FROM users".to_string(),
+            database_type: Some(DatabaseType::Dameng),
+            result_columns: vec!["id".to_string(), "name".to_string()],
+            column_index: 0,
+            column: "id".to_string(),
+            direction: QuerySortDirection::Asc,
+        });
+
+        assert_eq!(result.sql.unwrap(), "SELECT * FROM (SELECT id, name FROM users) t ORDER BY \"id\" ASC;");
+    }
+
+    #[test]
+    fn builds_dameng_sorted_query_by_ordinal_for_duplicate_columns() {
+        let result = build_sorted_query_sql(SortedQuerySqlOptions {
+            original_sql: "SELECT a.id, b.id FROM a JOIN b ON b.a_id = a.id".to_string(),
+            database_type: Some(DatabaseType::Dameng),
+            result_columns: vec!["ID".to_string(), "id".to_string()],
+            column_index: 1,
+            column: "id".to_string(),
+            direction: QuerySortDirection::Desc,
+        });
+
+        assert_eq!(
+            result.sql.unwrap(),
+            "SELECT * FROM (SELECT a.id, b.id FROM a JOIN b ON b.a_id = a.id) t ORDER BY 2 DESC;"
+        );
+    }
+
+    #[test]
+    fn builds_oracle_sorted_query_by_ordinal_for_duplicate_columns() {
+        let result = build_sorted_query_sql(SortedQuerySqlOptions {
+            original_sql: "SELECT a.id, b.id FROM a JOIN b ON b.a_id = a.id".to_string(),
+            database_type: Some(DatabaseType::Oracle),
+            result_columns: vec!["ID".to_string(), "ID".to_string()],
+            column_index: 0,
+            column: "ID".to_string(),
+            direction: QuerySortDirection::Asc,
+        });
+
+        assert_eq!(
+            result.sql.unwrap(),
+            "SELECT * FROM (SELECT a.id, b.id FROM a JOIN b ON b.a_id = a.id) t ORDER BY 1 ASC;"
+        );
+    }
+
+    #[test]
+    fn preserves_derived_column_aliases_for_generic_jdbc() {
+        let result = build_sorted_query_sql(SortedQuerySqlOptions {
+            original_sql: "SELECT id, name FROM users".to_string(),
+            database_type: Some(DatabaseType::Jdbc),
+            result_columns: vec!["id".to_string(), "name".to_string()],
+            column_index: 0,
+            column: "id".to_string(),
+            direction: QuerySortDirection::Asc,
+        });
+
+        assert_eq!(result.sql.unwrap(), "SELECT * FROM (SELECT id, name FROM users) t(id, name) ORDER BY id ASC;");
     }
 
     #[test]
