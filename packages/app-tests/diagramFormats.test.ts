@@ -77,6 +77,41 @@ test("buildDiagramJson pretty-prints with trailing newline", () => {
   assert.deepEqual(JSON.parse(text), snapshot);
 });
 
+test("buildDiagramJson round-trips non-empty layers", () => {
+  const snapshot: DiagramJsonSnapshot = {
+    meta: {
+      connectionName: "local",
+      database: "app",
+      schema: "public",
+      mode: "table",
+      exportedAt: "2026-01-01T00:00:00.000Z",
+    },
+    tables: [],
+    relationships: [],
+    positions: {},
+    layers: [
+      {
+        id: "layer-1",
+        name: "Core",
+        color: "#3b82f6",
+        tableNames: ["users"],
+        collapsed: false,
+        visible: true,
+        layoutMode: "auto",
+        position: { x: 40, y: 40 },
+        width: 400,
+        height: 240,
+      },
+    ],
+    customRelationships: [],
+    matchConfirms: [],
+    matchIgnores: [],
+  };
+  const parsed = JSON.parse(buildDiagramJson(snapshot)) as DiagramJsonSnapshot;
+  assert.equal(parsed.layers.length, 1);
+  assert.deepEqual(parsed.layers[0], snapshot.layers[0]);
+});
+
 test("buildDiagramDbml emits tables, quoted types, and Ref operators", () => {
   const dbml = buildDiagramDbml(tables, [
     rel({ sourceCardinality: "1", targetCardinality: "1" }),

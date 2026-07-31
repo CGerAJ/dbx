@@ -1,12 +1,12 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, provide, ref, watch } from "vue";
+import { computed, markRaw, nextTick, onMounted, onUnmounted, provide, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { VueFlow, useVueFlow, type NodeChange, type EdgeChange, type NodeDragEvent, type EdgeMouseEvent } from "@vue-flow/core";
+import { VueFlow, useVueFlow, type NodeChange, type EdgeChange, type NodeDragEvent, type EdgeMouseEvent, type NodeTypesObject, type EdgeTypesObject } from "@vue-flow/core";
 import { Background } from "@vue-flow/background";
 import { MiniMap } from "@vue-flow/minimap";
 import "@vue-flow/core/dist/style.css";
@@ -17,15 +17,16 @@ import { useGraphStore } from "@/lib/diagram/graph-store";
 import * as api from "@/lib/backend/api";
 import { DIAGRAM_SQL_TYPES, isSchemaAware as isSchemaAwareDatabase } from "@/lib/database/databaseCapabilities";
 import { databaseOptionsForConnection } from "@/composables/useDatabaseOptions";
-import { buildDiagramJoinSql, buildDiagramRelationships, filterDiagramTables, layoutDiagramTables, mergeRelationshipsWithInferred, normalizeCustomDiagramRelationship, type CustomDiagramRelationship, type DiagramPosition, type DiagramRelationship, type DiagramTable } from "@/lib/diagram/erDiagram";
+import { buildDiagramJoinSql, buildDiagramRelationships, filterDiagramTables, layoutDiagramTables, mergeRelationshipsWithInferred, normalizeCustomDiagramRelationship, type CustomDiagramRelationship, type DiagramPosition, type DiagramTable } from "@/lib/diagram/erDiagram";
 import { buildEngineeringDiagram } from "@/lib/diagram/engineeringDiagram";
 import { buildEngineeringDiagramSvg, buildTableDiagramSvg, buildTableRelationshipPaths, computeTableDiagramCanvas } from "@/lib/export/diagramSvgExport";
 import { buildDiagramDbml, buildDiagramJson, buildDiagramMermaid, diagramExportFileName, svgToPngBlob, type DiagramExportFormat } from "@/lib/export/diagramFormats";
 import { saveDiagramBinaryExport, saveDiagramTextExport } from "@/lib/export/saveDiagramExport";
 import { inferRelationships, filterByStorage } from "@/lib/diagram/match-engine";
 import { loadMatchConfirms, saveMatchConfirms, loadMatchIgnores, saveMatchIgnores, isAutoMatchEnabled } from "@/lib/diagram/match-storage";
-import { toVueFlowNodes, toVueFlowEdges, toDiagramNodes, toDiagramEdges, toVueFlowLayerNodes, toAbsolutePosition } from "@/lib/diagram/vue-flow-adapter";
-import { CARD_WIDTH, CARD_HEADER_HEIGHT, COLUMN_ROW_HEIGHT, CARD_BOTTOM_PADDING, GAP_X, GAP_Y, MARGIN, columnsPerRowForWidth, DIAGRAM_HOVERED_EDGE_KEY, DIAGRAM_EDGE_OBSTACLES_KEY, EDGE_POPOVER_OPEN_DELAY_MS, EDGE_POPOVER_CLOSE_DELAY_MS } from "@/lib/diagram/diagram-constants";
+import { toVueFlowNodes, toVueFlowEdges, toDiagramEdges, toVueFlowLayerNodes, toAbsolutePosition } from "@/lib/diagram/vue-flow-adapter";
+import { CARD_WIDTH, CARD_HEADER_HEIGHT, COLUMN_ROW_HEIGHT, CARD_BOTTOM_PADDING, GAP_X, GAP_Y, MARGIN, columnsPerRowForWidth, DIAGRAM_HOVERED_EDGE_KEY, DIAGRAM_EDGE_OBSTACLES_KEY } from "@/lib/diagram/diagram-constants";
+import { createEdgePopoverScheduler } from "@/lib/diagram/edge-popover-schedule";
 import { sizeLayerToFit, findLayerAtPoint, placeNewLayer } from "@/lib/diagram/size-layer";
 import { orderTablesByConnectivity } from "@/lib/diagram/ltr-auto-layout";
 import { computeLayoutWithLayers } from "@/lib/diagram/elk-layout";
@@ -65,10 +66,8 @@ const edgeHandleHints = ref<Record<string, { sourceHandle?: string; targetHandle
 const highlightEdgeId = ref<string | null>(null);
 provide(DIAGRAM_HOVERED_EDGE_KEY, highlightEdgeId);
 
-let edgeLeaveTimer: ReturnType<typeof setTimeout> | null = null;
-let edgeOpenTimer: ReturnType<typeof setTimeout> | null = null;
-/** Edge under cursor while open-delay is pending (not yet shown). */
-let pendingHoverEdgeId: string | null = null;
+const edgePopoverScheduler = createEdgePopoverScheduler();
+/** Position for the edge under cursor while open-delay is pending. */
 let pendingHoverPos = { x: 0, y: 0 };
 
 function syncHighlightEdgeId() {
@@ -85,28 +84,22 @@ function clientToPanePos(clientX: number, clientY: number): { x: number; y: numb
 }
 
 function clearEdgeLeaveTimer() {
-  if (edgeLeaveTimer) {
-    clearTimeout(edgeLeaveTimer);
-    edgeLeaveTimer = null;
-  }
+  edgePopoverScheduler.cancelClose();
 }
 
 function clearEdgeOpenTimer() {
-  if (edgeOpenTimer) {
-    clearTimeout(edgeOpenTimer);
-    edgeOpenTimer = null;
-  }
-  pendingHoverEdgeId = null;
+  edgePopoverScheduler.cancelOpen();
 }
 
 function scheduleEdgePopoverClose() {
-  clearEdgeLeaveTimer();
-  edgeLeaveTimer = setTimeout(() => {
-    if (pinnedEdgeId.value || edgePopoverHovering.value) return;
-    hoveredEdgeId.value = null;
-    edgePopoverEditing.value = false;
-    syncHighlightEdgeId();
-  }, EDGE_POPOVER_CLOSE_DELAY_MS);
+  edgePopoverScheduler.scheduleClose(
+    () => !(pinnedEdgeId.value || edgePopoverHovering.value),
+    () => {
+      hoveredEdgeId.value = null;
+      edgePopoverEditing.value = false;
+      syncHighlightEdgeId();
+    },
+  );
 }
 
 function showEdgePopover(edgeId: string, pos: { x: number; y: number }) {
@@ -116,19 +109,11 @@ function showEdgePopover(edgeId: string, pos: { x: number; y: number }) {
 }
 
 function scheduleEdgePopoverOpen(edgeId: string, pos: { x: number; y: number }) {
-  clearEdgeOpenTimer();
-  pendingHoverEdgeId = edgeId;
   pendingHoverPos = pos;
-  edgeOpenTimer = setTimeout(() => {
-    edgeOpenTimer = null;
-    if (pendingHoverEdgeId !== edgeId) return;
-    if (pinnedEdgeId.value && pinnedEdgeId.value !== edgeId) {
-      pendingHoverEdgeId = null;
-      return;
-    }
-    showEdgePopover(edgeId, pendingHoverPos);
-    pendingHoverEdgeId = null;
-  }, EDGE_POPOVER_OPEN_DELAY_MS);
+  edgePopoverScheduler.scheduleOpen(edgeId, (id) => {
+    if (pinnedEdgeId.value && pinnedEdgeId.value !== id) return;
+    showEdgePopover(id, pendingHoverPos);
+  });
 }
 
 function handleEdgeMouseEnter(event: EdgeMouseEvent) {
@@ -149,7 +134,7 @@ function handleEdgeMouseMove(event: EdgeMouseEvent) {
   if (pinnedEdgeId.value) return;
   const ev = event.event as MouseEvent;
   const pos = clientToPanePos(ev.clientX, ev.clientY);
-  if (pendingHoverEdgeId === event.edge.id) {
+  if (edgePopoverScheduler.getPendingEdgeId() === event.edge.id) {
     pendingHoverPos = pos;
     return;
   }
@@ -471,8 +456,13 @@ const relationshipDraft = ref({
   cardinality: "many-to-one" as "one-to-one" | "one-to-many" | "many-to-one" | "many-to-many",
 });
 
-const nodeTypes = { table: TableNode, layer: LayerNode };
-const edgeTypes = { relationship: RelationshipEdge };
+const nodeTypes = {
+  table: markRaw(TableNode),
+  layer: markRaw(LayerNode),
+} as NodeTypesObject;
+const edgeTypes = {
+  relationship: markRaw(RelationshipEdge),
+} as EdgeTypesObject;
 
 const leftPanelWidth = ref(224);
 const rightPanelWidth = ref(360);
@@ -500,11 +490,6 @@ const isSchemaAware = computed(() => isSchemaAwareDatabase(selectedConnection.va
 const tableMap = computed(() => new Map(tables.value.map((table) => [table.name, table])));
 
 const allRelationships = computed(() => buildDiagramRelationships(tables.value, customRelationships.value));
-
-const allRelationshipsWithInferred = computed(() => {
-  if (!isAutoMatchEnabled()) return allRelationships.value;
-  return mergeRelationshipsWithInferred(allRelationships.value, matchResult.value.relationships);
-});
 
 const relatedTableNames = computed(() => {
   const focus = props.focusTableName;
@@ -579,11 +564,6 @@ const generatedJoinSql = computed(() => buildDiagramJoinSql(visibleRelationships
 const customRelationshipCount = computed(() => customRelationships.value.length);
 
 const matchRelationshipCount = computed(() => matchResult.value.relationships.length);
-
-function connectionIconType(id: string) {
-  const config = store.getConfig(id);
-  return config?.driver_profile || config?.db_type || "mysql";
-}
 
 function tableHeight(table: DiagramTable): number {
   return CARD_HEADER_HEIGHT + table.columns.length * COLUMN_ROW_HEIGHT + CARD_BOTTOM_PADDING;
@@ -719,22 +699,6 @@ async function handleLayerLayoutModeChanged(payload: { layerId: string; layoutMo
     }
     syncVueFlowNodes();
   }
-}
-
-function visibleColumns(table: DiagramTable) {
-  return table.columns;
-}
-
-function isForeignKeyColumn(table: DiagramTable, columnName: string): boolean {
-  return table.foreignKeys.some((fk) => fk.column === columnName);
-}
-
-function isRelationshipColumn(table: DiagramTable, columnName: string): boolean {
-  return visibleRelationships.value.some((relationship) => (relationship.sourceTable === table.name && relationship.sourceColumn === columnName) || (relationship.targetTable === table.name && relationship.targetColumn === columnName));
-}
-
-function relationshipTitle(relationship: DiagramRelationship): string {
-  return `${relationship.sourceTable}.${relationship.sourceColumn} (${relationship.sourceCardinality}:${relationship.targetCardinality}) -> ${relationship.targetTable}.${relationship.targetColumn}`;
 }
 
 function openTableData(tableName: string) {

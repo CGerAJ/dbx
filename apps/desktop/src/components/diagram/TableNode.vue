@@ -6,7 +6,7 @@ import { Badge } from "@/components/ui/badge";
 import type { DiagramTable, DiagramRelationship } from "@/lib/diagram/erDiagram";
 import type { InferredRelationship } from "@/types/diagram";
 import { useLayerStore } from "@/lib/diagram/layer-store";
-import { CARD_WIDTH, CARD_HEADER_HEIGHT, COLUMN_ROW_HEIGHT, CARD_BOTTOM_PADDING, COLUMN_TYPE_WIDTH, COLUMN_NAME_MAX_CHARS, COLUMN_TYPE_MAX_CHARS, TABLE_NAME_MAX_CHARS, EDGE_HANDLE_OUTSET } from "@/lib/diagram/diagram-constants";
+import { CARD_WIDTH, COLUMN_TYPE_WIDTH, COLUMN_NAME_MAX_CHARS, COLUMN_TYPE_MAX_CHARS, TABLE_NAME_MAX_CHARS, EDGE_HANDLE_OUTSET } from "@/lib/diagram/diagram-constants";
 
 const layerStore = useLayerStore();
 
@@ -38,10 +38,6 @@ function truncateLabel(value: string, maxChars: number): string {
   if (value.length <= maxChars) return value;
   return `${value.slice(0, Math.max(1, maxChars - 1))}…`;
 }
-
-const tableHeight = computed(() => {
-  return CARD_HEADER_HEIGHT + props.data.table.columns.length * COLUMN_ROW_HEIGHT + CARD_BOTTOM_PADDING;
-});
 
 const layerColor = computed(() => layerStore.getLayerColor(props.data.table.name));
 

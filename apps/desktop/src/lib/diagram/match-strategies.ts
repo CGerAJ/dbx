@@ -1,4 +1,4 @@
-import type { ColumnInfo, DiagramTable } from "./erDiagram";
+import type { DiagramTable } from "./erDiagram";
 
 const TYPE_COMPATIBLE_MAP: Record<string, string[]> = {
   bigint: ["bigint", "int", "smallint", "tinyint", "integer", "long"],

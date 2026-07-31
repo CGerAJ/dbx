@@ -1,4 +1,4 @@
-import { safeLocalStorageGet, safeLocalStorageSet, safeLocalStorageRemove } from "@/lib/backend/safeStorage";
+import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/backend/safeStorage";
 
 function matchStorageKey(type: "match-confirms" | "match-ignores" | "match-rules", connectionId: string, database: string, schema: string): string {
   return ["dbx", "diagram", type, "v1", connectionId, database, schema].join(":");

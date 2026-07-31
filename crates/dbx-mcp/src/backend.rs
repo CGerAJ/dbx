@@ -1412,6 +1412,7 @@ fn infer_document_columns(documents: &[Value]) -> Vec<ColumnInfo> {
             is_nullable: true,
             column_default: None,
             is_primary_key: false,
+            is_unique: false,
             extra: None,
             comment: None,
             numeric_precision: None,
