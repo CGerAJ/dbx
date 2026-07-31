@@ -1,5 +1,20 @@
 import { describe, expect, it } from "vitest";
-import { connectionObjectTreeNodeSchema, connectionQueryExecutionSchema, connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection, inferJdbcDialect } from "@/lib/database/jdbcDialect";
+import type { ConnectionConfig } from "@/types/database";
+import {
+  GAUSSDB_M_JDBC_DRIVER_CLASS,
+  connectionObjectTreeNodeSchema,
+  connectionQueryExecutionSchema,
+  connectionShouldLoadIdentifierQuote,
+  connectionUsesDatabaseObjectTreeMode,
+  effectiveDatabaseTypeForConnection,
+  gaussdbConnectionMode,
+  gaussdbIdentifierQuoteOverride,
+  gaussdbIdentifierQuoteStyle,
+  inferJdbcDialect,
+  setGaussdbConnectionMode,
+  setGaussdbIdentifierQuoteStyle,
+  supportsGaussdbIdentifierQuoteStyle,
+} from "@/lib/database/jdbcDialect";
 
 describe("jdbc dialect inference", () => {
   it("detects InterSystems IRIS and Caché JDBC connections", () => {
@@ -65,6 +80,56 @@ describe("jdbc dialect inference", () => {
     expect(connectionUsesDatabaseObjectTreeMode(opengaussConnection)).toBe(false);
   });
 
+  it("loads driver-reported identifier quotes for compatible JDBC connections", () => {
+    expect(connectionShouldLoadIdentifierQuote({ db_type: "jdbc", jdbc_driver_paths: ["/drivers/gaussdb.jar"] })).toBe(true);
+    expect(connectionShouldLoadIdentifierQuote({ db_type: "jdbc", jdbc_driver_class: "org.opengauss.Driver" })).toBe(true);
+    expect(connectionShouldLoadIdentifierQuote({ db_type: "jdbc", jdbc_driver_class: "org.postgresql.Driver" })).toBe(true);
+    expect(connectionShouldLoadIdentifierQuote({ db_type: "kingbase" })).toBe(true);
+    expect(connectionShouldLoadIdentifierQuote({ db_type: "gaussdb" })).toBe(true);
+    expect(
+      connectionShouldLoadIdentifierQuote({
+        db_type: "jdbc",
+        jdbc_driver_class: "org.postgresql.Driver",
+        external_config: { gaussdbIdentifierQuoteStyle: "backtick" },
+      }),
+    ).toBe(false);
+  });
+
+  it("recognizes GaussDB reached through PostgreSQL-compatible JDBC drivers", () => {
+    const connection = {
+      db_type: "jdbc" as const,
+      connection_string: "jdbc:postgresql://localhost:5432/postgres",
+      jdbc_driver_class: "org.postgresql.Driver",
+      database_info: { productName: "GaussDB Kernel", driverName: "PostgreSQL JDBC Driver" },
+    };
+
+    expect(inferJdbcDialect(connection)).toBe("gaussdb");
+    expect(effectiveDatabaseTypeForConnection(connection)).toBe("gaussdb");
+    expect(supportsGaussdbIdentifierQuoteStyle(connection)).toBe(true);
+  });
+
+  it("supports persisted GaussDB identifier quote overrides", () => {
+    const native = { db_type: "gaussdb" as const, external_config: undefined as unknown };
+    const jdbc = { db_type: "jdbc" as const, jdbc_driver_paths: ["/drivers/gaussdb.jar"], external_config: { retained: true } as unknown };
+
+    expect(supportsGaussdbIdentifierQuoteStyle(native)).toBe(true);
+    expect(gaussdbIdentifierQuoteStyle(native)).toBe("auto");
+    expect(gaussdbIdentifierQuoteOverride(native)).toBeUndefined();
+
+    setGaussdbIdentifierQuoteStyle(native, "backtick");
+    expect(gaussdbIdentifierQuoteStyle(native)).toBe("backtick");
+    expect(gaussdbIdentifierQuoteOverride(native)).toBe("`");
+
+    setGaussdbIdentifierQuoteStyle(jdbc, "double");
+    expect(jdbc.external_config).toEqual({ retained: true, gaussdbIdentifierQuoteStyle: "double" });
+    expect(gaussdbIdentifierQuoteOverride(jdbc)).toBe('"');
+    expect(connectionShouldLoadIdentifierQuote(jdbc)).toBe(false);
+
+    setGaussdbIdentifierQuoteStyle(jdbc, "auto");
+    expect(jdbc.external_config).toEqual({ retained: true });
+    expect(connectionShouldLoadIdentifierQuote(jdbc)).toBe(true);
+  });
+
   it("detects Dameng JDBC connections", () => {
     const damengConnection = {
       db_type: "jdbc" as const,
@@ -76,6 +141,22 @@ describe("jdbc dialect inference", () => {
   });
 });
 
+describe("GaussDB connection mode", () => {
+  it("keeps native connections compatible and configures M mode for the vendor JDBC driver", () => {
+    const connection = { db_type: "gaussdb", driver_profile: "gaussdb", driver_label: "GaussDB" } as ConnectionConfig;
+
+    expect(gaussdbConnectionMode(connection)).toBe("native");
+    setGaussdbConnectionMode(connection, "m-jdbc");
+    expect(connection.driver_profile).toBe("gaussdb-m");
+    expect(connection.jdbc_driver_class).toBe(GAUSSDB_M_JDBC_DRIVER_CLASS);
+    expect(gaussdbIdentifierQuoteOverride(connection)).toBeUndefined();
+
+    setGaussdbConnectionMode(connection, "native");
+    expect(connection.driver_profile).toBe("gaussdb");
+    expect(connection.jdbc_driver_class).toBeUndefined();
+  });
+});
+
 describe("query execution schema", () => {
   it.each(["spark", "hive"] as const)("uses the selected database as the %s execution schema", (dbType) => {
     expect(connectionQueryExecutionSchema({ db_type: dbType }, "ai_test", undefined, false)).toBe("ai_test");
@@ -83,6 +164,10 @@ describe("query execution schema", () => {
 
   it("prefers an explicit schema for PostgreSQL", () => {
     expect(connectionQueryExecutionSchema({ db_type: "postgres" }, "app", "reporting", false)).toBe("reporting");
+  });
+
+  it("prefers an explicit schema for Kingbase query execution", () => {
+    expect(connectionQueryExecutionSchema({ db_type: "kingbase" }, "qinzhou", "sdy_smartsite", false)).toBe("sdy_smartsite");
   });
 
   it("does not send a schema for MySQL database context", () => {

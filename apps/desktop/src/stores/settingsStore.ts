@@ -10,6 +10,7 @@ import { normalizeSidebarHiddenTablePrefixes } from "@/lib/sidebar/sidebarTableN
 import type { ConnectionListSortMode } from "@/lib/sidebar/connectionListSort";
 import { DEFAULT_SQL_FORMATTER_SETTINGS, normalizeSqlFormatterSettings, type SqlFormatterSettings } from "@/lib/sql/sqlFormatterConfig";
 import { normalizeSqlVariableSyntaxOverrides, type SqlVariableSyntaxOverrides } from "@/lib/sql/sqlVariableSyntax";
+import type { SavedSqlOpenTargetMode } from "@/lib/savedSql/savedSqlExecutionTarget";
 import type { SidebarActivation } from "@/lib/sidebar/treeNodeClick";
 import type { SqlSnippet, TableInfoTab } from "@/types/database";
 import { DEFAULT_SQL_SNIPPETS } from "@/lib/sql/sqlCompletion";
@@ -20,6 +21,7 @@ import { safeLocalStorageGet, safeLocalStorageRemove } from "@/lib/backend/safeS
 import type { AiProvider, AiApiStyle, AiAuthMethod, AiEffortLevel, AiReasoningLevel, AiConfiguredModel, AiConfig, AiTestConnectionResult, AiConfigItem, AiChatSelectionState, AiEffortSelection, AiModelEffortPreference } from "@/types/ai";
 
 export type { AiProvider, AiApiStyle, AiAuthMethod, AiEffortLevel, AiReasoningLevel, AiConfiguredModel, AiConfig, AiTestConnectionResult, AiConfigItem, AiChatSelectionState, AiEffortSelection };
+export type { SavedSqlOpenTargetMode };
 
 export interface DesktopSettings {
   show_tray_icon: boolean;
@@ -170,6 +172,16 @@ export const AI_PROVIDER_PRESETS: Record<AiProvider, AiProviderPreset> = {
     authMethod: "bearer",
     requiresApiKey: true,
   },
+  minimax: {
+    label: "MiniMax",
+    iconSlug: "minimax",
+    provider: "minimax",
+    endpoint: "https://api.minimax.io/v1",
+    model: "MiniMax-M3",
+    apiStyle: "completions",
+    authMethod: "bearer",
+    requiresApiKey: true,
+  },
   ollama: {
     label: "Ollama",
     iconSlug: "ollama",
@@ -177,6 +189,16 @@ export const AI_PROVIDER_PRESETS: Record<AiProvider, AiProviderPreset> = {
     endpoint: "http://localhost:11434/v1",
     model: "llama3.1",
     apiStyle: "completions",
+    authMethod: "bearer",
+    requiresApiKey: false,
+  },
+  "anthropic-compatible": {
+    label: "Anthropic Compatible",
+    iconSlug: "anthropic",
+    provider: "anthropic-compatible",
+    endpoint: "",
+    model: "",
+    apiStyle: "anthropic-messages",
     authMethod: "bearer",
     requiresApiKey: false,
   },
@@ -289,6 +311,7 @@ function inferAiProviderFromConfig(config: Partial<AiConfig> | null | undefined)
   if (endpoint.includes("deepseek") || model.includes("deepseek")) return "deepseek";
   if (endpoint.includes("dashscope") || endpoint.includes("aliyuncs") || model.includes("qwen")) return "qwen";
   if (endpoint.includes("generativelanguage.googleapis.com") || model.includes("gemini")) return "gemini";
+  if (endpoint.includes("minimax.io") || endpoint.includes("minimaxi.com") || model.includes("minimax")) return "minimax";
   if (endpoint.includes("localhost:11434") || endpoint.includes("127.0.0.1:11434")) return "ollama";
   if (endpoint.includes("openai.com") || model.startsWith("gpt-")) return "openai";
   return "claude";
@@ -335,6 +358,9 @@ export const TABLE_FONT_SIZE_MAX = 16;
 export const TABLE_FONT_SIZE_DEFAULT = 13;
 const DISCONNECT_TAB_HANDLING_MODES = ["close-tabs", "keep-tabs-clear-results", "keep-tabs-keep-results"] as const;
 export type DisconnectTabHandlingMode = (typeof DISCONNECT_TAB_HANDLING_MODES)[number];
+
+const CLICK_TABLE_NAVIGATION_TARGETS = ["data", "ddl"] as const;
+export type ClickTableNavigationTarget = (typeof CLICK_TABLE_NAVIGATION_TARGETS)[number];
 
 export interface CustomThemeColors {
   keyword: string;
@@ -393,7 +419,14 @@ export interface CustomTheme {
   ddlColors: CustomThemeDdlColors;
 }
 
-export const DEFAULT_CUSTOM_THEMES: CustomTheme[] = [{ id: "default", name: "Custom", colors: { ...DEFAULT_CUSTOM_THEME_COLORS }, ddlColors: { ...DEFAULT_CUSTOM_THEME_DDL_COLORS } }];
+export const DEFAULT_CUSTOM_THEMES: CustomTheme[] = [
+  {
+    id: "default",
+    name: "Custom",
+    colors: { ...DEFAULT_CUSTOM_THEME_COLORS },
+    ddlColors: { ...DEFAULT_CUSTOM_THEME_DDL_COLORS },
+  },
+];
 
 export type SidebarObjectInfoMode = "comment-inline" | "comment-aligned" | "comment-right" | "size" | "hidden";
 
@@ -421,6 +454,7 @@ export interface EditorSettings {
   sqlSemanticDiagnosticsEnabled: boolean;
   confirmDangerousSqlExecution: boolean;
   confirmUnsavedSqlClose: boolean;
+  savedSqlOpenTargetMode: SavedSqlOpenTargetMode;
   compactTabTitle: boolean;
   tabLayout: TabLayoutMode;
   appLayout: "separated" | "classic";
@@ -458,7 +492,10 @@ export interface EditorSettings {
   sidebarActivation: SidebarActivation;
   sidebarConnectionSortMode: ConnectionListSortMode;
   sidebarObjectDisplay: "grouped" | "simple";
+  routineSourceOpenMode: "query-tab" | "dialog";
   sidebarTableSearchEnabled: boolean;
+  sidebarTableSearchLocal: boolean;
+  sidebarGlobalSearchLocal: boolean;
   autoSelectActiveSidebarNode: boolean;
   openTabsRestoreMode: OpenTabsRestoreMode;
   disconnectTabHandlingMode: DisconnectTabHandlingMode;
@@ -485,6 +522,7 @@ export interface EditorSettings {
   objectBrowserViewMode: "list" | "grid";
   sqlVariableSyntaxOverrides: SqlVariableSyntaxOverrides;
   continueOnErrorOnBatch: boolean;
+  clickTableNavigationTarget: ClickTableNavigationTarget;
 }
 
 export interface ToolbarItems {
@@ -538,7 +576,11 @@ export function enforceRightSidebarPanelExclusivity(current: RightSidebarPanelSt
   return transitionRightSidebarPanels(current, panelToKeep, true, true);
 }
 
-export const EDITOR_THEMES: { value: EditorTheme; label: string; dark: boolean }[] = [
+export const EDITOR_THEMES: {
+  value: EditorTheme;
+  label: string;
+  dark: boolean;
+}[] = [
   { value: "app", label: "Follow app theme", dark: false },
   { value: "one-dark", label: "One Dark", dark: true },
   { value: "vscode-dark", label: "VS Dark+", dark: true },
@@ -589,6 +631,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   sqlSemanticDiagnosticsEnabled: SQL_SEMANTIC_DIAGNOSTICS_AUTO_ENABLED,
   confirmDangerousSqlExecution: true,
   confirmUnsavedSqlClose: true,
+  savedSqlOpenTargetMode: "saved",
   compactTabTitle: false,
   tabLayout: "scroll",
   appLayout: "classic",
@@ -626,7 +669,10 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   sidebarActivation: "single",
   sidebarConnectionSortMode: "manual",
   sidebarObjectDisplay: "grouped",
+  routineSourceOpenMode: "query-tab",
   sidebarTableSearchEnabled: false,
+  sidebarTableSearchLocal: true,
+  sidebarGlobalSearchLocal: false,
   autoSelectActiveSidebarNode: false,
   openTabsRestoreMode: "all",
   disconnectTabHandlingMode: "close-tabs",
@@ -653,6 +699,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   objectBrowserViewMode: "list",
   sqlVariableSyntaxOverrides: {},
   continueOnErrorOnBatch: false,
+  clickTableNavigationTarget: "data",
 };
 
 export const STORAGE_KEY = "dbx-editor-settings";
@@ -740,6 +787,10 @@ function normalizeDisconnectTabHandlingMode(value: unknown, legacyCloseTabsOnDis
   return DEFAULT_EDITOR_SETTINGS.disconnectTabHandlingMode;
 }
 
+function normalizeClickTableNavigationTarget(value: unknown): ClickTableNavigationTarget {
+  return value === "data" || value === "ddl" ? value : DEFAULT_EDITOR_SETTINGS.clickTableNavigationTarget;
+}
+
 function normalizeOpenTabsRestoreMode(value: unknown, legacyRestoreOpenTabsOnLaunch?: unknown): OpenTabsRestoreMode {
   if (value === "all" || value === "pinned" || value === "none") return value;
   if (typeof legacyRestoreOpenTabsOnLaunch === "boolean") return legacyRestoreOpenTabsOnLaunch ? "all" : "none";
@@ -790,7 +841,13 @@ function normalizeSqlSnippets(value: unknown, existing?: SqlSnippet[]): SqlSnipp
     if (seenPrefixes.has(item.prefix)) continue;
     seenPrefixes.add(item.prefix);
     // Older settings do not have this field; only an explicit false disables a snippet.
-    valid.push({ id: item.id, label: item.label, prefix: item.prefix, body: item.body, enabled: item.enabled !== false });
+    valid.push({
+      id: item.id,
+      label: item.label,
+      prefix: item.prefix,
+      body: item.body,
+      enabled: item.enabled !== false,
+    });
   }
   if (valid.length === 0) return existing ?? DEFAULT_SQL_SNIPPETS;
   return valid;
@@ -845,7 +902,10 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
           return {
             ...renamed,
             colors: { ...DEFAULT_CUSTOM_THEME_COLORS, ...renamed.colors },
-            ddlColors: { ...DEFAULT_CUSTOM_THEME_DDL_COLORS, ...(renamed as any).ddlColors },
+            ddlColors: {
+              ...DEFAULT_CUSTOM_THEME_DDL_COLORS,
+              ...(renamed as any).ddlColors,
+            },
           };
         });
       }
@@ -854,7 +914,10 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
             {
               id: "migrated",
               name: "Migrated",
-              colors: { ...DEFAULT_CUSTOM_THEME_COLORS, ...settings.customThemeColors },
+              colors: {
+                ...DEFAULT_CUSTOM_THEME_COLORS,
+                ...settings.customThemeColors,
+              },
               ddlColors: { ...DEFAULT_CUSTOM_THEME_DDL_COLORS },
             },
           ]
@@ -876,6 +939,7 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     sqlSemanticDiagnosticsEnabled: sqlSemanticDiagnosticsEnabledForMode(sqlSemanticDiagnosticsMode),
     confirmDangerousSqlExecution: settings.confirmDangerousSqlExecution ?? DEFAULT_EDITOR_SETTINGS.confirmDangerousSqlExecution,
     confirmUnsavedSqlClose: settings.confirmUnsavedSqlClose ?? DEFAULT_EDITOR_SETTINGS.confirmUnsavedSqlClose,
+    savedSqlOpenTargetMode: settings.savedSqlOpenTargetMode === "current" ? "current" : DEFAULT_EDITOR_SETTINGS.savedSqlOpenTargetMode,
     compactTabTitle: settings.compactTabTitle ?? DEFAULT_EDITOR_SETTINGS.compactTabTitle,
     tabLayout: normalizeTabLayout(settings.tabLayout),
     appLayout: settings.appLayout ?? DEFAULT_EDITOR_SETTINGS.appLayout,
@@ -913,19 +977,48 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     sidebarActivation: settings.sidebarActivation === "single" || settings.sidebarActivation === "double" ? settings.sidebarActivation : DEFAULT_EDITOR_SETTINGS.sidebarActivation,
     sidebarConnectionSortMode: normalizeConnectionListSortMode(settings.sidebarConnectionSortMode),
     sidebarObjectDisplay: settings.sidebarObjectDisplay === "simple" || settings.sidebarObjectDisplay === "grouped" ? settings.sidebarObjectDisplay : DEFAULT_EDITOR_SETTINGS.sidebarObjectDisplay,
+    routineSourceOpenMode: settings.routineSourceOpenMode === "query-tab" || settings.routineSourceOpenMode === "dialog" ? settings.routineSourceOpenMode : DEFAULT_EDITOR_SETTINGS.routineSourceOpenMode,
     sidebarTableSearchEnabled: typeof settings.sidebarTableSearchEnabled === "boolean" ? settings.sidebarTableSearchEnabled : DEFAULT_EDITOR_SETTINGS.sidebarTableSearchEnabled,
+    sidebarTableSearchLocal: typeof settings.sidebarTableSearchLocal === "boolean" ? settings.sidebarTableSearchLocal : DEFAULT_EDITOR_SETTINGS.sidebarTableSearchLocal,
+    sidebarGlobalSearchLocal: typeof settings.sidebarGlobalSearchLocal === "boolean" ? settings.sidebarGlobalSearchLocal : DEFAULT_EDITOR_SETTINGS.sidebarGlobalSearchLocal,
     autoSelectActiveSidebarNode: settings.autoSelectActiveSidebarNode ?? DEFAULT_EDITOR_SETTINGS.autoSelectActiveSidebarNode,
-    openTabsRestoreMode: normalizeOpenTabsRestoreMode((settings as Partial<EditorSettings>).openTabsRestoreMode, (settings as Partial<EditorSettings> & { restoreOpenTabsOnLaunch?: boolean }).restoreOpenTabsOnLaunch),
-    disconnectTabHandlingMode: normalizeDisconnectTabHandlingMode((settings as Partial<EditorSettings>).disconnectTabHandlingMode, (settings as Partial<EditorSettings> & { closeQueryTabsOnDisconnect?: boolean }).closeQueryTabsOnDisconnect),
+    openTabsRestoreMode: normalizeOpenTabsRestoreMode(
+      (settings as Partial<EditorSettings>).openTabsRestoreMode,
+      (
+        settings as Partial<EditorSettings> & {
+          restoreOpenTabsOnLaunch?: boolean;
+        }
+      ).restoreOpenTabsOnLaunch,
+    ),
+    disconnectTabHandlingMode: normalizeDisconnectTabHandlingMode(
+      (settings as Partial<EditorSettings>).disconnectTabHandlingMode,
+      (
+        settings as Partial<EditorSettings> & {
+          closeQueryTabsOnDisconnect?: boolean;
+        }
+      ).closeQueryTabsOnDisconnect,
+    ),
     reuseDataTab: settings.reuseDataTab ?? DEFAULT_EDITOR_SETTINGS.reuseDataTab,
     prefillNewQueryWithSelect: typeof settings.prefillNewQueryWithSelect === "boolean" ? settings.prefillNewQueryWithSelect : DEFAULT_EDITOR_SETTINGS.prefillNewQueryWithSelect,
     updateNotificationsEnabled: settings.updateNotificationsEnabled ?? DEFAULT_EDITOR_SETTINGS.updateNotificationsEnabled,
     sidebarHiddenTablePrefixes: normalizeSidebarHiddenTablePrefixes(settings.sidebarHiddenTablePrefixes),
     sidebarObjectInfoMode: normalizeSidebarObjectInfoMode(
       settings.sidebarObjectInfoMode,
-      (settings as Partial<EditorSettings> & { sidebarTableCommentLayout?: string }).sidebarTableCommentLayout,
-      (settings as Partial<EditorSettings> & { sidebarHideTableComments?: boolean }).sidebarHideTableComments,
-      (settings as Partial<EditorSettings> & { sidebarShowDatabaseSizes?: boolean }).sidebarShowDatabaseSizes,
+      (
+        settings as Partial<EditorSettings> & {
+          sidebarTableCommentLayout?: string;
+        }
+      ).sidebarTableCommentLayout,
+      (
+        settings as Partial<EditorSettings> & {
+          sidebarHideTableComments?: boolean;
+        }
+      ).sidebarHideTableComments,
+      (
+        settings as Partial<EditorSettings> & {
+          sidebarShowDatabaseSizes?: boolean;
+        }
+      ).sidebarShowDatabaseSizes,
     ),
     sidebarAllowHorizontalScroll: settings.sidebarAllowHorizontalScroll ?? DEFAULT_EDITOR_SETTINGS.sidebarAllowHorizontalScroll,
     columnFormatters: normalizeColumnFormatters(settings.columnFormatters),
@@ -945,6 +1038,7 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     objectBrowserViewMode: settings.objectBrowserViewMode === "grid" ? "grid" : DEFAULT_EDITOR_SETTINGS.objectBrowserViewMode,
     sqlVariableSyntaxOverrides: normalizeSqlVariableSyntaxOverrides(settings.sqlVariableSyntaxOverrides),
     continueOnErrorOnBatch: settings.continueOnErrorOnBatch === true,
+    clickTableNavigationTarget: normalizeClickTableNavigationTarget(settings.clickTableNavigationTarget),
   };
 }
 
@@ -996,7 +1090,9 @@ export const useSettingsStore = defineStore("settings", () => {
   const isAiConfigLoaded = ref(false);
   const aiConfigs = ref<AiConfigItem[]>([]);
   const desktopSettings = ref<DesktopSettings>({ ...DEFAULT_DESKTOP_SETTINGS });
-  const mcpGlobalPolicy = ref<McpGlobalPolicy>({ ...DEFAULT_MCP_GLOBAL_POLICY });
+  const mcpGlobalPolicy = ref<McpGlobalPolicy>({
+    ...DEFAULT_MCP_GLOBAL_POLICY,
+  });
   const isDesktopSettingsLoaded = ref(false);
   const isMcpGlobalPolicyLoaded = ref(false);
   const isEditorSettingsLoaded = ref(false);
@@ -1119,7 +1215,10 @@ export const useSettingsStore = defineStore("settings", () => {
     const savedActive = savedSelection?.active;
     const savedConfig = savedActive ? aiConfigs.value.find((config) => config.id === savedActive.configId) : undefined;
     if (savedConfig && savedActive?.modelId.trim()) {
-      activeModel.value = { configId: savedConfig.id, modelId: savedActive.modelId.trim() };
+      activeModel.value = {
+        configId: savedConfig.id,
+        modelId: savedActive.modelId.trim(),
+      };
     } else {
       const fallback = aiConfigs.value.find((config) => config.isDefault) || aiConfigs.value[0];
       activeModel.value = fallback?.model.trim() ? { configId: fallback.id, modelId: fallback.model.trim() } : null;
@@ -1175,7 +1274,10 @@ export const useSettingsStore = defineStore("settings", () => {
     await api.saveAiConfigItem(normalized);
     aiConfigs.value.push(normalized);
     if (aiConfigs.value.length === 1 && normalized.model.trim()) {
-      activeModel.value = { configId: normalized.id, modelId: normalized.model };
+      activeModel.value = {
+        configId: normalized.id,
+        modelId: normalized.model,
+      };
       persistAiChatSelection();
     }
   }
@@ -1214,7 +1316,10 @@ export const useSettingsStore = defineStore("settings", () => {
   }
 
   function updateActiveModel(model: { configId: string; modelId: string }) {
-    activeModel.value = { configId: model.configId, modelId: model.modelId.trim() };
+    activeModel.value = {
+      configId: model.configId,
+      modelId: model.modelId.trim(),
+    };
     persistAiChatSelection();
   }
 
@@ -1316,6 +1421,7 @@ export const useSettingsStore = defineStore("settings", () => {
     }
     if (partial.confirmDangerousSqlExecution !== undefined) editorSettings.value.confirmDangerousSqlExecution = partial.confirmDangerousSqlExecution;
     if (partial.confirmUnsavedSqlClose !== undefined) editorSettings.value.confirmUnsavedSqlClose = partial.confirmUnsavedSqlClose;
+    if (partial.savedSqlOpenTargetMode !== undefined) editorSettings.value.savedSqlOpenTargetMode = partial.savedSqlOpenTargetMode === "current" ? "current" : "saved";
     if (partial.compactTabTitle !== undefined) editorSettings.value.compactTabTitle = partial.compactTabTitle;
     if (partial.tabLayout !== undefined) editorSettings.value.tabLayout = normalizeTabLayout(partial.tabLayout);
     if (partial.appLayout !== undefined) editorSettings.value.appLayout = partial.appLayout;
@@ -1354,7 +1460,10 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.sidebarActivation !== undefined) editorSettings.value.sidebarActivation = partial.sidebarActivation;
     if (partial.sidebarConnectionSortMode !== undefined) editorSettings.value.sidebarConnectionSortMode = normalizeConnectionListSortMode(partial.sidebarConnectionSortMode);
     if (partial.sidebarObjectDisplay !== undefined) editorSettings.value.sidebarObjectDisplay = partial.sidebarObjectDisplay;
+    if (partial.routineSourceOpenMode !== undefined) editorSettings.value.routineSourceOpenMode = partial.routineSourceOpenMode;
     if (partial.sidebarTableSearchEnabled !== undefined) editorSettings.value.sidebarTableSearchEnabled = partial.sidebarTableSearchEnabled;
+    if (partial.sidebarTableSearchLocal !== undefined) editorSettings.value.sidebarTableSearchLocal = partial.sidebarTableSearchLocal;
+    if (partial.sidebarGlobalSearchLocal !== undefined) editorSettings.value.sidebarGlobalSearchLocal = partial.sidebarGlobalSearchLocal;
     if (partial.autoSelectActiveSidebarNode !== undefined) editorSettings.value.autoSelectActiveSidebarNode = partial.autoSelectActiveSidebarNode;
     if (partial.openTabsRestoreMode !== undefined) editorSettings.value.openTabsRestoreMode = normalizeOpenTabsRestoreMode(partial.openTabsRestoreMode);
     if (partial.disconnectTabHandlingMode !== undefined) editorSettings.value.disconnectTabHandlingMode = normalizeDisconnectTabHandlingMode(partial.disconnectTabHandlingMode);
@@ -1381,6 +1490,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.objectBrowserViewMode !== undefined) editorSettings.value.objectBrowserViewMode = partial.objectBrowserViewMode === "grid" ? "grid" : "list";
     if (partial.sqlVariableSyntaxOverrides !== undefined) editorSettings.value.sqlVariableSyntaxOverrides = normalizeSqlVariableSyntaxOverrides(partial.sqlVariableSyntaxOverrides);
     if (partial.continueOnErrorOnBatch !== undefined) editorSettings.value.continueOnErrorOnBatch = partial.continueOnErrorOnBatch === true;
+    if (partial.clickTableNavigationTarget !== undefined) editorSettings.value.clickTableNavigationTarget = normalizeClickTableNavigationTarget(partial.clickTableNavigationTarget);
     saveEditorSettings(editorSettings.value);
   }
 
@@ -1412,7 +1522,9 @@ export const useSettingsStore = defineStore("settings", () => {
   }
 
   function deleteCustomColumnFormatter(id: string) {
-    const customColumnFormatters = { ...editorSettings.value.customColumnFormatters };
+    const customColumnFormatters = {
+      ...editorSettings.value.customColumnFormatters,
+    };
     delete customColumnFormatters[id];
     const columnFormatters = Object.fromEntries(
       Object.entries(editorSettings.value.columnFormatters).filter(([, formatter]) => {

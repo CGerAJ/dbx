@@ -2,7 +2,7 @@
 import { computed, ref, nextTick, watch, onMounted, onBeforeUnmount } from "vue";
 import { uuid } from "@/lib/common/utils";
 import { useI18n } from "vue-i18n";
-import { RefreshCw, Trash2, Plus, Save, ChevronDown, ChevronUp, ChevronLeft, ChevronRight, Table2, Braces, X, Columns3, Check, Search, Wrench, Filter } from "@lucide/vue";
+import { RefreshCw, Trash2, Plus, Save, ChevronDown, ChevronUp, ChevronLeft, ChevronRight, Table2, Braces, X, Search, Wrench, Filter } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
@@ -11,6 +11,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
 import ErrorBanner from "@/components/ui/ErrorBanner.vue";
 import DataGrid from "@/components/grid/DataGrid.vue";
+import DataGridColumnLayoutPopover from "@/components/grid/DataGridColumnLayoutPopover.vue";
+import DataGridCopyFormatControl from "@/components/grid/DataGridCopyFormatControl.vue";
 import QueryLoadingState from "@/components/common/QueryLoadingState.vue";
 import * as api from "@/lib/backend/api";
 import { useConnectionStore } from "@/stores/connectionStore";
@@ -34,10 +36,12 @@ import {
   documentFilterModeOptions,
   documentStoreProviderFor,
   elasticsearchBoolClauseOptions,
+  elasticsearchFieldPathTreeFromFieldNames,
   elasticsearchQueryTypeNeedsValue,
   elasticsearchQueryTypeOptions,
   elasticsearchStructuredFilter,
   formatDocumentQueryInput,
+  searchElasticsearchFieldPathTree,
   type DocumentFieldPathNode,
   type DocumentFilterMode,
   type DocumentFilterRule,
@@ -61,6 +65,8 @@ import { isLosslessJsonNumber, parseJsonPreservingLargeNumbers } from "@/lib/com
 import { buildMongoInsertDocument, buildMongoUpdateDocument, formatMongoShellLiteral, mongoDocumentDisplayValue, mongoDocumentIdForGrid, parseMongoDocumentInputValue, serializeMongoDocumentId, type MongoInputValue } from "@/lib/mongo/mongoDocumentValues";
 import { normalizeResultPageSize } from "@/lib/dataGrid/paginationPageSize";
 import { findDocumentTextMatches, renderDocumentJsonHtml } from "@/lib/document/documentJsonSearch";
+import { documentDataGridColumnLayoutScopeKey } from "@/lib/dataGrid/dataGridColumnLayoutStorage";
+import { documentGridColumnVisibilityScopeKey, migrateDocumentGridColumnVisibilityToLayout } from "@/lib/document/documentGridColumnVisibilityStorage";
 import { useSettingsStore } from "@/stores/settingsStore";
 import JsonEditNode from "./JsonEditNode.vue";
 import type { EditNode } from "@/types/editor";
@@ -114,6 +120,7 @@ const sortInput = ref("");
 const filterInputRef = ref<HTMLTextAreaElement>();
 const sortInputRef = ref<HTMLTextAreaElement>();
 const dataGridRef = ref<InstanceType<typeof DataGrid>>();
+const viewOptionsOpen = ref(false);
 const mongoUpdateTarget = computed(() => (props.databaseType === "mongodb" && mongoCopyDocumentsAvailable.value ? { collection: props.collection, idColumn: "_id" as const } : undefined));
 const documentViewerRef = ref<HTMLElement>();
 const documentSearchInputRef = ref<HTMLInputElement>();
@@ -122,8 +129,11 @@ const documentSearchQuery = ref("");
 const documentSearchMatchIndex = ref(0);
 const documentSearchHasNavigated = ref(false);
 const documentViewerSearchActive = ref(false);
-const columnVisibilitySearch = ref("");
-const columnVisibilityOptions = computed(() => dataGridRef.value?.filteredColumnVisibilityOptions(columnVisibilitySearch.value) ?? []);
+
+function openDataGridExtractorConfiguration() {
+  viewOptionsOpen.value = false;
+  void nextTick(() => dataGridRef.value?.openExtractorConfiguration());
+}
 const tableSearchSplitContainerRef = ref<HTMLDivElement>();
 const tableFindPaneWidth = ref<number | null>(null);
 const isResizingTableSearchSplit = ref(false);
@@ -135,6 +145,30 @@ let elasticsearchPaginationLowerBound: number | undefined;
 let elasticsearchCountExecutionId = "";
 let elasticsearchCountGeneration = 0;
 const documentStoreProvider = computed(() => documentStoreProviderFor(props.databaseType));
+const documentColumnLayoutScopeKey = computed(() =>
+  documentDataGridColumnLayoutScopeKey({
+    databaseType: props.databaseType ?? "mongodb",
+    connectionId: props.connectionId,
+    database: props.database,
+    collection: props.collection,
+  }),
+);
+const legacyDocumentColumnVisibilityScopeKey = computed(() =>
+  documentGridColumnVisibilityScopeKey({
+    databaseType: props.databaseType,
+    connectionId: props.connectionId,
+    database: props.database,
+    collection: props.collection,
+  }),
+);
+
+watch(
+  [legacyDocumentColumnVisibilityScopeKey, documentColumnLayoutScopeKey],
+  ([legacyScopeKey, layoutScopeKey]) => {
+    migrateDocumentGridColumnVisibilityToLayout(legacyScopeKey, layoutScopeKey);
+  },
+  { immediate: true },
+);
 
 const pageTotal = computed(() => paginationTotal.value);
 const documentPageCount = computed(() => (pageTotal.value === undefined ? undefined : Math.max(1, Math.ceil(pageTotal.value / pageSize.value))));
@@ -213,7 +247,10 @@ const deleteDetails = computed(() => {
   if (pending.kind === "document") {
     const id = documents.value[pending.index]?._id ?? "";
     const displayId = mongoDocumentIdForGrid(id);
-    if (props.databaseType === "elasticsearch") return `Elasticsearch index: ${props.collection}\nDocument _id: ${String(displayId)}`;
+    if (props.databaseType === "elasticsearch" || props.databaseType === "easysearch") {
+      const product = props.databaseType === "easysearch" ? "Easysearch" : "Elasticsearch";
+      return `${product} index: ${props.collection}\nDocument _id: ${String(displayId)}`;
+    }
     return t("dangerDialog.mongoDocumentDetails", { collection: props.collection, id: String(displayId) });
   }
   return t("dangerDialog.mongoFieldDetails", { field: pending.name || t("mongo.field") });
@@ -254,7 +291,15 @@ const gridResult = computed<QueryResult>(() => {
   return { columns, rows, mongo_documents: docs, mongo_copy_documents: copyDocuments.value, affected_rows: 0, execution_time_ms: 0, truncated: false };
 });
 const expandedDocumentFilterFieldPaths = ref<Set<string>>(new Set());
+const elasticsearchFieldTypes = computed(() => new Map(elasticsearchMappingFields.value.map((field) => [field.name, field.data_type])));
+const elasticsearchFilterFieldNames = computed(() => {
+  const names = [...elasticsearchMappingFields.value.map((field) => field.name), ...gridResult.value.columns, "_id", "_routing"];
+  return [...new Set(names.filter(Boolean))];
+});
 const documentFilterFieldTree = computed<DocumentFieldPathNode[]>(() => {
+  if (documentStoreProvider.value.kind === "elasticsearch") {
+    return elasticsearchFieldPathTreeFromFieldNames(elasticsearchFilterFieldNames.value, elasticsearchFieldTypes.value);
+  }
   const tree = documentFieldPathTreeFromDocuments(documents.value);
   if (tree.length > 0) return tree;
   return gridResult.value.columns.map((column) => ({
@@ -269,15 +314,15 @@ const documentFilterFieldTree = computed<DocumentFieldPathNode[]>(() => {
 });
 const documentFilterFieldOptions = computed(() => {
   if (documentStoreProvider.value.kind === "elasticsearch") {
-    const names = [...elasticsearchMappingFields.value.map((field) => field.name), ...gridResult.value.columns, "_id", "_routing"];
-    return [...new Set(names.filter(Boolean))];
+    return flattenDocumentFieldPathTree(documentFilterFieldTree.value)
+      .filter((field) => field.selectable)
+      .map((field) => field.path);
   }
   const nestedFields = documentFieldPathOptionsFromDocuments(documents.value);
   return nestedFields.length > 0 ? nestedFields : gridResult.value.columns;
 });
 const documentFilterFieldRows = computed<DocumentFilterFieldTreeRow[]>(() => visibleDocumentFilterFieldRows(documentFilterFieldTree.value));
 const documentFilterFieldByPath = computed(() => new Map(flattenDocumentFieldPathTree(documentFilterFieldTree.value).map((node) => [node.path, node])));
-const elasticsearchFieldTypes = computed(() => new Map(elasticsearchMappingFields.value.map((field) => [field.name, field.data_type])));
 const documentStructuredFilterCount = computed(() => {
   if (!appliedDocumentFilter.value) return 0;
   if (documentStoreProvider.value.kind !== "elasticsearch") return 1;
@@ -336,11 +381,18 @@ function setDocumentFilterFieldPopoverOpen(ruleId: string, open: boolean) {
   if (open) next[ruleId] = true;
   else delete next[ruleId];
   documentFilterFieldPopoverOpen.value = next;
+  if (open) {
+    void nextTick(() => document.getElementById(documentFilterFieldSearchInputId(ruleId))?.focus());
+  }
   if (!open) {
     const search = { ...documentFilterFieldSearch.value };
     delete search[ruleId];
     documentFilterFieldSearch.value = search;
   }
+}
+
+function documentFilterFieldSearchInputId(ruleId: string): string {
+  return `document-filter-field-search-${ruleId}`;
 }
 
 function documentFilterFieldSearchActive(ruleId: string): boolean {
@@ -350,7 +402,8 @@ function documentFilterFieldSearchActive(ruleId: string): boolean {
 function documentFilterFieldRowsForRule(ruleId: string): DocumentFilterFieldTreeRow[] {
   const query = documentFilterFieldSearch.value[ruleId] ?? "";
   if (!query.trim()) return documentFilterFieldRows.value;
-  return searchDocumentFieldPathTree(documentFilterFieldTree.value, query).map((node) => ({ ...node, depth: 0 }));
+  const matchingFields = documentStoreProvider.value.kind === "elasticsearch" ? searchElasticsearchFieldPathTree(documentFilterFieldTree.value, query) : searchDocumentFieldPathTree(documentFilterFieldTree.value, query);
+  return matchingFields.map((node) => ({ ...node, depth: 0 }));
 }
 
 function selectDocumentFilterField(ruleId: string, fieldName: string) {
@@ -359,7 +412,11 @@ function selectDocumentFilterField(ruleId: string, fieldName: string) {
 }
 
 function documentFilterFieldLabel(path: string): string {
-  return documentFilterFieldByPath.value.get(path)?.displayPath ?? path;
+  if (documentStoreProvider.value.kind !== "elasticsearch") {
+    return documentFilterFieldByPath.value.get(path)?.displayPath ?? path;
+  }
+  const fieldType = elasticsearchFieldTypes.value.get(path);
+  return fieldType ? `${path} (${fieldType})` : path;
 }
 
 function documentFilterFieldKindLabel(kind: DocumentFieldPathNode["kind"]): string {
@@ -1499,54 +1556,9 @@ defineExpose({ focusSearch });
 
       <div class="flex-1" />
 
-      <Popover v-if="viewMode === 'table' && gridResult.columns.length">
-        <PopoverTrigger as-child>
-          <Button variant="ghost" size="sm" class="h-5 shrink-0 gap-1 px-1.5 text-xs text-foreground hover:bg-accent" :class="{ 'bg-accent text-foreground': (dataGridRef?.hiddenColumnCount ?? 0) > 0 }" :title="t('grid.columnVisibility')" :aria-label="t('grid.columnVisibility')">
-            <Columns3 class="h-3.5 w-3.5" />
-            {{ t("grid.columnVisibility") }}
-            <span v-if="(dataGridRef?.hiddenColumnCount ?? 0) > 0" class="tabular-nums"> {{ dataGridRef?.visibleColumnCount }}/{{ dataGridRef?.displayableColumnCount }} </span>
-          </Button>
-        </PopoverTrigger>
-        <PopoverContent align="end" class="w-64 max-w-[calc(100vw-2rem)] gap-0 overflow-hidden rounded-md border bg-popover p-0 text-popover-foreground shadow-xl" @click.stop @keydown.stop>
-          <div class="border-b bg-muted/40 px-2 py-1.5">
-            <div class="flex items-center justify-between gap-2">
-              <div class="text-xs font-semibold">{{ t("grid.columnVisibility") }}</div>
-              <div class="text-[10px] text-muted-foreground tabular-nums">{{ dataGridRef?.visibleColumnCount ?? 0 }}/{{ dataGridRef?.displayableColumnCount ?? 0 }}</div>
-            </div>
-          </div>
-          <div class="flex items-center gap-1.5 border-b px-2 py-1.5">
-            <Search class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-            <input v-model="columnVisibilitySearch" autocapitalize="off" autocorrect="off" spellcheck="false" class="h-6 min-w-0 flex-1 bg-transparent text-xs outline-none placeholder:text-muted-foreground" :placeholder="t('grid.searchColumns')" />
-          </div>
-          <div class="max-h-72 overflow-auto py-0.5">
-            <button v-for="option in columnVisibilityOptions" :key="`${option.index}:${option.column}`" type="button" class="grid w-full grid-cols-[1.5rem_minmax(0,1fr)] items-center px-2 py-1 text-left text-xs hover:bg-accent" @click="dataGridRef?.toggleColumnVisibility(option.index)">
-              <span class="flex h-4 w-4 items-center justify-center rounded border" :class="dataGridRef?.isColumnVisible(option.index) ? 'border-primary bg-primary text-primary-foreground' : 'border-border bg-background text-transparent'">
-                <Check class="h-3 w-3 stroke-[3]" />
-              </span>
-              <span class="truncate font-mono text-xs" :title="option.column">{{ option.column }}</span>
-            </button>
-            <div v-if="columnVisibilityOptions.length === 0" class="px-2 py-6 text-center text-xs text-muted-foreground">
-              {{ t("grid.noSearchResults") }}
-            </div>
-          </div>
-          <div class="flex flex-col gap-1 border-t bg-muted/30 px-2 py-1.5">
-            <span class="text-[11px] leading-4 text-muted-foreground">{{ t("grid.columnVisibilityHint") }}</span>
-            <div class="flex items-center justify-end gap-1">
-              <Button variant="ghost" size="sm" class="h-7 px-2 text-xs" :disabled="(dataGridRef?.displayableColumnCount ?? 0) <= 1" @click="dataGridRef?.invertColumnVisibility()">
-                {{ t("grid.invertColumnVisibility") }}
-              </Button>
-              <Button variant="ghost" size="sm" class="h-7 px-2 text-xs" :disabled="!dataGridRef?.hasCustomColumnOrder" @click="dataGridRef?.resetColumnOrder()">
-                {{ t("grid.resetColumnOrder") }}
-              </Button>
-              <Button variant="ghost" size="sm" class="h-7 px-2 text-xs" :disabled="(dataGridRef?.hiddenColumnCount ?? 0) === 0" @click="dataGridRef?.showAllColumns()">
-                {{ t("grid.showAllColumns") }}
-              </Button>
-            </div>
-          </div>
-        </PopoverContent>
-      </Popover>
+      <DataGridColumnLayoutPopover v-if="viewMode === 'table' && gridResult.columns.length" :grid="dataGridRef" />
 
-      <Popover v-if="viewMode === 'table' && gridResult.columns.length">
+      <Popover v-if="viewMode === 'table' && gridResult.columns.length" v-model:open="viewOptionsOpen">
         <PopoverTrigger as-child>
           <Button variant="ghost" size="icon" class="h-6 w-7 shrink-0 text-foreground hover:bg-accent" :class="{ 'bg-accent text-foreground': dataGridRef?.nullColumnsHidden }" :title="t('grid.viewOptions')" :aria-label="t('grid.viewOptions')">
             <Wrench class="h-4 w-4" />
@@ -1563,6 +1575,13 @@ defineExpose({ focusSearch });
               <span v-if="(dataGridRef?.allNullColumnCount ?? 0) > 0" class="text-muted-foreground tabular-nums"> ({{ dataGridRef?.allNullColumnCount }}) </span>
             </span>
           </label>
+          <DataGridCopyFormatControl
+            :current-label="dataGridRef?.defaultCopyExtractorLabel ?? '-'"
+            :current-value="dataGridRef?.defaultCopyExtractor ?? ''"
+            :items="dataGridRef?.copyExtractorMenuItems ?? []"
+            @select="dataGridRef?.setDefaultCopyExtractor($event)"
+            @configure="openDataGridExtractorConfiguration"
+          />
         </PopoverContent>
       </Popover>
     </div>
@@ -1583,6 +1602,9 @@ defineExpose({ focusSearch });
       ref="dataGridRef"
       class="flex-1 min-h-0"
       :result="gridResult"
+      :connection-id="props.connectionId"
+      :database="props.database"
+      :column-layout-scope-key="documentColumnLayoutScopeKey"
       context="results"
       :database-type="props.databaseType"
       :mongo-update-target="mongoUpdateTarget"
@@ -1684,7 +1706,7 @@ defineExpose({ focusSearch });
                         </SelectContent>
                       </Select>
 
-                      <Popover v-if="documentStoreProvider.kind !== 'elasticsearch'" :open="!!documentFilterFieldPopoverOpen[rule.id]" @update:open="(open) => setDocumentFilterFieldPopoverOpen(rule.id, open)">
+                      <Popover :open="!!documentFilterFieldPopoverOpen[rule.id]" @update:open="(open) => setDocumentFilterFieldPopoverOpen(rule.id, open)">
                         <PopoverTrigger as-child>
                           <button type="button" class="flex h-8 w-full min-w-0 items-center justify-between gap-1 rounded-md border bg-background px-2 text-left text-xs hover:bg-accent focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring">
                             <span class="min-w-0 truncate font-mono" :title="documentFilterFieldLabel(rule.fieldName)">{{ documentFilterFieldLabel(rule.fieldName) || t("grid.filterBuilderColumn") }}</span>
@@ -1695,7 +1717,7 @@ defineExpose({ focusSearch });
                           <div class="border-b bg-muted/40 px-2 py-1.5 text-xs font-medium text-foreground">{{ t("grid.filterBuilderColumn") }}</div>
                           <div class="relative border-b p-2">
                             <Search class="pointer-events-none absolute left-4 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-                            <Input v-model="documentFilterFieldSearch[rule.id]" autofocus class="h-7 pl-7 text-xs" :placeholder="t('grid.filterBuilderSearchColumns')" />
+                            <Input :id="documentFilterFieldSearchInputId(rule.id)" v-model="documentFilterFieldSearch[rule.id]" autofocus class="h-7 pl-7 text-xs" :placeholder="t('grid.filterBuilderSearchColumns')" />
                           </div>
                           <div class="max-h-72 overflow-auto py-1">
                             <div v-for="field in documentFilterFieldRowsForRule(rule.id)" :key="field.path" class="flex items-center gap-1 px-1.5">
@@ -1709,9 +1731,20 @@ defineExpose({ focusSearch });
                                 <ChevronRight v-if="!expandedDocumentFilterFieldPaths.has(field.path)" class="h-3.5 w-3.5" />
                                 <ChevronDown v-else class="h-3.5 w-3.5" />
                               </button>
-                              <button type="button" class="flex h-7 min-w-0 flex-1 items-center gap-1.5 rounded px-1.5 text-left text-xs hover:bg-accent" :class="rule.fieldName === field.path ? 'bg-accent text-foreground' : ''" @click="selectDocumentFilterField(rule.id, field.path)">
-                                <span class="min-w-0 flex-1 truncate font-mono" :title="field.displayPath">{{ documentFilterFieldSearchActive(rule.id) ? field.displayPath : field.label }}</span>
-                                <span v-if="field.kind !== 'scalar'" class="shrink-0 rounded border px-1 py-0 text-[10px] leading-4 text-muted-foreground">{{ documentFilterFieldKindLabel(field.kind) }}</span>
+                              <button
+                                type="button"
+                                class="flex h-7 min-w-0 flex-1 items-center gap-1.5 rounded px-1.5 text-left text-xs hover:bg-accent disabled:cursor-default disabled:text-muted-foreground disabled:hover:bg-transparent"
+                                :class="rule.fieldName === field.path ? 'bg-accent text-foreground' : ''"
+                                :disabled="!field.selectable"
+                                @click="selectDocumentFilterField(rule.id, field.path)"
+                              >
+                                <span class="min-w-0 flex-1 truncate font-mono" :title="documentStoreProvider.kind === 'elasticsearch' ? field.path : field.displayPath">
+                                  {{ documentFilterFieldSearchActive(rule.id) ? (documentStoreProvider.kind === "elasticsearch" ? field.path : field.displayPath) : field.label }}
+                                </span>
+                                <span v-if="documentStoreProvider.kind === 'elasticsearch' && field.selectable && elasticsearchFieldTypes.get(field.path)" class="shrink-0 text-[10px] text-muted-foreground"> ({{ elasticsearchFieldTypes.get(field.path) }}) </span>
+                                <span v-else-if="documentStoreProvider.kind !== 'elasticsearch' && field.kind !== 'scalar'" class="shrink-0 rounded border px-1 py-0 text-[10px] leading-4 text-muted-foreground">
+                                  {{ documentFilterFieldKindLabel(field.kind) }}
+                                </span>
                               </button>
                             </div>
                             <div v-if="documentFilterFieldRowsForRule(rule.id).length === 0" class="px-3 py-6 text-center text-xs text-muted-foreground">
@@ -1720,20 +1753,6 @@ defineExpose({ focusSearch });
                           </div>
                         </PopoverContent>
                       </Popover>
-
-                      <Select v-if="documentStoreProvider.kind === 'elasticsearch'" :model-value="rule.fieldName" @update:model-value="(value: any) => updateDocumentFilterRule(rule.id, { fieldName: String(value) })">
-                        <SelectTrigger class="h-8 w-full min-w-0 overflow-hidden text-xs [&_[data-slot=select-value]]:min-w-0 [&_[data-slot=select-value]]:truncate">
-                          <SelectValue :placeholder="t('grid.filterBuilderColumn')"> {{ rule.fieldName }}{{ elasticsearchFieldTypes.get(rule.fieldName) ? ` (${elasticsearchFieldTypes.get(rule.fieldName)})` : "" }} </SelectValue>
-                        </SelectTrigger>
-                        <SelectContent position="popper">
-                          <SelectItem v-for="fieldName in documentFilterFieldOptions" :key="fieldName" :value="fieldName">
-                            <span class="flex min-w-0 items-center gap-2">
-                              <span class="truncate">{{ fieldName }}</span>
-                              <span v-if="elasticsearchFieldTypes.get(fieldName)" class="shrink-0 text-[10px] text-muted-foreground">({{ elasticsearchFieldTypes.get(fieldName) }})</span>
-                            </span>
-                          </SelectItem>
-                        </SelectContent>
-                      </Select>
 
                       <Select v-if="documentStoreProvider.kind === 'elasticsearch'" :model-value="rule.elasticsearchQueryType || elasticsearchRuleQueryTypes(rule)[0]" @update:model-value="(value: any) => updateDocumentFilterRule(rule.id, { elasticsearchQueryType: value as ElasticsearchQueryType })">
                         <SelectTrigger class="h-8 w-full min-w-0 overflow-hidden text-xs [&_[data-slot=select-value]]:min-w-0 [&_[data-slot=select-value]]:truncate">

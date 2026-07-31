@@ -12,6 +12,7 @@ export type DatabaseType =
   | "mongodb"
   | "oracle"
   | "elasticsearch"
+  | "easysearch"
   | "hbase"
   | "qdrant"
   | "milvus"
@@ -66,6 +67,10 @@ export type DatabaseType =
   | "jdbc"
   | "mq"
   | "nacos";
+
+export function isElasticsearchCompatibleDatabaseType(dbType?: DatabaseType): boolean {
+  return dbType === "elasticsearch" || dbType === "easysearch";
+}
 
 export interface SqlSnippet {
   id: string;
@@ -158,6 +163,7 @@ export interface ConnectionConfig {
   redis_cluster_nodes?: string;
   redis_key_separator?: string;
   redis_scan_page_size?: number;
+  redis_database_aliases?: Record<string, string>;
   etcd_endpoints?: string;
   gbase_server?: string;
   informix_server?: string;
@@ -392,7 +398,7 @@ export interface TableInfo {
   parent_name?: string | null;
 }
 
-export type DatabaseObjectType = "TABLE" | "VIEW" | "MATERIALIZED_VIEW" | "PROCEDURE" | "FUNCTION" | "TRIGGER" | "SEQUENCE" | "PACKAGE" | "PACKAGE_BODY" | "TYPE" | "TYPE_BODY";
+export type DatabaseObjectType = "TABLE" | "VIEW" | "MATERIALIZED_VIEW" | "PROCEDURE" | "FUNCTION" | "TRIGGER" | "SEQUENCE" | "SYNONYM" | "PACKAGE" | "PACKAGE_BODY" | "TYPE" | "TYPE_BODY";
 
 export interface ObjectInfo {
   name: string;
@@ -414,7 +420,7 @@ export interface ObjectStatistics {
   total_bytes?: number | null;
 }
 
-export type ObjectSourceKind = "VIEW" | "MATERIALIZED_VIEW" | "PROCEDURE" | "FUNCTION" | "TRIGGER" | "SEQUENCE" | "PACKAGE" | "PACKAGE_BODY" | "TYPE" | "TYPE_BODY";
+export type ObjectSourceKind = "VIEW" | "MATERIALIZED_VIEW" | "PROCEDURE" | "FUNCTION" | "TRIGGER" | "SEQUENCE" | "SYNONYM" | "PACKAGE" | "PACKAGE_BODY" | "TYPE" | "TYPE_BODY";
 
 export interface ObjectSource {
   name: string;
@@ -600,6 +606,31 @@ export interface QueryResult {
   sourceTo?: number;
 }
 
+export type BatchStatementExecutionStatus = "pending" | "running" | "success" | "error" | "skipped" | "cancelled";
+
+export interface BatchStatementExecutionItem {
+  statementIndex: number;
+  sql: string;
+  from: number;
+  to: number;
+  status: BatchStatementExecutionStatus;
+  executionTimeMs?: number;
+  affectedRows?: number;
+  error?: string;
+}
+
+export interface BatchSqlExecution {
+  executionId: string;
+  submittedSql: string;
+  editorFingerprint: string;
+  sourceOffset: number;
+  completed: number;
+  total: number;
+  startedAt: number;
+  finishedAt?: number;
+  items: BatchStatementExecutionItem[];
+}
+
 export interface QueryResultRun {
   id: string;
   title: string;
@@ -609,6 +640,7 @@ export interface QueryResultRun {
   result?: QueryResult;
   results?: QueryResult[];
   activeResultIndex?: number;
+  batchSqlExecution?: BatchSqlExecution;
   resultBaseSql?: string;
   /** Fingerprint of the complete editor document when this result run started. */
   resultEditorFingerprint?: string;
@@ -712,6 +744,7 @@ export type TreeNodeType =
   | "type"
   | "type-body"
   | "sequence"
+  | "synonym"
   | "package"
   | "package-body"
   | "group-columns"
@@ -728,6 +761,7 @@ export type TreeNodeType =
   | "group-functions"
   | "group-types"
   | "group-sequences"
+  | "group-synonyms"
   | "group-packages"
   | "group-partitions"
   | "group-extensions"
@@ -752,6 +786,7 @@ export type TreeNodeType =
   | "nacos-namespace"
   | "etcd-root"
   | "etcd-dashboard"
+  | "etcd-access-control"
   | "zookeeper-root"
   | "mongo-db"
   | "mongo-gridfs"
@@ -914,6 +949,8 @@ export interface QueryTab {
   isExecuting: boolean;
   isCancelling?: boolean;
   queryExecutionStartedAt?: number;
+  /** Ephemeral per-statement progress for the latest multi-statement execution. */
+  batchSqlExecution?: BatchSqlExecution;
   editorViewport?: {
     scrollTop: number;
     scrollLeft: number;
@@ -941,6 +978,7 @@ export interface QueryTab {
     | "hbase"
     | "etcd"
     | "etcd-dashboard"
+    | "etcd-access-control"
     | "zookeeper"
     | "mq"
     | "nacos"
@@ -1085,6 +1123,21 @@ export interface VectorCollectionMeta {
   collectionId?: string;
 }
 
+export interface MilvusFieldInfo {
+  name: string;
+  dataType: string;
+  dimension?: number;
+  primaryKey: boolean;
+  autoId: boolean;
+  nullable: boolean;
+  hasDefaultValue: boolean;
+  isFunctionOutput: boolean;
+}
+
+export interface MilvusCollectionSchema {
+  fields: MilvusFieldInfo[];
+}
+
 /** Mongo collection node metadata (not SQL tableType). */
 export type MongoCollectionKind = "collection" | "view" | "timeseries";
 
@@ -1096,6 +1149,7 @@ export interface CollectionInfo {
   name: string;
   id: string;
   dimension?: number;
+  milvusSchema?: MilvusCollectionSchema;
   kind?: MongoCollectionKind | "bucket";
   bucketName?: string;
 }

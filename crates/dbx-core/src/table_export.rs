@@ -61,6 +61,8 @@ pub struct TableExportRequest {
     pub date_time_format: Option<String>,
     #[serde(default)]
     pub numeric_column_right_align: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column_comments: Option<Vec<Option<String>>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -134,6 +136,25 @@ fn resolve_requested_export_columns(
         .collect();
 
     (resolved_columns, resolved_column_types, resolved_primary_keys)
+}
+
+fn requested_export_needs_column_extras(database_type: DatabaseType, format: &str) -> bool {
+    database_type == DatabaseType::Mysql && format.eq_ignore_ascii_case("sql")
+}
+
+fn resolve_requested_export_column_extras(
+    requested_columns: &[String],
+    table_columns: &[crate::db::ColumnInfo],
+) -> Vec<Option<String>> {
+    requested_columns
+        .iter()
+        .map(|requested| {
+            table_columns
+                .iter()
+                .find(|column| column.name.eq_ignore_ascii_case(requested))
+                .and_then(|column| column.extra.clone())
+        })
+        .collect()
 }
 
 fn write_json_row_object<W: Write>(writer: &mut W, columns: &[String], row: &[Value]) -> Result<(), String> {
@@ -227,7 +248,7 @@ fn table_cursor_sql(
     col_names: &[String],
     primary_keys: &[String],
 ) -> String {
-    let full_table = qualified_table(&request.table_name, request.schema.as_deref().unwrap_or(""), db_type);
+    let full_table = qualified_table(&request.table_name, request.schema.as_deref().unwrap_or(""), db_type, None);
     let col_list = col_names.iter().map(|column| quote_identifier(column, db_type)).collect::<Vec<_>>().join(", ");
     let predicate = crate::sql_dialect::normalize_where_input(request.where_input.as_deref());
     let where_clause = if predicate.is_empty() { String::new() } else { format!(" WHERE ({predicate})") };
@@ -582,6 +603,7 @@ async fn close_table_export_cursor_if_open(
                 &request.database,
                 &session_id,
                 Some(&client_session_id),
+                None,
             )
             .await;
         }
@@ -764,6 +786,7 @@ async fn try_export_native_table_stream(
         }
         "xlsx" => {
             let xlsx_column_types = export_column_types(request);
+            let column_comments: Vec<Option<String>> = request.column_comments.clone().unwrap_or_default();
             let xlsx_file =
                 std::fs::File::create(&request.file_path).map_err(|e| format!("Failed to create XLSX file: {e}"))?;
             let mut writer = start_streaming_xlsx_workbook_with_options(
@@ -771,6 +794,7 @@ async fn try_export_native_table_stream(
                 Some(&request.table_name),
                 col_names,
                 &xlsx_column_types,
+                &column_comments,
                 &[],
                 request.date_time_format.as_deref(),
                 request.numeric_column_right_align,
@@ -1102,7 +1126,20 @@ async fn export_table_data_core_inner(
             request.column_types.as_deref(),
             request.primary_keys.as_deref(),
         );
-        (col_names, column_types, Vec::new(), primary_keys)
+        let column_extras = if requested_export_needs_column_extras(db_type, &request.format) {
+            let table_columns = crate::schema::get_columns_core(
+                state,
+                &request.connection_id,
+                &request.database,
+                request.schema.as_deref().unwrap_or(""),
+                &request.table_name,
+            )
+            .await?;
+            resolve_requested_export_column_extras(&col_names, &table_columns)
+        } else {
+            Vec::new()
+        };
+        (col_names, column_types, column_extras, primary_keys)
     } else {
         let columns = crate::schema::get_columns_core(
             state,
@@ -1150,6 +1187,7 @@ async fn export_table_data_core_inner(
             request.schema.as_deref().unwrap_or(""),
             &db_type,
             request.where_input.as_deref(),
+            None,
         );
         match execute_table_export_count(state, &pool_key, request, &count_query, cancel_token.clone()).await {
             Ok(result) => result
@@ -1388,6 +1426,7 @@ async fn export_table_data_core_inner(
         }
         "xlsx" => {
             let xlsx_column_types = export_column_types(request);
+            let column_comments: Vec<Option<String>> = request.column_comments.clone().unwrap_or_default();
             // Create a dedicated file handle for the streaming XLSX writer
             // instead of cloning the outer BufWriter's handle.  This avoids
             // sharing a file descriptor between two independent buffers.
@@ -1398,6 +1437,7 @@ async fn export_table_data_core_inner(
                 Some(&request.table_name),
                 &col_names,
                 &xlsx_column_types,
+                &column_comments,
                 &[],
                 request.date_time_format.as_deref(),
                 request.numeric_column_right_align,
@@ -1879,6 +1919,7 @@ mod tests {
             row_limit,
             date_time_format: None,
             numeric_column_right_align: false,
+            column_comments: None,
         };
 
         ExternalDriverExportFixture { state, request, calls, output, dir }
@@ -2040,6 +2081,7 @@ mod tests {
             row_limit: Some(1000),
             date_time_format: None,
             numeric_column_right_align: false,
+            column_comments: None,
         };
 
         let sql = table_cursor_sql(
@@ -2089,6 +2131,7 @@ mod tests {
             row_limit: None,
             date_time_format: None,
             numeric_column_right_align: false,
+            column_comments: None,
         };
         let sql = table_cursor_sql(&request, &DatabaseType::Oracle, &columns, &primary_keys);
         assert_eq!(sql, "SELECT \"ID\", \"NAME\" FROM \"APP\".\"USERS\"");
@@ -2118,6 +2161,33 @@ mod tests {
         let mysql_columns = vec!["__DBX_ROWID".to_string(), "name".to_string()];
         let (resolved_mysql, _, _) = resolve_requested_export_columns(DatabaseType::Mysql, &mysql_columns, None, None);
         assert_eq!(resolved_mysql, mysql_columns);
+    }
+
+    #[test]
+    fn requested_mysql_sql_export_resolves_generated_column_extras_only_for_sql() {
+        let table_columns = vec![
+            crate::db::ColumnInfo {
+                name: "ID".to_string(),
+                extra: Some("auto_increment".to_string()),
+                ..Default::default()
+            },
+            crate::db::ColumnInfo {
+                name: "virtual_total".to_string(),
+                extra: Some("VIRTUAL GENERATED".to_string()),
+                ..Default::default()
+            },
+        ];
+        let requested_columns = vec!["virtual_total".to_string(), "id".to_string(), "missing".to_string()];
+
+        assert!(requested_export_needs_column_extras(DatabaseType::Mysql, "SQL"));
+        for format in ["csv", "json", "xlsx"] {
+            assert!(!requested_export_needs_column_extras(DatabaseType::Mysql, format));
+        }
+        assert!(!requested_export_needs_column_extras(DatabaseType::Postgres, "sql"));
+        assert_eq!(
+            resolve_requested_export_column_extras(&requested_columns, &table_columns),
+            vec![Some("VIRTUAL GENERATED".to_string()), Some("auto_increment".to_string()), None]
+        );
     }
 
     #[test]
@@ -2402,6 +2472,7 @@ mod tests {
             sheet_name: Some("employees".to_string()),
             columns: vec!["id".to_string(), "name".to_string(), "salary".to_string()],
             column_types: vec![],
+            column_comments: vec![],
             rows: vec![
                 vec![json!(1), json!("Alice"), json!(75000.50)],
                 vec![json!(2), json!("Bob"), json!(82000)],
