@@ -42,6 +42,7 @@ export interface DiagramPosition {
 export interface DiagramLayoutOptions {
   columnsPerRow?: number;
   cardWidth?: number;
+  /** When set, every row advances by this height (legacy/tests). When omitted, row height follows tallest table in the row. */
   rowHeight?: number;
   gapX?: number;
   gapY?: number;
@@ -139,12 +140,12 @@ export function toDiagramRelationship(input: InferredRelationshipInput): Diagram
 
 export function mergeRelationshipsWithInferred(existing: DiagramRelationship[], inferred: InferredRelationshipInput[]): DiagramRelationship[] {
   const existingIds = new Set(existing.map((r) => r.id));
-  const inferredIds = new Set(inferred.map((r) => r.id));
   const merged: DiagramRelationship[] = [...existing];
 
   for (const inf of inferred) {
-    if (!existingIds.has(inf.id) && !inferredIds.has(inf.id)) {
+    if (!existingIds.has(inf.id)) {
       merged.push(toDiagramRelationship(inf));
+      existingIds.add(inf.id);
     }
   }
 
@@ -165,24 +166,32 @@ export function filterDiagramTables(tables: DiagramTable[], query: string): Diag
 export function layoutDiagramTables(tables: Pick<DiagramTable, "name" | "columns">[], options: DiagramLayoutOptions = {}): Record<string, DiagramPosition> {
   const columnsPerRow = Math.max(1, options.columnsPerRow ?? Math.ceil(Math.sqrt(Math.max(tables.length, 1))));
   const cardWidth = options.cardWidth ?? 260;
-  const rowHeight = options.rowHeight ?? 220;
   const gapX = options.gapX ?? 56;
   const gapY = options.gapY ?? 40;
   const margin = options.margin ?? 40;
+  const fixedRowHeight = options.rowHeight;
 
-  return Object.fromEntries(
-    tables.map((table, index) => {
-      const col = index % columnsPerRow;
-      const row = Math.floor(index / columnsPerRow);
-      return [
-        table.name,
-        {
-          x: margin + col * (cardWidth + gapX),
-          y: margin + row * (rowHeight + gapY),
-        },
-      ];
-    }),
-  );
+  const measureHeight = (table: Pick<DiagramTable, "columns">): number => {
+    if (fixedRowHeight != null) return fixedRowHeight;
+    const columnCount = table.columns?.length ?? 0;
+    return 44 + columnCount * 24 + 12;
+  };
+
+  const positions: Record<string, DiagramPosition> = {};
+  let y = margin;
+  for (let start = 0; start < tables.length; start += columnsPerRow) {
+    const rowTables = tables.slice(start, start + columnsPerRow);
+    const rowContentHeight = Math.max(...rowTables.map(measureHeight));
+    rowTables.forEach((table, col) => {
+      positions[table.name] = {
+        x: margin + col * (cardWidth + gapX),
+        y,
+      };
+    });
+    y += rowContentHeight + gapY;
+  }
+
+  return positions;
 }
 
 function quoteIdentifier(value: string): string {

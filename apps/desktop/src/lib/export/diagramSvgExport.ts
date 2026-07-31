@@ -1,9 +1,20 @@
 import type { EngineeringDiagram, EngineeringEntityNode } from "@/lib/diagram/engineeringDiagram";
 import type { DiagramPosition, DiagramRelationship, DiagramTable } from "@/lib/diagram/erDiagram";
-
-type DiagramSvgMode = "table" | "engineering";
+import { pickHandles } from "@/lib/diagram/vue-flow-adapter";
+import { pointsToSvgPath, type Point } from "@/lib/diagram/edge-obstacle-router";
+import { CARD_BOTTOM_PADDING, CARD_HEADER_HEIGHT, CARD_WIDTH, COLUMN_ROW_HEIGHT, MARGIN } from "@/lib/diagram/diagram-constants";
 
 interface DiagramCanvas {
+  width: number;
+  height: number;
+}
+
+export interface DiagramSvgLayer {
+  id: string;
+  name: string;
+  color: string;
+  x: number;
+  y: number;
   width: number;
   height: number;
 }
@@ -17,10 +28,15 @@ export interface TableDiagramSvgOptions {
   cardWidth: number;
   cardHeaderHeight: number;
   columnRowHeight: number;
-  maxVisibleColumns: number;
   cardBottomPadding?: number;
-  moreColumnsLabel?: (count: number) => string;
+  layers?: DiagramSvgLayer[];
 }
+
+type CardHeightMetrics = {
+  cardHeaderHeight: number;
+  columnRowHeight: number;
+  cardBottomPadding?: number;
+};
 
 function escapeXml(value: string | number): string {
   return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
@@ -54,23 +70,129 @@ function svgText(
   return `<text ${attrs.join(" ")}>${escapeXml(label)}</text>`;
 }
 
-function tableHeight(table: DiagramTable, options: TableDiagramSvgOptions): number {
-  const visibleCount = Math.min(table.columns.length, options.maxVisibleColumns);
-  const overflowHeight = table.columns.length > options.maxVisibleColumns ? options.columnRowHeight : 0;
-  return options.cardHeaderHeight + visibleCount * options.columnRowHeight + overflowHeight + (options.cardBottomPadding ?? 12);
+/** Shared table card height for SVG canvas / paths / cards. */
+function svgCardHeight(columnCount: number, metrics: CardHeightMetrics): number {
+  return metrics.cardHeaderHeight + columnCount * metrics.columnRowHeight + (metrics.cardBottomPadding ?? CARD_BOTTOM_PADDING);
 }
 
 function tableDiagramDefs(): string {
-  return ["<defs>", '<marker id="dbx-diagram-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth">', '<path d="M 0 0 L 8 4 L 0 8 z" fill="#2563eb"/>', "</marker>", "</defs>"].join("");
+  return ["<defs>", '<marker id="dbx-diagram-arrow" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto" markerUnits="strokeWidth">', '<path d="M 0 0 L 8 4 L 0 8 z" fill="#2563eb"/>', "</marker>", "</defs>"].join("");
 }
 
 function isForeignKeyColumn(table: DiagramTable, columnName: string): boolean {
   return table.foreignKeys.some((fk) => fk.column === columnName);
 }
 
-export function buildTableDiagramSvg(options: TableDiagramSvgOptions): string {
-  const parts = [svgHeader(options.canvas), tableDiagramDefs(), '<g fill="none" stroke="#2563eb" stroke-opacity="0.58" stroke-width="1.6">'];
+function handleAnchor(pos: DiagramPosition, handle: string, width: number, height: number): Point {
+  const cx = pos.x + width / 2;
+  const cy = pos.y + height / 2;
+  if (handle.startsWith("right")) return { x: pos.x + width, y: cy };
+  if (handle.startsWith("left")) return { x: pos.x, y: cy };
+  if (handle.startsWith("bottom")) return { x: cx, y: pos.y + height };
+  return { x: cx, y: pos.y };
+}
 
+/** Orthogonal fallback path when no ELK/obstacle waypoints are stored. */
+function orthogonalPathBetweenTables(sourcePos: DiagramPosition, targetPos: DiagramPosition, sourceHeight: number, targetHeight: number, cardWidth: number): string {
+  const { sourceHandle, targetHandle } = pickHandles(sourcePos, targetPos, sourceHeight, targetHeight, cardWidth);
+  const s = handleAnchor(sourcePos, sourceHandle, cardWidth, sourceHeight);
+  const t = handleAnchor(targetPos, targetHandle.replace(/-target$/, ""), cardWidth, targetHeight);
+  const mid: Point = Math.abs(s.x - t.x) >= Math.abs(s.y - t.y) ? { x: t.x, y: s.y } : { x: s.x, y: t.y };
+  return pointsToSvgPath([s, mid, t]);
+}
+
+/**
+ * Build SVG path `d` strings for relationships from live waypoints or table positions.
+ */
+export function buildTableRelationshipPaths(input: {
+  relationships: DiagramRelationship[];
+  positions: Record<string, DiagramPosition>;
+  tables: DiagramTable[];
+  waypoints?: Record<string, Point[]>;
+  cardWidth?: number;
+  cardHeaderHeight?: number;
+  columnRowHeight?: number;
+  cardBottomPadding?: number;
+}): Record<string, string> {
+  const cardWidth = input.cardWidth ?? CARD_WIDTH;
+  const metrics: CardHeightMetrics = {
+    cardHeaderHeight: input.cardHeaderHeight ?? CARD_HEADER_HEIGHT,
+    columnRowHeight: input.columnRowHeight ?? COLUMN_ROW_HEIGHT,
+    cardBottomPadding: input.cardBottomPadding ?? CARD_BOTTOM_PADDING,
+  };
+  const heightByName = new Map(input.tables.map((t) => [t.name, svgCardHeight(t.columns.length, metrics)]));
+  const paths: Record<string, string> = {};
+
+  for (const rel of input.relationships) {
+    const stored = input.waypoints?.[rel.id];
+    if (stored && stored.length >= 2) {
+      paths[rel.id] = pointsToSvgPath(stored);
+      continue;
+    }
+    const sourcePos = input.positions[rel.sourceTable];
+    const targetPos = input.positions[rel.targetTable];
+    if (!sourcePos || !targetPos) continue;
+    const sh = heightByName.get(rel.sourceTable) ?? svgCardHeight(0, metrics);
+    const th = heightByName.get(rel.targetTable) ?? svgCardHeight(0, metrics);
+    paths[rel.id] = orthogonalPathBetweenTables(sourcePos, targetPos, sh, th, cardWidth);
+  }
+  return paths;
+}
+
+/** Compute canvas size that fits tables + layers with padding. */
+export function computeTableDiagramCanvas(
+  tables: DiagramTable[],
+  positions: Record<string, DiagramPosition>,
+  options: {
+    cardWidth: number;
+    cardHeaderHeight: number;
+    columnRowHeight: number;
+    cardBottomPadding?: number;
+    layers?: DiagramSvgLayer[];
+    padding?: number;
+  },
+): DiagramCanvas {
+  const padding = options.padding ?? MARGIN;
+  let maxX = 400;
+  let maxY = 300;
+
+  for (const layer of options.layers ?? []) {
+    if (layer.width <= 0 || layer.height <= 0) continue;
+    maxX = Math.max(maxX, layer.x + layer.width);
+    maxY = Math.max(maxY, layer.y + layer.height);
+  }
+
+  for (const table of tables) {
+    const pos = positions[table.name] ?? { x: 0, y: 0 };
+    const height = svgCardHeight(table.columns.length, options);
+    maxX = Math.max(maxX, pos.x + options.cardWidth);
+    maxY = Math.max(maxY, pos.y + height);
+  }
+
+  return { width: Math.ceil(maxX + padding), height: Math.ceil(maxY + padding) };
+}
+
+export function buildTableDiagramSvg(options: TableDiagramSvgOptions): string {
+  const parts = [svgHeader(options.canvas), tableDiagramDefs()];
+
+  const layers = (options.layers ?? []).filter((l) => l.width > 0 && l.height > 0);
+  if (layers.length > 0) {
+    parts.push('<g class="diagram-layers">');
+    for (const layer of layers) {
+      const fill = layer.color || "#9ca3af";
+      parts.push(`<rect x="${svgNumber(layer.x)}" y="${svgNumber(layer.y)}" width="${svgNumber(layer.width)}" height="${svgNumber(layer.height)}" ` + `rx="8" fill="${escapeXml(fill)}" fill-opacity="0.08" stroke="${escapeXml(fill)}" stroke-opacity="0.55" stroke-width="1.5"/>`);
+      parts.push(
+        svgText(layer.name, layer.x + 12, layer.y + 18, {
+          size: 12,
+          weight: "600",
+          fill: fill,
+        }),
+      );
+    }
+    parts.push("</g>");
+  }
+
+  parts.push('<g fill="none" stroke="#2563eb" stroke-opacity="0.58" stroke-width="1.6">');
   for (const relationship of options.relationships) {
     const path = options.relationshipPaths[relationship.id];
     if (!path) continue;
@@ -80,9 +202,7 @@ export function buildTableDiagramSvg(options: TableDiagramSvgOptions): string {
 
   for (const table of options.tables) {
     const position = options.positions[table.name] ?? { x: 0, y: 0 };
-    const height = tableHeight(table, options);
-    const visibleColumns = table.columns.slice(0, options.maxVisibleColumns);
-    const hiddenCount = Math.max(0, table.columns.length - options.maxVisibleColumns);
+    const height = svgCardHeight(table.columns.length, options);
     parts.push(`<g transform="translate(${svgNumber(position.x)} ${svgNumber(position.y)})">`);
     parts.push(`<rect width="${options.cardWidth}" height="${svgNumber(height)}" rx="6" fill="#ffffff" stroke="#d4d4d8"/>`);
     parts.push(`<rect width="${options.cardWidth}" height="${options.cardHeaderHeight}" rx="6" fill="#f4f4f5"/>`);
@@ -96,7 +216,7 @@ export function buildTableDiagramSvg(options: TableDiagramSvgOptions): string {
       }),
     );
 
-    visibleColumns.forEach((column, index) => {
+    table.columns.forEach((column, index) => {
       const rowTop = options.cardHeaderHeight + index * options.columnRowHeight;
       const rowCenter = rowTop + options.columnRowHeight / 2;
       parts.push(`<path d="M 0 ${svgNumber(rowTop)} H ${options.cardWidth}" stroke="#f0f0f1"/>`);
@@ -114,16 +234,6 @@ export function buildTableDiagramSvg(options: TableDiagramSvgOptions): string {
         }),
       );
     });
-
-    if (hiddenCount > 0) {
-      const y = options.cardHeaderHeight + visibleColumns.length * options.columnRowHeight + options.columnRowHeight / 2;
-      parts.push(
-        svgText(options.moreColumnsLabel?.(hiddenCount) ?? `+ ${hiddenCount} columns`, 12, y, {
-          size: 11,
-          fill: "#71717a",
-        }),
-      );
-    }
     parts.push("</g>");
   }
 
@@ -235,18 +345,4 @@ export function buildEngineeringDiagramSvg(diagram: EngineeringDiagram): string 
 
   parts.push("</svg>");
   return parts.join("");
-}
-
-function fileToken(value: string): string {
-  return value
-    .trim()
-    .replace(/[^\p{L}\p{N}._-]+/gu, "-")
-    .replace(/-+/g, "-")
-    .replace(/^-|-$/g, "");
-}
-
-export function diagramSvgFileName(connectionName: string, databaseName: string, mode: DiagramSvgMode): string {
-  const context = [connectionName, databaseName].map(fileToken).filter(Boolean);
-  const suffix = mode === "engineering" ? "engineering-er" : "table-structure";
-  return ["dbx", ...(context.length > 0 ? context : ["diagram"]), suffix].join("-") + ".svg";
 }

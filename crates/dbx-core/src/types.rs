@@ -142,6 +142,14 @@ pub struct ColumnInfo {
     pub collation: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TableColumnsResult {
+    pub table_name: String,
+    pub columns: Vec<ColumnInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CompletionAssistantObjectKind {

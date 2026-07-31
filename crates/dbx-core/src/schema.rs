@@ -4931,14 +4931,14 @@ pub async fn get_all_columns_core(
     connection_id: &str,
     database: &str,
     schema: &str,
-) -> Result<Vec<(String, Vec<db::ColumnInfo>)>, String> {
-    let tables = list_tables_core(state, connection_id, database, schema, None, None, None, None).await?;
+) -> Result<Vec<db::TableColumnsResult>, String> {
+    let tables = list_tables_core(state, connection_id, database, schema, None, None, None, None, None).await?;
 
-    let mut result: Vec<(String, Vec<db::ColumnInfo>)> = Vec::with_capacity(tables.len());
+    let mut result: Vec<db::TableColumnsResult> = Vec::with_capacity(tables.len());
     for table in tables {
         match get_columns_core(state, connection_id, database, schema, &table.name).await {
             Ok(columns) => {
-                result.push((table.name, columns));
+                result.push(db::TableColumnsResult { table_name: table.name, columns, error: None });
             }
             Err(e) => {
                 log::warn!(
@@ -4949,7 +4949,7 @@ pub async fn get_all_columns_core(
                     table.name,
                     e
                 );
-                result.push((table.name, Vec::new()));
+                result.push(db::TableColumnsResult { table_name: table.name, columns: Vec::new(), error: Some(e) });
             }
         }
     }

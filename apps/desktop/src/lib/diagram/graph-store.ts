@@ -1,63 +1,75 @@
 import { defineStore } from "pinia";
-import { ref } from "vue";
-import type { DiagramNode, DiagramEdge, HistorySnapshot, LayoutOptions } from "@/types/diagram";
+import { ref, computed } from "vue";
+import type { DiagramNode, DiagramEdge, HistorySnapshot, LayoutOptions, DiagramLayer } from "@/types/diagram";
 import { LayoutManager } from "./layout-manager";
+import type { LayerLayoutInfo } from "./elk-layout";
 
 function deepClone<T>(obj: T): T {
   return JSON.parse(JSON.stringify(obj));
 }
 
+function emptySnapshotExtras(): Pick<HistorySnapshot, "positions" | "layers" | "customRelationships" | "edgeWaypoints" | "edgeHandleHints" | "matchConfirms" | "matchIgnores"> {
+  return {
+    positions: {},
+    layers: [],
+    customRelationships: [],
+    edgeWaypoints: {},
+    edgeHandleHints: {},
+    matchConfirms: [],
+    matchIgnores: [],
+  };
+}
+
 export const useGraphStore = defineStore("diagram-graph", () => {
   const nodes = ref<DiagramNode[]>([]);
   const edges = ref<DiagramEdge[]>([]);
+  const layerLayouts = ref<LayerLayoutInfo[]>([]);
   const historyStack = ref<HistorySnapshot[]>([]);
   const redoStack = ref<HistorySnapshot[]>([]);
   const maxHistorySize = 50;
   const layoutManager = new LayoutManager();
 
-  function pushHistory() {
-    historyStack.value.push({
+  const canUndo = computed(() => historyStack.value.length > 0);
+  const canRedo = computed(() => redoStack.value.length > 0);
+
+  function snapshotFromNodesEdges(): HistorySnapshot {
+    return {
       nodes: deepClone(nodes.value),
       edges: deepClone(edges.value),
-    });
+      ...emptySnapshotExtras(),
+      positions: Object.fromEntries(nodes.value.map((n) => [n.id, { ...n.position }])),
+    };
+  }
+
+  function pushHistory(snapshot: HistorySnapshot) {
+    historyStack.value.push(deepClone(snapshot));
     if (historyStack.value.length > maxHistorySize) {
       historyStack.value.shift();
     }
     redoStack.value = [];
   }
 
-  function undo() {
-    if (historyStack.value.length === 0) return;
+  /** Push current store nodes/edges (used by store-owned layout helpers). */
+  function pushStoreHistory() {
+    pushHistory(snapshotFromNodesEdges());
+  }
 
-    redoStack.value.push({
-      nodes: deepClone(nodes.value),
-      edges: deepClone(edges.value),
-    });
-
+  function undo(current: HistorySnapshot): HistorySnapshot | null {
+    if (historyStack.value.length === 0) return null;
+    redoStack.value.push(deepClone(current));
     const prev = historyStack.value.pop()!;
-    nodes.value = prev.nodes;
-    edges.value = prev.edges;
+    nodes.value = deepClone(prev.nodes);
+    edges.value = deepClone(prev.edges);
+    return deepClone(prev);
   }
 
-  function redo() {
-    if (redoStack.value.length === 0) return;
-
-    historyStack.value.push({
-      nodes: deepClone(nodes.value),
-      edges: deepClone(edges.value),
-    });
-
+  function redo(current: HistorySnapshot): HistorySnapshot | null {
+    if (redoStack.value.length === 0) return null;
+    historyStack.value.push(deepClone(current));
     const next = redoStack.value.pop()!;
-    nodes.value = next.nodes;
-    edges.value = next.edges;
-  }
-
-  function canUndo() {
-    return historyStack.value.length > 0;
-  }
-
-  function canRedo() {
-    return redoStack.value.length > 0;
+    nodes.value = deepClone(next.nodes);
+    edges.value = deepClone(next.edges);
+    return deepClone(next);
   }
 
   function setNodes(newNodes: DiagramNode[]) {
@@ -71,20 +83,30 @@ export const useGraphStore = defineStore("diagram-graph", () => {
   function updateNodePosition(nodeId: string, position: { x: number; y: number }) {
     const node = nodes.value.find((n) => n.id === nodeId);
     if (node) {
-      pushHistory();
+      pushStoreHistory();
       node.position = position;
     }
   }
 
   async function applyLayout(direction?: LayoutOptions["direction"]) {
-    pushHistory();
+    pushStoreHistory();
     const result = await layoutManager.applyElkLayout(nodes.value, edges.value, direction);
     nodes.value = result.nodes;
     edges.value = result.edges;
+    layerLayouts.value = [];
+  }
+
+  async function applyElkLayoutWithLayers(nodesParam: DiagramNode[], edgesParam: DiagramEdge[], layers: DiagramLayer[]) {
+    pushStoreHistory();
+    const result = await layoutManager.applyElkLayoutWithLayers(nodesParam, edgesParam, layers);
+    nodes.value = result.nodes;
+    edges.value = result.edges;
+    layerLayouts.value = result.layerLayouts || [];
+    return result;
   }
 
   function applyGridLayout() {
-    pushHistory();
+    pushStoreHistory();
     nodes.value = layoutManager.applyGridLayout(nodes.value);
   }
 
@@ -96,6 +118,7 @@ export const useGraphStore = defineStore("diagram-graph", () => {
   return {
     nodes,
     edges,
+    layerLayouts,
     undo,
     redo,
     canUndo,
@@ -105,6 +128,7 @@ export const useGraphStore = defineStore("diagram-graph", () => {
     setEdges,
     updateNodePosition,
     applyLayout,
+    applyElkLayoutWithLayers,
     applyGridLayout,
     clearHistory,
   };

@@ -1009,7 +1009,13 @@ export async function getSqlServerColumnMetadata(connectionId: string, database:
   });
 }
 
-export async function getAllColumns(connectionId: string, database: string, schema: string): Promise<Array<[string, ColumnInfo[]]>> {
+export interface TableColumnsResult {
+  tableName: string;
+  columns: ColumnInfo[];
+  error?: string;
+}
+
+export async function getAllColumns(connectionId: string, database: string, schema: string): Promise<TableColumnsResult[]> {
   return invoke("get_all_columns", { connectionId, database, schema });
 }
 

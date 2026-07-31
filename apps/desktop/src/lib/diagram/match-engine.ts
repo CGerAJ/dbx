@@ -19,13 +19,32 @@ export function inferRelationships(tables: DiagramTable[]): InferredRelationship
       if (!candidateTableName) continue;
 
       const candidateTable = toSnakeCase(candidateTableName);
-      if (!tableNameSet.has(candidateTable)) continue;
+      if (!tableNameSet.has(candidateTable)) {
+        const partialMatch = tables.find((t) => t.name.toLowerCase().includes(candidateTableName.toLowerCase()));
+        if (partialMatch) {
+          const targetPK = primaryKeys.get(partialMatch.name);
+          if (targetPK) {
+            const strategy = isTypeCompatible(column.data_type, targetPK.data_type) ? "type_signature" : "naming_convention";
+            const confidence = "medium";
+
+            results.push({
+              id: buildRelationshipId(table.name, column.name, partialMatch.name, targetPK.name),
+              sourceTable: table.name,
+              sourceColumn: column.name,
+              targetTable: partialMatch.name,
+              targetColumn: targetPK.name,
+              confidence,
+              strategy,
+            });
+          }
+        }
+        continue;
+      }
 
       const targetPK = primaryKeys.get(candidateTable);
       if (!targetPK) continue;
 
       const strategy = isTypeCompatible(column.data_type, targetPK.data_type) ? "type_signature" : "naming_convention";
-
       const confidence = strategy === "type_signature" ? "high" : "high";
 
       results.push({
@@ -60,17 +79,19 @@ function deduplicate(relationships: InferredRelationship[]): InferredRelationshi
 
 export function filterByStorage(inferred: InferredRelationship[], confirms: string[], ignores: string[]): MatchResult {
   const confirmed = inferred.filter((r) => confirms.includes(r.id));
-  const pending = inferred.filter((r) => !confirms.includes(r.id) && !ignores.includes(r.id) && r.confidence === "high");
+  const pending = inferred.filter((r) => !confirms.includes(r.id) && !ignores.includes(r.id));
 
-  const conflicts = findConflicts(pending);
+  const conflictList = findConflicts(pending.filter((r) => r.confidence === "high"));
+  const conflictIds = new Set(conflictList.map((r) => r.id));
+  const actionablePending = pending.filter((r) => !conflictIds.has(r.id));
 
   return {
-    relationships: [...confirmed, ...pending.filter((r) => !conflicts.includes(r))],
-    conflicts,
-    pending: conflicts,
+    relationships: [...confirmed, ...actionablePending],
+    conflicts: conflictList,
+    pending: actionablePending,
     stats: {
       total: inferred.length,
-      high: confirmed.length + pending.length - conflicts.length,
+      high: inferred.filter((r) => r.confidence === "high").length,
       medium: inferred.filter((r) => r.confidence === "medium").length,
     },
   };

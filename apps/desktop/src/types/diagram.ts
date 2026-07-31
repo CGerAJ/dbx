@@ -1,4 +1,4 @@
-import type { DiagramTable, DiagramRelationship } from "@/lib/diagram/erDiagram";
+import type { CustomDiagramRelationship, DiagramPosition, DiagramTable, DiagramRelationship } from "@/lib/diagram/erDiagram";
 
 export interface InferredRelationship {
   id: string;
@@ -24,6 +24,13 @@ export interface LayoutOptions {
 export interface HistorySnapshot {
   nodes: DiagramNode[];
   edges: DiagramEdge[];
+  positions: Record<string, DiagramPosition>;
+  layers: DiagramLayer[];
+  customRelationships: CustomDiagramRelationship[];
+  edgeWaypoints: Record<string, { x: number; y: number }[]>;
+  edgeHandleHints: Record<string, { sourceHandle?: string; targetHandle?: string }>;
+  matchConfirms: string[];
+  matchIgnores: string[];
 }
 
 export interface DiagramNode {
@@ -40,6 +47,8 @@ export interface DiagramEdge {
   target: string;
   sourceHandle?: string;
   targetHandle?: string;
+  /** Absolute canvas waypoints from ELK / obstacle router (includes endpoints). */
+  waypoints?: { x: number; y: number }[];
   data: { relationship: DiagramRelationship | InferredRelationship };
 }
 
@@ -59,3 +68,21 @@ export interface MatchStorageKeys {
   rules: string;
   enabled: string;
 }
+
+export type LayerLayoutMode = "free" | "auto";
+
+export interface DiagramLayer {
+  id: string;
+  name: string;
+  color: string;
+  tableNames: string[];
+  collapsed: boolean;
+  visible: boolean;
+  /** free = locked (keep relative table positions); auto = unlocked (auto-layout rearranges tables in this layer) */
+  layoutMode: LayerLayoutMode;
+  position?: { x: number; y: number };
+  width?: number;
+  height?: number;
+}
+
+export const LAYER_COLORS = ["#3b82f6", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#ec4899", "#06b6d4", "#84cc16"];

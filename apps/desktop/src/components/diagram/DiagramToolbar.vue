@@ -4,10 +4,12 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Copy, Download, KeyRound, Link2, Loader2, Maximize2, Network, RefreshCw, ScanSearch, Search, Table2, Trash2, X, ZoomIn, ZoomOut, LayoutGrid } from "@lucide/vue";
+import { Copy, Download, Link2, Loader2, Maximize2, Minimize2, Network, RefreshCw, Search, Table2, X, ZoomIn, ZoomOut, LayoutGrid } from "@lucide/vue";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
 import ConnectionGroupBadge from "@/components/connection/ConnectionGroupBadge.vue";
 import type { ConnectionConfig } from "@/types/database";
+import type { DiagramExportFormat } from "@/lib/export/diagramFormats";
 
 const { t } = useI18n();
 
@@ -30,11 +32,12 @@ const props = defineProps<{
   matchRelationshipCount: number;
   diagramMode: "table" | "engineering";
   tableSearch: string;
-  showRelationshipPanel: boolean;
   showMatchPanel: boolean;
+  showLayersPanel: boolean;
   showAllTables: boolean;
   focusTableName: string;
   generatedJoinSql: string;
+  isFullscreen?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -43,17 +46,34 @@ const emit = defineEmits<{
   (e: "set-schema", value: string): void;
   (e: "update:table-search", value: string): void;
   (e: "set-diagram-mode", value: "table" | "engineering"): void;
-  (e: "toggle-relationship-panel"): void;
   (e: "toggle-match-panel"): void;
+  (e: "toggle-layers-panel"): void;
   (e: "copy-join-sql"): void;
   (e: "toggle-show-all-tables"): void;
-  (e: "export-svg"): void;
+  (e: "export-format", format: DiagramExportFormat): void;
   (e: "refresh"): void;
   (e: "zoom-out"): void;
   (e: "zoom-in"): void;
-  (e: "reset-layout"): void;
+  (e: "toggle-fullscreen"): void;
   (e: "auto-layout"): void;
 }>();
+
+const EXPORT_FORMATS: DiagramExportFormat[] = ["svg", "png", "json", "dbml", "mermaid"];
+
+function exportFormatLabel(format: DiagramExportFormat): string {
+  switch (format) {
+    case "svg":
+      return t("diagram.exportSvg");
+    case "png":
+      return t("diagram.exportPng");
+    case "json":
+      return t("diagram.exportJson");
+    case "dbml":
+      return t("diagram.exportDbml");
+    case "mermaid":
+      return t("diagram.exportMermaid");
+  }
+}
 
 function connectionIconType(id: string) {
   const config = props.sqlConnections.find((c) => c.id === id);
@@ -102,7 +122,10 @@ function connectionIconType(id: string) {
 
     <div class="relative min-w-40 flex-1">
       <Search class="absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-      <Input :value="tableSearch" @input="(e: Event) => emit('update:table-search', (e.target as HTMLInputElement).value)" class="h-8 pl-7 text-xs" :placeholder="t('diagram.searchTables')" />
+      <Input :value="tableSearch" @input="(e: Event) => emit('update:table-search', (e.target as HTMLInputElement).value)" class="h-8 pl-7 pr-9 text-xs" :placeholder="t('diagram.searchTables')" />
+      <button v-if="tableSearch" type="button" class="absolute right-2 top-1/2 h-4 w-4 -translate-y-1/2 rounded-full bg-muted-foreground/20 hover:bg-muted-foreground/40 flex items-center justify-center transition-colors" @click="emit('update:table-search', '')">
+        <X class="h-3 w-3 text-muted-foreground" />
+      </button>
     </div>
 
     <div class="flex h-8 shrink-0 items-center overflow-hidden rounded-md border bg-background">
@@ -116,14 +139,14 @@ function connectionIconType(id: string) {
       </Button>
     </div>
 
-    <Button variant="outline" size="sm" class="h-8 px-2 text-xs" :disabled="tablesCount === 0" :title="t('diagram.modelRelationships')" @click="emit('toggle-relationship-panel')">
+    <Button variant="outline" size="sm" class="h-8 px-2 text-xs" :disabled="tablesCount === 0" :title="t('diagram.modelRelationships')" :class="showMatchPanel ? 'bg-primary/10 border-primary text-primary' : ''" @click="emit('toggle-match-panel')">
       <Link2 class="mr-1 h-3.5 w-3.5" />
       {{ t("diagram.modelRelationships") }}
     </Button>
 
-    <Button variant="outline" size="sm" class="h-8 px-2 text-xs" :disabled="tablesCount === 0" :title="t('diagram.autoMatch')" @click="emit('toggle-match-panel')">
-      <ScanSearch class="mr-1 h-3.5 w-3.5" />
-      {{ t("diagram.autoMatch") }}
+    <Button variant="outline" size="sm" class="h-8 px-2 text-xs" :disabled="tablesCount === 0" :title="t('diagram.layers')" :class="showLayersPanel ? 'bg-primary/10 border-primary text-primary' : ''" @click="emit('toggle-layers-panel')">
+      <LayoutGrid class="mr-1 h-3.5 w-3.5" />
+      {{ t("diagram.layers") }}
     </Button>
 
     <Button variant="outline" size="sm" class="h-8 px-2 text-xs" :disabled="tablesCount === 0" :title="t('diagram.autoLayout')" @click="emit('auto-layout')">
@@ -153,21 +176,31 @@ function connectionIconType(id: string) {
       {{ t("diagram.customRelationshipsCount", { count: customRelationshipCount }) }}
     </Badge>
 
-    <Button variant="ghost" size="icon" class="h-8 w-8" :disabled="loadingDiagram || tablesCount === 0" :title="t('diagram.exportSvg')" @click="emit('export-svg')">
-      <Download class="h-4 w-4" />
-    </Button>
+    <DropdownMenu>
+      <DropdownMenuTrigger as-child>
+        <Button variant="ghost" size="icon" class="h-8 w-8" :disabled="loadingDiagram || tablesCount === 0" :title="t('diagram.export')">
+          <Download class="h-4 w-4" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" class="w-44">
+        <DropdownMenuItem v-for="format in EXPORT_FORMATS" :key="format" @click="emit('export-format', format)">
+          {{ exportFormatLabel(format) }}
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
     <Button variant="ghost" size="icon" class="h-8 w-8" :disabled="!diagramReady || loadingDiagram" :title="t('diagram.refresh')" @click="emit('refresh')">
       <Loader2 v-if="loadingDiagram" class="h-4 w-4 animate-spin" />
       <RefreshCw v-else class="h-4 w-4" />
     </Button>
-    <Button variant="ghost" size="icon" class="h-8 w-8" :title="t('diagram.zoomOut')" @click="emit('zoom-out')">
+    <Button variant="ghost" size="icon" class="h-8 w-8" :disabled="diagramMode === 'engineering' || tablesCount === 0" :title="t('diagram.zoomOut')" @click="emit('zoom-out')">
       <ZoomOut class="h-4 w-4" />
     </Button>
-    <Button variant="ghost" size="icon" class="h-8 w-8" :title="t('diagram.zoomIn')" @click="emit('zoom-in')">
+    <Button variant="ghost" size="icon" class="h-8 w-8" :disabled="diagramMode === 'engineering' || tablesCount === 0" :title="t('diagram.zoomIn')" @click="emit('zoom-in')">
       <ZoomIn class="h-4 w-4" />
     </Button>
-    <Button variant="ghost" size="icon" class="h-8 w-8" :title="t('diagram.resetLayout')" @click="emit('reset-layout')">
-      <Maximize2 class="h-4 w-4" />
+    <Button variant="ghost" size="icon" class="h-8 w-8" :title="isFullscreen ? t('diagram.exitFullscreen') : t('diagram.fullscreen')" @click="emit('toggle-fullscreen')">
+      <Minimize2 v-if="isFullscreen" class="h-4 w-4" />
+      <Maximize2 v-else class="h-4 w-4" />
     </Button>
   </div>
 </template>

@@ -1,5 +1,5 @@
-import type { DiagramNode, DiagramEdge, LayoutOptions } from "@/types/diagram";
-import { computeLayout } from "./elk-layout";
+import type { DiagramNode, DiagramEdge, LayoutOptions, DiagramLayer } from "@/types/diagram";
+import { computeLayout, computeLayoutWithLayers, type LayerLayoutInfo } from "./elk-layout";
 
 export interface LayoutManagerOptions {
   defaultDirection?: LayoutOptions["direction"];
@@ -17,6 +17,10 @@ export class LayoutManager {
 
   async applyElkLayout(nodes: DiagramNode[], edges: DiagramEdge[], direction?: LayoutOptions["direction"]): Promise<{ nodes: DiagramNode[]; edges: DiagramEdge[] }> {
     return computeLayout(nodes, edges, { direction: direction || this.defaultDirection });
+  }
+
+  async applyElkLayoutWithLayers(nodes: DiagramNode[], edges: DiagramEdge[], layers: DiagramLayer[], direction?: LayoutOptions["direction"]): Promise<{ nodes: DiagramNode[]; edges: DiagramEdge[]; layerLayouts: LayerLayoutInfo[] }> {
+    return computeLayoutWithLayers(nodes, edges, layers, { direction: direction || this.defaultDirection });
   }
 
   applyGridLayout(nodes: DiagramNode[]): DiagramNode[] {

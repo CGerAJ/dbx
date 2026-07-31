@@ -58,7 +58,14 @@ export function buildPrimaryKeyIndex(tables: DiagramTable[]): Map<string, Primar
 }
 
 export function extractTableNameFromColumn(columnName: string): string | null {
-  const match = columnName.match(/^(.+?)_(?:id|uuid|pk)$/i);
-  if (!match) return null;
-  return match[1];
+  const camelCaseMatch = columnName.match(/^(.+?)(?:ID|UID)$/);
+  if (camelCaseMatch) return camelCaseMatch[1];
+
+  const underscoreMatch = columnName.match(/^(.+?)_(?:id|uuid|pk)$/i);
+  if (underscoreMatch) return underscoreMatch[1];
+
+  const lowercaseMatch = columnName.match(/^(.+?)(?:id|uid)$/i);
+  if (lowercaseMatch) return lowercaseMatch[1];
+
+  return null;
 }
