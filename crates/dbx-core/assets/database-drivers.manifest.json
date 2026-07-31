@@ -199,7 +199,7 @@
         "fieldLineage": false,
         "sqlExplain": false,
         "userAdmin": false,
-        "driverManagement": false
+        "driverManagement": true
       }
     },
     {
@@ -329,6 +329,35 @@
     {
       "dbType": "elasticsearch",
       "label": "Elasticsearch",
+      "runtimeMode": "native",
+      "mcpMode": "bridge",
+      "singleConnectionPool": false,
+      "metadataConnectionScoped": false,
+      "skipTcpProbe": false,
+      "defaultPort": 9200,
+      "supportLevel": "connect",
+      "capabilities": {
+        "queryExecution": true,
+        "metadataBrowse": false,
+        "objectBrowser": false,
+        "objectSource": false,
+        "schemaSearch": false,
+        "diagram": false,
+        "tableDataEdit": false,
+        "tableStructureEdit": false,
+        "tableImport": false,
+        "dataTransfer": false,
+        "sqlFileExecution": false,
+        "databaseCreate": false,
+        "fieldLineage": false,
+        "sqlExplain": false,
+        "userAdmin": false,
+        "driverManagement": false
+      }
+    },
+    {
+      "dbType": "easysearch",
+      "label": "Easysearch",
       "runtimeMode": "native",
       "mcpMode": "bridge",
       "singleConnectionPool": false,
@@ -506,7 +535,7 @@
       "runtimeMode": "native",
       "mcpMode": "direct",
       "singleConnectionPool": false,
-      "metadataConnectionScoped": false,
+      "metadataConnectionScoped": true,
       "skipTcpProbe": false,
       "defaultPort": 9030,
       "supportLevel": "operate",
@@ -535,7 +564,7 @@
       "runtimeMode": "native",
       "mcpMode": "direct",
       "singleConnectionPool": false,
-      "metadataConnectionScoped": false,
+      "metadataConnectionScoped": true,
       "skipTcpProbe": false,
       "defaultPort": 9030,
       "supportLevel": "operate",
@@ -564,7 +593,7 @@
       "runtimeMode": "native",
       "mcpMode": "direct",
       "singleConnectionPool": false,
-      "metadataConnectionScoped": false,
+      "metadataConnectionScoped": true,
       "skipTcpProbe": false,
       "defaultPort": 9306,
       "supportLevel": "operate",
