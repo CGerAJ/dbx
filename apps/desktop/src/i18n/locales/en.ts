@@ -2925,7 +2925,6 @@ export default {
     pendingDropTableBadge: "Drop table",
     source: "Source",
     target: "Target",
-    removeRelationship: "Remove relationship",
     emptyDesignHint: "No tables yet. Create a layer and tables, edit fields in the inspector, then sync to the database.",
     removeFromLayer: "Remove from layer",
     addTables: "Add table(s)",

@@ -17,19 +17,7 @@ import { useGraphStore } from "@/lib/diagram/graph-store";
 import * as api from "@/lib/backend/api";
 import { DIAGRAM_SQL_TYPES, isSchemaAware as isSchemaAwareDatabase } from "@/lib/database/databaseCapabilities";
 import { databaseOptionsForConnection } from "@/composables/useDatabaseOptions";
-import {
-  buildDiagramJoinSql,
-  buildDiagramRelationships,
-  filterDiagramTables,
-  layoutDiagramTables,
-  mergeRelationshipsWithInferred,
-  normalizeCustomDiagramRelationship,
-  type CustomDiagramRelationship,
-  type DiagramPosition,
-  type DiagramTable,
-  isDraftTable,
-  needsDiagramSync,
-} from "@/lib/diagram/erDiagram";
+import { buildDiagramJoinSql, buildDiagramRelationships, filterDiagramTables, mergeRelationshipsWithInferred, normalizeCustomDiagramRelationship, type CustomDiagramRelationship, type DiagramPosition, type DiagramTable, isDraftTable, needsDiagramSync } from "@/lib/diagram/erDiagram";
 import { createDraftTable } from "@/lib/diagram/draft-table";
 import { cardinalityPairFromChoice } from "@/lib/diagram/cardinality";
 import { loadDraftTables, saveDraftTables, loadPersistedLayers, savePersistedLayers, loadPersistedPositions, savePersistedPositions, hasUsablePersistedPositions, loadLiveTablePatches, saveLiveTablePatches, applyLiveTablePatches } from "@/lib/diagram/draft-storage";
@@ -45,9 +33,9 @@ import { saveDiagramBinaryExport, saveDiagramTextExport } from "@/lib/export/sav
 import { inferRelationships, filterByStorage } from "@/lib/diagram/match-engine";
 import { loadMatchConfirms, saveMatchConfirms, loadMatchIgnores, saveMatchIgnores, isAutoMatchEnabled } from "@/lib/diagram/match-storage";
 import { toVueFlowNodes, toVueFlowEdges, toDiagramEdges, toVueFlowLayerNodes, toAbsolutePosition, isTableCanvasVisible } from "@/lib/diagram/vue-flow-adapter";
-import { CARD_WIDTH, CARD_HEADER_HEIGHT, COLUMN_ROW_HEIGHT, CARD_BOTTOM_PADDING, GAP_X, GAP_Y, MARGIN, LAYER_CONTENT_PADDING, LAYER_HEADER_HEIGHT, columnsPerRowForWidth, DIAGRAM_HOVERED_EDGE_KEY, DIAGRAM_EDGE_OBSTACLES_KEY } from "@/lib/diagram/diagram-constants";
+import { CARD_WIDTH, CARD_HEADER_HEIGHT, COLUMN_ROW_HEIGHT, CARD_BOTTOM_PADDING, GAP_X, GAP_Y, MARGIN, LAYER_CONTENT_PADDING, LAYER_HEADER_HEIGHT, DIAGRAM_HOVERED_EDGE_KEY, DIAGRAM_EDGE_OBSTACLES_KEY } from "@/lib/diagram/diagram-constants";
 import { sizeLayerToFit, findLayerAtPoint, placeNewLayer } from "@/lib/diagram/size-layer";
-import { computeLtrAutoLayout, orderTablesByConnectivity } from "@/lib/diagram/ltr-auto-layout";
+import { computeLtrAutoLayout } from "@/lib/diagram/ltr-auto-layout";
 import { computeLayoutWithLayers } from "@/lib/diagram/elk-layout";
 import type { ObstacleRect, Point } from "@/lib/diagram/edge-obstacle-router";
 import type { DiagramNode, DiagramEdge, MatchResult, LayerLayoutMode, HistorySnapshot } from "@/types/diagram";
@@ -189,11 +177,11 @@ function applyHistorySnapshot(snapshot: HistorySnapshot) {
   matchIgnores.value = [...(snapshot.matchIgnores ?? [])];
   graphStore.setNodes(deepCloneJson(snapshot.nodes));
   graphStore.setEdges(deepCloneJson(snapshot.edges));
-  if (inspectorTarget.value?.kind === "table" && !tables.value.some((t) => t.name === inspectorTarget.value!.tableName)) {
+  const restoreTarget = inspectorTarget.value;
+  if (restoreTarget?.kind === "table" && !tables.value.some((t) => t.name === restoreTarget.tableName)) {
     inspectorTarget.value = null;
-  }
-  if (inspectorTarget.value?.kind === "edge") {
-    const edgeId = inspectorTarget.value.edgeId;
+  } else if (restoreTarget?.kind === "edge") {
+    const edgeId = restoreTarget.edgeId;
     const edgeExists = customRelationships.value.some((r) => r.id === edgeId) || matchResult.value.relationships.some((r) => r.id === edgeId) || snapshot.edges.some((e) => e.id === edgeId);
     if (!edgeExists) inspectorTarget.value = null;
   }
@@ -507,57 +495,6 @@ const canvasSize = computed(() => {
 const engineeringDiagram = computed(() => buildEngineeringDiagram(visibleTables.value, visibleRelationships.value, positions.value));
 
 const activeCanvasSize = computed(() => (diagramMode.value === "engineering" ? engineeringDiagram.value.canvas : canvasSize.value));
-
-async function resetLayout(options?: { skipHistory?: boolean }) {
-  const layoutTables = canvasVisibleTables.value;
-  if (visibleTables.value.length === 0) {
-    positions.value = {};
-    syncVueFlowNodes();
-    return;
-  }
-  if (layoutTables.length === 0) {
-    syncVueFlowNodes();
-    return;
-  }
-
-  if (!options?.skipHistory) recordHistory();
-
-  // Wait for pane to have real dimensions before measuring width
-  await nextTick();
-  const paneWidth = diagramPaneWidth();
-  const ordered = orderTablesByConnectivity(layoutTables, canvasVisibleRelationships.value);
-  const laidOut = layoutDiagramTables(ordered, {
-    columnsPerRow: columnsPerRowForWidth(paneWidth),
-    cardWidth: CARD_WIDTH,
-    gapX: GAP_X,
-    gapY: GAP_Y,
-    margin: MARGIN,
-  });
-  // Freeze positions for tables in hidden layers
-  const nextPositions: Record<string, DiagramPosition> = { ...positions.value };
-  for (const table of layoutTables) {
-    const pos = laidOut[table.name];
-    if (pos) nextPositions[table.name] = pos;
-  }
-  positions.value = nextPositions;
-  // Drop waypoints only for edges still on canvas; keep frozen hidden-end edges
-  const canvasEdgeIds = new Set(canvasVisibleRelationships.value.map((r) => r.id));
-  const nextWaypoints: Record<string, Point[]> = {};
-  const nextHandleHints: Record<string, { sourceHandle?: string; targetHandle?: string }> = {};
-  for (const [id, wp] of Object.entries(edgeWaypoints.value)) {
-    if (!canvasEdgeIds.has(id)) nextWaypoints[id] = wp;
-  }
-  for (const [id, hint] of Object.entries(edgeHandleHints.value)) {
-    if (!canvasEdgeIds.has(id)) nextHandleHints[id] = hint;
-  }
-  edgeWaypoints.value = nextWaypoints;
-  edgeHandleHints.value = nextHandleHints;
-  fitAllFreeLayers();
-  syncVueFlowNodes();
-  await nextTick();
-  fitDiagramView();
-  persistDraftAndLayers();
-}
 
 function handleAddLayer() {
   recordHistory();
@@ -1810,8 +1747,6 @@ onMounted(() => {
 onUnmounted(() => {
   window.removeEventListener("keydown", handleKeydown);
   window.removeEventListener("keyup", handleKeyup);
-  clearEdgeLeaveTimer();
-  clearEdgeOpenTimer();
   teardownFullscreenListeners();
   if (diagramOwnedFullscreen) {
     void exitFullscreen();

@@ -57,13 +57,15 @@ const adapter = computed(() => resolveDiagramDialectAdapter(props.databaseType))
 const databaseType = computed(() => props.databaseType);
 
 const selectedTable = computed(() => {
-  if (props.target?.kind !== "table") return null;
-  return props.tables.find((t) => t.name === props.target!.tableName) ?? null;
+  const target = props.target;
+  if (target?.kind !== "table") return null;
+  return props.tables.find((t) => t.name === target.tableName) ?? null;
 });
 
 const selectedEdge = computed(() => {
-  if (props.target?.kind !== "edge") return null;
-  return props.relationships.find((r) => r.id === props.target!.edgeId) ?? null;
+  const target = props.target;
+  if (target?.kind !== "edge") return null;
+  return props.relationships.find((r) => r.id === target.edgeId) ?? null;
 });
 
 const relationshipKind = computed(() => {

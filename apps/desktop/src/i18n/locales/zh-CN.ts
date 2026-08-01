@@ -2925,7 +2925,6 @@ export default withEnglishFallback({
     pendingDropTableBadge: "待删表",
     source: "源",
     target: "目标",
-    removeRelationship: "删除关系",
     emptyDesignHint: "还没有表。可新建层与表，在属性面板编辑字段，完成后同步到数据库。",
     removeFromLayer: "从层中移除",
     addTables: "添加表",

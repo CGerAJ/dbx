@@ -22,10 +22,14 @@ export function cardinalityChoiceFromPair(pair: Partial<CardinalityPair> | null 
   return "many-to-one";
 }
 
-/** Resolve endpoint cardinalities from a relationship; FK without explicit pair defaults to N:1. */
-export function edgeCardinalityPair(rel: { sourceCardinality?: "1" | "N"; targetCardinality?: "1" | "N" } | null | undefined): CardinalityPair {
-  if (rel?.sourceCardinality && rel?.targetCardinality) {
-    return { sourceCardinality: rel.sourceCardinality, targetCardinality: rel.targetCardinality };
+/** Resolve endpoint cardinalities from a relationship; FK/inferred without explicit pair defaults to N:1. */
+export function edgeCardinalityPair(rel: Partial<CardinalityPair> | object | null | undefined): CardinalityPair {
+  if (rel && typeof rel === "object" && "sourceCardinality" in rel && "targetCardinality" in rel) {
+    const sourceCardinality = (rel as Partial<CardinalityPair>).sourceCardinality;
+    const targetCardinality = (rel as Partial<CardinalityPair>).targetCardinality;
+    if (sourceCardinality && targetCardinality) {
+      return { sourceCardinality, targetCardinality };
+    }
   }
   return { sourceCardinality: "N", targetCardinality: "1" };
 }
