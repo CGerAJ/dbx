@@ -4,6 +4,7 @@ import { useI18n } from "vue-i18n";
 import { Plus, Trash2, Eye, EyeOff, ChevronDown, ChevronRight, Edit3, Check, X, CheckSquare, Square, Lock, Unlock } from "@lucide/vue";
 import { useLayerStore } from "@/lib/diagram/layer-store";
 import type { DiagramTable } from "@/lib/diagram/erDiagram";
+import { filterAssignableDiagramTables } from "@/lib/diagram/erDiagram";
 import type { LayerLayoutMode } from "@/types/diagram";
 import { useToast } from "@/composables/useToast";
 
@@ -18,6 +19,7 @@ const emit = defineEmits<{
   (e: "layout-mode-changed", payload: { layerId: string; layoutMode: LayerLayoutMode }): void;
   (e: "focus-layer", layerId: string): void;
   (e: "create-draft-table", payload: { name: string; layerId: string | null; withDefaultId: boolean }): void;
+  (e: "delete-table", tableName: string): void;
 }>();
 
 const store = useLayerStore();
@@ -92,8 +94,10 @@ function isTableSelected(layerId: string, tableName: string): boolean {
   return getSelectedTables(layerId).has(tableName);
 }
 
+const assignableTables = computed(() => filterAssignableDiagramTables(props.tables));
+
 const availableTables = computed(() => {
-  return props.tables.filter((table) => !store.getLayerByTable(table.name));
+  return assignableTables.value.filter((table) => !store.getLayerByTable(table.name));
 });
 
 function matchesAddTableFilter(name: string): boolean {
@@ -107,7 +111,7 @@ const filteredAvailableTables = computed(() => {
 });
 
 function getOtherLayerTables(excludeLayerId: string): DiagramTable[] {
-  return props.tables.filter((table) => getOtherLayerForTable(table.name, excludeLayerId));
+  return assignableTables.value.filter((table) => getOtherLayerForTable(table.name, excludeLayerId));
 }
 
 function getFilteredOtherLayerTables(excludeLayerId: string): DiagramTable[] {
@@ -255,6 +259,10 @@ function handleRemoveTable(layerId: string, tableName: string) {
   emit("layer-changed");
 }
 
+function handleDeleteTable(tableName: string) {
+  emit("delete-table", tableName);
+}
+
 function handleToggleVisibility(layerId: string) {
   beforeMutate();
   store.toggleLayerVisibility(layerId);
@@ -284,7 +292,7 @@ function handleSetActiveLayer(layerId: string) {
 function getLayerTables(layerId: string): DiagramTable[] {
   const layer = store.layers.find((l) => l.id === layerId);
   if (!layer) return [];
-  return props.tables.filter((table) => layer.tableNames.includes(table.name));
+  return assignableTables.value.filter((table) => layer.tableNames.includes(table.name));
 }
 
 function getLayerColor(layerId: string): string {
@@ -349,6 +357,9 @@ function getLayerColor(layerId: string): string {
               <span class="flex-1 min-w-0 truncate">{{ table.name }}</span>
               <button type="button" class="p-0.5 rounded hover:bg-background transition-colors" @click.stop="handleRemoveTable(layer.id, table.name)" :title="t('diagram.removeFromLayer')">
                 <X class="h-3 w-3 text-muted-foreground" />
+              </button>
+              <button type="button" class="p-0.5 rounded hover:bg-background transition-colors" @click.stop="handleDeleteTable(table.name)" :title="t('diagram.deleteLiveTable')">
+                <Trash2 class="h-3 w-3 text-red-500" />
               </button>
             </div>
           </div>

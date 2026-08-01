@@ -1,8 +1,12 @@
 import { strict as assert } from "node:assert";
 import { test } from "vitest";
 import {
+  filterAssignableDiagramTables,
+  hasDroppedColumns,
   hasPendingColumns,
+  isDiagramTableAssignable,
   isDraftTable,
+  isDroppedColumn,
   isLiveTable,
   isPendingColumn,
   needsDiagramSync,
@@ -66,4 +70,34 @@ test("needsDiagramSync for draft and live pending", () => {
   );
   assert.equal(needsDiagramSync(table({ name: "l", origin: "live" })), false);
   assert.equal(needsDiagramSync(table({ name: "legacy" })), false);
+});
+
+test("hasDroppedColumns / isDroppedColumn / needsDiagramSync for drops", () => {
+  const withDrop = table({
+    name: "users",
+    origin: "live",
+    columns: [col("id"), col("nickname")],
+    droppedColumnNames: ["nickname"],
+  });
+  assert.equal(hasDroppedColumns(withDrop), true);
+  assert.equal(isDroppedColumn(withDrop, "nickname"), true);
+  assert.equal(isDroppedColumn(withDrop, "id"), false);
+  assert.equal(needsDiagramSync(withDrop), true);
+
+  const pendingDrop = table({ name: "orders", origin: "live", pendingDrop: true });
+  assert.equal(needsDiagramSync(pendingDrop), true);
+});
+
+test("filterAssignableDiagramTables excludes pendingDrop tables", () => {
+  const live = table({ name: "users", origin: "live" });
+  const pendingDrop = table({ name: "orders", origin: "live", pendingDrop: true });
+  const draft = table({ name: "draft_t", origin: "draft" });
+
+  assert.equal(isDiagramTableAssignable(live), true);
+  assert.equal(isDiagramTableAssignable(pendingDrop), false);
+  assert.equal(isDiagramTableAssignable(draft), true);
+  assert.deepEqual(
+    filterAssignableDiagramTables([live, pendingDrop, draft]).map((t) => t.name),
+    ["users", "draft_t"],
+  );
 });

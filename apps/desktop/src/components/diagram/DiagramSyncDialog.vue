@@ -4,8 +4,9 @@ import { useI18n } from "vue-i18n";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import type { DiagramTable } from "@/lib/diagram/erDiagram";
-import { hasPendingColumns, isDraftTable, needsDiagramSync } from "@/lib/diagram/erDiagram";
-import { draftTableToCreateSqlOptions, liveTableToAlterSqlOptions, validateDraftTable, validateLivePendingColumns } from "@/lib/diagram/draft-table";
+import { isDraftTable, needsDiagramSync } from "@/lib/diagram/erDiagram";
+import { draftTableToCreateSqlOptions, hasLiveColumnChanges, liveTableToAlterSqlOptions, validateDraftTable, validateLivePendingColumns } from "@/lib/diagram/draft-table";
+import { buildDropTableSql, supportsDropTableCascade } from "@/lib/database/dbAdminSql";
 import type { DatabaseType } from "@/types/database";
 import * as api from "@/lib/backend/api";
 import { copyToClipboard } from "@/lib/common/clipboard";
@@ -33,7 +34,8 @@ const openModel = computed({
 
 const syncTables = computed(() => props.tables.filter(needsDiagramSync));
 const draftTables = computed(() => syncTables.value.filter(isDraftTable));
-const livePendingTables = computed(() => syncTables.value.filter((table) => !isDraftTable(table) && hasPendingColumns(table)));
+const liveDropTables = computed(() => syncTables.value.filter((table) => !isDraftTable(table) && !!table.pendingDrop));
+const liveAlterTables = computed(() => syncTables.value.filter((table) => !isDraftTable(table) && !table.pendingDrop && hasLiveColumnChanges(table)));
 const validationErrors = ref<string[]>([]);
 const sqlText = ref("");
 const warnings = ref<string[]>([]);
@@ -48,7 +50,7 @@ async function rebuildSql() {
   sqlText.value = "";
   execError.value = "";
   try {
-    const errors = [...draftTables.value.flatMap(validateDraftTable), ...livePendingTables.value.flatMap(validateLivePendingColumns)];
+    const errors = [...draftTables.value.flatMap(validateDraftTable), ...liveAlterTables.value.flatMap(validateLivePendingColumns)];
     if (errors.length) {
       validationErrors.value = errors;
       return;
@@ -60,10 +62,20 @@ async function rebuildSql() {
       allStatements.push(...result.statements);
       allWarnings.push(...result.warnings);
     }
-    for (const table of livePendingTables.value) {
+    for (const table of liveAlterTables.value) {
       const result = await api.buildTableStructureChangeSql(liveTableToAlterSqlOptions(table, props.databaseType, props.schema || undefined));
       allStatements.push(...result.statements);
       allWarnings.push(...result.warnings);
+    }
+    const cascade = supportsDropTableCascade(props.databaseType);
+    for (const table of liveDropTables.value) {
+      const sql = await buildDropTableSql({
+        databaseType: props.databaseType,
+        schema: props.schema || undefined,
+        tableName: table.name,
+        cascade,
+      });
+      if (sql.trim()) allStatements.push(sql.trim());
     }
     sqlText.value = allStatements.join("\n\n");
     warnings.value = allWarnings;
@@ -113,8 +125,15 @@ function syncTableLabel(table: DiagramTable): string {
   if (isDraftTable(table)) {
     return `${table.name} (${table.columns.length} cols, CREATE)`;
   }
-  const pending = table.pendingColumnNames?.length ?? 0;
-  return `${table.name} (+${pending} cols, ALTER)`;
+  if (table.pendingDrop) {
+    return `${table.name} (DROP TABLE)`;
+  }
+  const added = table.pendingColumnNames?.length ?? 0;
+  const dropped = table.droppedColumnNames?.length ?? 0;
+  const parts: string[] = [];
+  if (added) parts.push(`+${added}`);
+  if (dropped) parts.push(`-${dropped}`);
+  return `${table.name} (${parts.join("/") || "0"} cols, ALTER)`;
 }
 </script>
 

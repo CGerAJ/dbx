@@ -417,7 +417,10 @@ const relatedTableNames = computed(() => {
 });
 
 const visibleTables = computed(() => {
-  const filtered = filterDiagramTables(tables.value, tableSearch.value);
+  const filtered = filterDiagramTables(
+    tables.value.filter((table) => !table.pendingDrop),
+    tableSearch.value,
+  );
   if (props.focusTableName && !showAllTables.value && !tableSearch.value.trim()) {
     return filtered.filter((table) => relatedTableNames.value.has(table.name));
   }
@@ -798,6 +801,41 @@ function handleDeleteDraftTable(tableName: string) {
   }
   persistDraftAndLayers();
   syncVueFlowNodes();
+}
+
+function handleDeleteLiveTable(tableName: string) {
+  recordHistory();
+  tables.value = tables.value.map((table) => {
+    if (table.name !== tableName || isDraftTable(table)) return table;
+    return {
+      ...table,
+      pendingDrop: true,
+      pendingColumnNames: undefined,
+      droppedColumnNames: undefined,
+    };
+  });
+  const layer = layerStore.getLayerByTable(tableName);
+  if (layer) {
+    layerStore.removeTableFromLayer(layer.id, tableName);
+    sizeLayerToFit(layer, positions.value, tableHeightsMap());
+  }
+  customRelationships.value = customRelationships.value.filter((r) => r.sourceTable !== tableName && r.targetTable !== tableName);
+  saveCustomRelationships();
+  if (inspectorTarget.value?.kind === "table" && inspectorTarget.value.tableName === tableName) {
+    inspectorTarget.value = null;
+  }
+  persistDraftAndLayers();
+  syncVueFlowNodes();
+}
+
+function deleteTableFromDiagram(tableName: string) {
+  const table = tables.value.find((t) => t.name === tableName);
+  if (!table || table.pendingDrop) return;
+  if (isDraftTable(table)) {
+    handleDeleteDraftTable(tableName);
+    return;
+  }
+  handleDeleteLiveTable(tableName);
 }
 
 function handleInspectorRemoveRelationship(id: string) {
@@ -1702,6 +1740,14 @@ function handleKeydown(e: KeyboardEvent) {
       return;
     }
   }
+  if (!typing && (e.key === "Delete" || e.key === "Backspace")) {
+    const selectedTableName = inspectorTarget.value?.kind === "table" ? inspectorTarget.value.tableName : nodes.value.find((n) => n.selected && n.type === "table")?.id;
+    if (selectedTableName) {
+      e.preventDefault();
+      deleteTableFromDiagram(selectedTableName);
+      return;
+    }
+  }
   if (e.key === " " || e.key === "Spacebar") {
     e.preventDefault();
     isSpacePressed.value = true;
@@ -1831,7 +1877,17 @@ onUnmounted(() => {
       <div class="flex min-h-0 flex-1 flex-col bg-muted/20">
         <div class="min-h-0 flex-1 flex overflow-hidden">
           <div v-if="showLayersPanel && diagramReady" class="flex flex-col overflow-hidden" :style="{ width: `${leftPanelWidth}px` }">
-            <LayerPanel :tables="tables" :record-history="recordHistory" class="h-full overflow-y-auto" @add-layer="handleAddLayer" @layer-changed="handleLayerChanged" @layout-mode-changed="handleLayerLayoutModeChanged" @focus-layer="handleFocusLayer" @create-draft-table="handleCreateDraftTable" />
+            <LayerPanel
+              :tables="tables"
+              :record-history="recordHistory"
+              class="h-full overflow-y-auto"
+              @add-layer="handleAddLayer"
+              @layer-changed="handleLayerChanged"
+              @layout-mode-changed="handleLayerLayoutModeChanged"
+              @focus-layer="handleFocusLayer"
+              @create-draft-table="handleCreateDraftTable"
+              @delete-table="deleteTableFromDiagram"
+            />
           </div>
           <ResizerHandle v-if="showLayersPanel && diagramReady" @resize="handleLeftResize" />
           <div class="min-h-0 flex-1 overflow-hidden">
@@ -1981,7 +2037,8 @@ onUnmounted(() => {
                   syncHighlightEdgeId();
                 "
                 @update-table="handleInspectorUpdateTable"
-                @delete-draft-table="handleDeleteDraftTable"
+                @delete-draft-table="deleteTableFromDiagram"
+                @delete-live-table="deleteTableFromDiagram"
                 @remove-relationship="handleInspectorRemoveRelationship"
                 @save-relationship="handleInspectorSaveRelationship"
                 @confirm-relationship="handleInspectorConfirmRelationship"

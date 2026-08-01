@@ -26,7 +26,7 @@ export function toVueFlowNodes(tables: DiagramTable[], positions?: Record<string
   const layers = layerStore.layers;
 
   return tables
-    .filter((table) => isTableCanvasVisible(table.name, layers))
+    .filter((table) => !table.pendingDrop && isTableCanvasVisible(table.name, layers))
     .map((table) => {
       const layer = layerStore.getLayerByTable(table.name);
       const absolute = positions?.[table.name] || { x: 0, y: 0 };

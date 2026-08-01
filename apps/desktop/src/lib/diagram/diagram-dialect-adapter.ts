@@ -7,6 +7,7 @@ export interface DiagramDialectAdapter {
   supportsCreateTable: boolean;
   supportsCreateIndex: boolean;
   supportsComment: boolean;
+  supportsDropColumn: boolean;
   dataTypeOptions: string[];
   createDefaultIdColumn(): ColumnInfo;
   createEmptyColumn(name?: string): ColumnInfo;
@@ -43,6 +44,7 @@ export function resolveDiagramDialectAdapter(databaseType?: DatabaseType): Diagr
     supportsCreateTable: caps.createTable,
     supportsCreateIndex: caps.createIndex,
     supportsComment: caps.comment,
+    supportsDropColumn: caps.dropColumn,
     dataTypeOptions,
     createDefaultIdColumn() {
       return {

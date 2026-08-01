@@ -1,12 +1,14 @@
 import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/backend/safeStorage";
 import type { ColumnInfo } from "@/types/database";
 import type { DiagramPosition, DiagramTable } from "./erDiagram";
-import { hasPendingColumns, isLiveTable } from "./erDiagram";
+import { isLiveTable, needsDiagramSync } from "./erDiagram";
 import type { DiagramLayer } from "@/types/diagram";
 
 export interface LiveTablePatch {
   tableName: string;
   pendingColumns: ColumnInfo[];
+  droppedColumnNames?: string[];
+  pendingDrop?: boolean;
 }
 
 function storageKey(kind: "draft-tables" | "layers" | "positions" | "live-patches", connectionId: string, database: string, schema: string): string {
@@ -17,6 +19,11 @@ function isValidColumn(value: unknown): value is ColumnInfo {
   if (!value || typeof value !== "object") return false;
   const col = value as Partial<ColumnInfo>;
   return typeof col.name === "string" && typeof col.data_type === "string" && typeof col.is_nullable === "boolean";
+}
+
+function sanitizeStringList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === "string" && item.length > 0);
 }
 
 function sanitizePositions(raw: unknown): Record<string, DiagramPosition> {
@@ -104,12 +111,24 @@ export function loadLiveTablePatches(connectionId: string, database: string, sch
     .filter((item): item is LiveTablePatch => {
       if (!item || typeof item !== "object") return false;
       const patch = item as Partial<LiveTablePatch>;
-      return typeof patch.tableName === "string" && Array.isArray(patch.pendingColumns) && patch.pendingColumns.every(isValidColumn);
+      if (typeof patch.tableName !== "string") return false;
+      const pendingColumns = Array.isArray(patch.pendingColumns) ? patch.pendingColumns : [];
+      if (!pendingColumns.every(isValidColumn)) return false;
+      const droppedColumnNames = sanitizeStringList(patch.droppedColumnNames);
+      const pendingDrop = patch.pendingDrop === true;
+      return pendingColumns.length > 0 || droppedColumnNames.length > 0 || pendingDrop;
     })
-    .map((patch) => ({
-      tableName: patch.tableName,
-      pendingColumns: patch.pendingColumns.map((col) => ({ ...col })),
-    }));
+    .map((patch) => {
+      const pendingColumns = Array.isArray(patch.pendingColumns) ? patch.pendingColumns.filter(isValidColumn) : [];
+      const droppedColumnNames = sanitizeStringList(patch.droppedColumnNames);
+      const next: LiveTablePatch = {
+        tableName: patch.tableName,
+        pendingColumns: pendingColumns.map((col) => ({ ...col })),
+      };
+      if (droppedColumnNames.length) next.droppedColumnNames = droppedColumnNames;
+      if (patch.pendingDrop === true) next.pendingDrop = true;
+      return next;
+    });
 }
 
 export function saveLiveTablePatches(tables: DiagramTable[], connectionId: string, database: string, schema: string): void {
@@ -117,33 +136,50 @@ export function saveLiveTablePatches(tables: DiagramTable[], connectionId: strin
   const key = storageKey("live-patches", connectionId, database, schema);
   const patches: LiveTablePatch[] = [];
   for (const table of tables) {
-    if (!isLiveTable(table) || !hasPendingColumns(table)) continue;
-    const pendingNames = new Set(table.pendingColumnNames);
+    if (!isLiveTable(table) || !needsDiagramSync(table)) continue;
+    const pendingNames = new Set(table.pendingColumnNames ?? []);
     const pendingColumns = table.columns.filter((col) => pendingNames.has(col.name));
-    if (pendingColumns.length === 0) continue;
-    patches.push({
+    const droppedColumnNames = [...(table.droppedColumnNames ?? [])];
+    if (pendingColumns.length === 0 && droppedColumnNames.length === 0 && !table.pendingDrop) continue;
+    const patch: LiveTablePatch = {
       tableName: table.name,
       pendingColumns: pendingColumns.map((col) => ({ ...col })),
-    });
+    };
+    if (droppedColumnNames.length) patch.droppedColumnNames = droppedColumnNames;
+    if (table.pendingDrop) patch.pendingDrop = true;
+    patches.push(patch);
   }
   safeLocalStorageSet(key, JSON.stringify(patches));
 }
 
-/** Merge saved pending columns onto live tables loaded from DB metadata. */
+/** Merge saved pending adds/drops onto live tables loaded from DB metadata. */
 export function applyLiveTablePatches(tables: DiagramTable[], patches: LiveTablePatch[]): DiagramTable[] {
   if (patches.length === 0) return tables;
   const byName = new Map(patches.map((p) => [p.tableName, p]));
   return tables.map((table) => {
     if (!isLiveTable(table)) return table;
     const patch = byName.get(table.name);
-    if (!patch || patch.pendingColumns.length === 0) return table;
+    if (!patch) return table;
+
     const existing = new Set(table.columns.map((c) => c.name.toLowerCase()));
     const pendingColumns = patch.pendingColumns.filter((col) => !existing.has(col.name.toLowerCase()));
-    if (pendingColumns.length === 0) return table;
-    return {
-      ...table,
-      columns: [...table.columns, ...pendingColumns.map((col) => ({ ...col }))],
-      pendingColumnNames: pendingColumns.map((col) => col.name),
-    };
+    const columnNames = new Set([...existing, ...pendingColumns.map((col) => col.name.toLowerCase())]);
+    const droppedColumnNames = (patch.droppedColumnNames ?? []).filter((name) => columnNames.has(name.toLowerCase()));
+
+    let next: DiagramTable = table;
+    if (pendingColumns.length > 0) {
+      next = {
+        ...next,
+        columns: [...next.columns, ...pendingColumns.map((col) => ({ ...col }))],
+        pendingColumnNames: pendingColumns.map((col) => col.name),
+      };
+    }
+    if (droppedColumnNames.length > 0) {
+      next = { ...next, droppedColumnNames };
+    }
+    if (patch.pendingDrop) {
+      next = { ...next, pendingDrop: true };
+    }
+    return next;
   });
 }

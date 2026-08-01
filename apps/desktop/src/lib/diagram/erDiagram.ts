@@ -17,6 +17,13 @@ export interface DiagramTable {
    * Editable in Inspector; synced via ALTER ADD COLUMN.
    */
   pendingColumnNames?: string[];
+  /**
+   * Live tables only: existing column names marked for DROP COLUMN on sync.
+   * Columns remain in `columns` until sync/reload.
+   */
+  droppedColumnNames?: string[];
+  /** Live tables only: marked for DROP TABLE on sync (hidden from canvas). */
+  pendingDrop?: boolean;
 }
 
 export function isDraftTable(table: DiagramTable): boolean {
@@ -35,9 +42,26 @@ export function isPendingColumn(table: DiagramTable, columnName: string): boolea
   return (table.pendingColumnNames ?? []).some((name) => name === columnName);
 }
 
-/** Tables that need sync: full draft creates and/or live pending column adds. */
+export function hasDroppedColumns(table: DiagramTable): boolean {
+  return (table.droppedColumnNames?.length ?? 0) > 0;
+}
+
+export function isDroppedColumn(table: DiagramTable, columnName: string): boolean {
+  return (table.droppedColumnNames ?? []).some((name) => name === columnName);
+}
+
+/** Tables that need sync: draft creates, live column adds/drops, or pending DROP TABLE. */
 export function needsDiagramSync(table: DiagramTable): boolean {
-  return isDraftTable(table) || hasPendingColumns(table);
+  return isDraftTable(table) || hasPendingColumns(table) || hasDroppedColumns(table) || !!table.pendingDrop;
+}
+
+/** Soft-deleted tables stay in state for Sync but must not be re-added to layers/canvas pickers. */
+export function isDiagramTableAssignable(table: DiagramTable): boolean {
+  return !table.pendingDrop;
+}
+
+export function filterAssignableDiagramTables(tables: DiagramTable[]): DiagramTable[] {
+  return tables.filter(isDiagramTableAssignable);
 }
 
 export interface DiagramRelationship {

@@ -1,6 +1,6 @@
 import type { ColumnInfo, DatabaseType } from "@/types/database";
 import type { DiagramTable } from "./erDiagram";
-import { hasPendingColumns, isPendingColumn } from "./erDiagram";
+import { hasDroppedColumns, hasPendingColumns, isPendingColumn } from "./erDiagram";
 import type { BuildTableStructureChangeSqlOptions, EditableStructureColumn, EditableStructureIndex } from "@/lib/table/tableStructureEditorSql";
 import { generateUniqueIndexName } from "@/lib/table/tableStructureEditorState";
 import { resolveDiagramDialectAdapter } from "./diagram-dialect-adapter";
@@ -72,9 +72,10 @@ export function draftTableToCreateSqlOptions(table: DiagramTable, databaseType: 
   };
 }
 
-/** Live table with pending columns → ALTER ADD COLUMN (no original on pending cols). */
+/** Live table pending adds/drops → ALTER ADD / DROP COLUMN. */
 export function liveTableToAlterSqlOptions(table: DiagramTable, databaseType: DatabaseType | undefined, schema: string | undefined): BuildTableStructureChangeSqlOptions {
   const pending = new Set(table.pendingColumnNames ?? []);
+  const dropped = new Set(table.droppedColumnNames ?? []);
   return {
     databaseType,
     schema: schema || undefined,
@@ -88,6 +89,7 @@ export function liveTableToAlterSqlOptions(table: DiagramTable, databaseType: Da
         ...editable,
         original: { ...column },
         originalPosition: index + 1,
+        markedForDrop: dropped.has(column.name),
       };
     }),
     indexes: [],
@@ -129,10 +131,10 @@ export function validateDraftTable(table: DiagramTable): string[] {
   return errors;
 }
 
-/** Validate only pending columns on a live table before ALTER sync. */
+/** Validate pending ADD columns and DROP column marks on a live table before ALTER sync. */
 export function validateLivePendingColumns(table: DiagramTable): string[] {
   const errors: string[] = [];
-  if (!hasPendingColumns(table)) return errors;
+  if (!hasPendingColumns(table) && !hasDroppedColumns(table)) return errors;
   const pendingNames = table.pendingColumnNames ?? [];
   const existingNames = new Set(table.columns.filter((col) => !isPendingColumn(table, col.name)).map((col) => col.name.toLowerCase()));
   const seenPending = new Set<string>();
@@ -151,5 +153,25 @@ export function validateLivePendingColumns(table: DiagramTable): string[] {
     }
     if (!col.data_type.trim()) errors.push(`Column "${table.name}.${col.name}" needs a type`);
   }
+  const seenDropped = new Set<string>();
+  for (const name of table.droppedColumnNames ?? []) {
+    const key = name.toLowerCase();
+    if (seenDropped.has(key)) {
+      errors.push(`Table "${table.name}" has duplicate dropped column "${name}"`);
+      continue;
+    }
+    seenDropped.add(key);
+    if (isPendingColumn(table, name)) {
+      errors.push(`Table "${table.name}" cannot drop pending column "${name}"`);
+      continue;
+    }
+    if (!table.columns.some((col) => col.name === name)) {
+      errors.push(`Table "${table.name}" dropped column "${name}" is missing`);
+    }
+  }
   return errors;
+}
+
+export function hasLiveColumnChanges(table: DiagramTable): boolean {
+  return hasPendingColumns(table) || hasDroppedColumns(table);
 }

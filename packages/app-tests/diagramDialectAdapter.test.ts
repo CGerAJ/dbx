@@ -30,8 +30,9 @@ test("resolveDiagramDialectAdapter createEmptyColumn defaults", () => {
   assert.ok(col.data_type);
 });
 
-test("postgres supports create index and comment", () => {
+test("postgres supports create index, comment, and drop column", () => {
   const adapter = resolveDiagramDialectAdapter("postgres");
   assert.equal(adapter.supportsCreateIndex, true);
   assert.equal(adapter.supportsComment, true);
+  assert.equal(adapter.supportsDropColumn, true);
 });

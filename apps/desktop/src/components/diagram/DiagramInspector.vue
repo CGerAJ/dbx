@@ -7,7 +7,7 @@ import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { SearchableSelect } from "@/components/ui/searchable-select";
 import type { DiagramTable, DiagramRelationship, CustomDiagramRelationship } from "@/lib/diagram/erDiagram";
-import { hasPendingColumns, isDraftTable, isPendingColumn } from "@/lib/diagram/erDiagram";
+import { hasDroppedColumns, hasPendingColumns, isDraftTable, isDroppedColumn, isPendingColumn } from "@/lib/diagram/erDiagram";
 import type { InferredRelationship } from "@/types/diagram";
 import type { InspectorTarget } from "@/types/diagram";
 import type { ColumnInfo, DatabaseType } from "@/types/database";
@@ -31,6 +31,7 @@ const emit = defineEmits<{
   (e: "close"): void;
   (e: "update-table", table: DiagramTable): void;
   (e: "delete-draft-table", tableName: string): void;
+  (e: "delete-live-table", tableName: string): void;
   (e: "update-relationship", payload: { id: string; patch: Partial<CustomDiagramRelationship> }): void;
   (e: "remove-relationship", id: string): void;
   (e: "save-relationship", payload: Omit<CustomDiagramRelationship, "id"> & { id?: string }): void;
@@ -42,6 +43,7 @@ type InspectorTab = "fields" | "indexes";
 
 const tableTab = ref<InspectorTab>("fields");
 const confirmingDelete = ref(false);
+const confirmingDropTable = ref(false);
 
 const relationshipDraft = reactive({
   sourceTable: "",
@@ -82,12 +84,22 @@ const editable = computed(() => selectedTable.value != null && isDraftTable(sele
 const isLive = computed(() => selectedTable.value != null && !isDraftTable(selectedTable.value));
 const canAddField = computed(() => selectedTable.value != null);
 const showLivePendingHint = computed(() => isLive.value && selectedTable.value != null);
+const canDropLiveColumn = computed(() => isLive.value && adapter.value.supportsDropColumn);
 
 function isColumnEditable(columnName: string): boolean {
   const table = selectedTable.value;
   if (!table) return false;
+  if (isDroppedColumn(table, columnName)) return false;
   if (isDraftTable(table)) return true;
   return isPendingColumn(table, columnName);
+}
+
+function canRemoveColumn(columnName: string): boolean {
+  const table = selectedTable.value;
+  if (!table) return false;
+  if (isDraftTable(table)) return true;
+  if (isPendingColumn(table, columnName)) return true;
+  return canDropLiveColumn.value;
 }
 
 const tableIndexes = computed(() => (selectedTable.value?.indexes ?? []).filter((index) => !index.markedForDrop));
@@ -107,6 +119,7 @@ watch(
   () => props.target,
   () => {
     tableTab.value = "fields";
+    confirmingDropTable.value = false;
   },
 );
 
@@ -144,6 +157,8 @@ function patchTable(mutator: (table: DiagramTable) => void, options?: { requireD
       includedColumns: [...index.includedColumns],
     })),
     pendingColumnNames: table.pendingColumnNames ? [...table.pendingColumnNames] : undefined,
+    droppedColumnNames: table.droppedColumnNames ? [...table.droppedColumnNames] : undefined,
+    pendingDrop: table.pendingDrop,
   };
   mutator(next);
   emit("update-table", next);
@@ -190,18 +205,49 @@ function removeColumn(index: number) {
   const table = selectedTable.value;
   if (!table) return;
   const removed = table.columns[index]?.name;
-  if (!removed || !isColumnEditable(removed)) return;
+  if (!removed || !canRemoveColumn(removed)) return;
+
+  // Pending add / draft: hard delete (no DB impact yet).
+  if (isDraftTable(table) || isPendingColumn(table, removed)) {
+    patchTable((next) => {
+      next.columns.splice(index, 1);
+      if (next.pendingColumnNames) {
+        next.pendingColumnNames = next.pendingColumnNames.filter((name) => name !== removed);
+        if (next.pendingColumnNames.length === 0) delete next.pendingColumnNames;
+      }
+      if (!next.indexes) return;
+      for (const idx of next.indexes) {
+        idx.columns = idx.columns.filter((col) => col !== removed);
+      }
+    });
+    return;
+  }
+
+  // Live existing column: soft-mark for DROP COLUMN (toggle).
   patchTable((next) => {
-    next.columns.splice(index, 1);
-    if (next.pendingColumnNames) {
-      next.pendingColumnNames = next.pendingColumnNames.filter((name) => name !== removed);
-      if (next.pendingColumnNames.length === 0) delete next.pendingColumnNames;
+    const dropped = new Set(next.droppedColumnNames ?? []);
+    if (dropped.has(removed)) {
+      dropped.delete(removed);
+    } else {
+      dropped.add(removed);
     }
-    if (!next.indexes) return;
-    for (const idx of next.indexes) {
-      idx.columns = idx.columns.filter((col) => col !== removed);
-    }
+    next.droppedColumnNames = dropped.size ? [...dropped] : undefined;
   });
+}
+
+function requestDeleteLiveTable() {
+  confirmingDropTable.value = true;
+}
+
+function confirmDeleteLiveTable() {
+  const table = selectedTable.value;
+  if (!table || isDraftTable(table)) return;
+  confirmingDropTable.value = false;
+  emit("delete-live-table", table.name);
+}
+
+function cancelDeleteLiveTable() {
+  confirmingDropTable.value = false;
 }
 
 function addIndex() {
@@ -363,7 +409,8 @@ const dataTypeOptionsForColumn = computed(() => {
           <template v-else-if="selectedEdge">{{ t("diagram.inspectorRelationship") }}</template>
         </h3>
         <Badge v-if="selectedTable && editable" variant="outline" class="h-5 shrink-0 text-[10px]">Draft</Badge>
-        <Badge v-else-if="selectedTable && hasPendingColumns(selectedTable)" variant="outline" class="h-5 shrink-0 text-[10px]">{{ t("diagram.pendingColumnsBadge") }}</Badge>
+        <Badge v-else-if="selectedTable && selectedTable.pendingDrop" variant="destructive" class="h-5 shrink-0 text-[10px]">{{ t("diagram.pendingDropTableBadge") }}</Badge>
+        <Badge v-else-if="selectedTable && (hasPendingColumns(selectedTable) || hasDroppedColumns(selectedTable))" variant="outline" class="h-5 shrink-0 text-[10px]">{{ t("diagram.pendingColumnsBadge") }}</Badge>
       </div>
       <button type="button" class="p-1.5 rounded-md hover:bg-muted transition-colors" @click="emit('close')">
         <X class="h-4 w-4 text-muted-foreground" />
@@ -397,11 +444,12 @@ const dataTypeOptionsForColumn = computed(() => {
           <p v-if="showLivePendingHint" class="text-[11px] text-muted-foreground">{{ t("diagram.liveTableAddColumnsHint") }}</p>
 
           <div class="space-y-2">
-            <div v-for="(col, index) in selectedTable.columns" :key="`field-${index}`" class="rounded border border-border/80 p-2 space-y-1.5">
+            <div v-for="(col, index) in selectedTable.columns" :key="`field-${index}`" class="rounded border p-2 space-y-1.5" :class="isDroppedColumn(selectedTable, col.name) ? 'border-destructive/50 bg-destructive/5 opacity-70' : 'border-border/80'">
               <div class="flex items-center gap-1">
                 <KeyRound v-if="col.is_primary_key" class="h-3 w-3 shrink-0 text-amber-500" />
-                <Input class="h-7 flex-1 font-mono text-[11px]" :model-value="col.name" :disabled="!isColumnEditable(col.name)" @update:model-value="(v: string | number) => updateColumn(index, { name: String(v) })" />
-                <button v-if="isColumnEditable(col.name)" type="button" class="rounded p-1 hover:bg-muted" :title="t('diagram.deleteField')" @click="removeColumn(index)">
+                <Input class="h-7 flex-1 font-mono text-[11px]" :class="isDroppedColumn(selectedTable, col.name) ? 'line-through' : ''" :model-value="col.name" :disabled="!isColumnEditable(col.name)" @update:model-value="(v: string | number) => updateColumn(index, { name: String(v) })" />
+                <Badge v-if="isDroppedColumn(selectedTable, col.name)" variant="outline" class="h-5 shrink-0 text-[10px] text-destructive">{{ t("diagram.pendingDropColumnBadge") }}</Badge>
+                <button v-if="canRemoveColumn(col.name)" type="button" class="rounded p-1 hover:bg-muted" :title="isDroppedColumn(selectedTable, col.name) ? t('diagram.undoDropField') : t('diagram.deleteField')" @click="removeColumn(index)">
                   <Trash2 class="h-3 w-3 text-red-500" />
                 </button>
               </div>
@@ -497,6 +545,22 @@ const dataTypeOptionsForColumn = computed(() => {
         <Button v-if="editable" type="button" variant="destructive" size="sm" class="w-full h-8 text-xs" @click="emit('delete-draft-table', selectedTable.name)">
           {{ t("diagram.deleteDraftTable") }}
         </Button>
+
+        <template v-else-if="isLive">
+          <div v-if="!confirmingDropTable" class="space-y-1">
+            <Button type="button" variant="destructive" size="sm" class="w-full h-8 text-xs" @click="requestDeleteLiveTable">
+              {{ t("diagram.deleteLiveTable") }}
+            </Button>
+            <p class="text-[10px] text-muted-foreground">{{ t("diagram.deleteLiveTableHint") }}</p>
+          </div>
+          <div v-else class="space-y-2 rounded border border-destructive/40 bg-destructive/5 p-2">
+            <p class="text-[11px] text-destructive">{{ t("diagram.deleteLiveTableConfirm") }}</p>
+            <div class="flex gap-2">
+              <Button type="button" variant="destructive" size="sm" class="h-7 flex-1 text-[11px]" @click="confirmDeleteLiveTable">{{ t("common.confirm") }}</Button>
+              <Button type="button" variant="outline" size="sm" class="h-7 flex-1 text-[11px]" @click="cancelDeleteLiveTable">{{ t("common.cancel") }}</Button>
+            </div>
+          </div>
+        </template>
       </template>
 
       <template v-else-if="selectedEdge">

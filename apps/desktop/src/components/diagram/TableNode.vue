@@ -4,7 +4,7 @@ import { Handle, Position } from "@vue-flow/core";
 import { Table2, KeyRound, Link2 } from "@lucide/vue";
 import { Badge } from "@/components/ui/badge";
 import type { DiagramTable, DiagramRelationship } from "@/lib/diagram/erDiagram";
-import { isDraftTable } from "@/lib/diagram/erDiagram";
+import { isDraftTable, isDroppedColumn } from "@/lib/diagram/erDiagram";
 import type { InferredRelationship } from "@/types/diagram";
 import { useLayerStore } from "@/lib/diagram/layer-store";
 import { CARD_WIDTH, COLUMN_TYPE_WIDTH, COLUMN_NAME_MAX_CHARS, COLUMN_TYPE_MAX_CHARS, TABLE_NAME_MAX_CHARS, EDGE_HANDLE_OUTSET } from "@/lib/diagram/diagram-constants";
@@ -25,7 +25,7 @@ const emit = defineEmits<{
 const isDraft = computed(() => isDraftTable(props.data.table));
 
 function visibleColumns(table: DiagramTable) {
-  return table.columns;
+  return table.columns.filter((column) => !isDroppedColumn(table, column.name));
 }
 
 function isForeignKeyColumn(table: DiagramTable, columnName: string): boolean {
@@ -73,7 +73,7 @@ const handleOffsetStyle = computed(() =>
           {{ truncateLabel(data.table.name, TABLE_NAME_MAX_CHARS) }}
         </span>
         <Badge v-if="isDraft" variant="outline" class="h-5 shrink-0 px-1.5 text-[10px] border-amber-500/50 text-amber-700 dark:text-amber-400">Draft</Badge>
-        <Badge variant="outline" class="h-5 px-1.5 text-[10px]">{{ data.table.columns.length }}</Badge>
+        <Badge variant="outline" class="h-5 px-1.5 text-[10px]">{{ visibleColumns(data.table).length }}</Badge>
       </div>
       <div>
         <div v-for="column in visibleColumns(data.table)" :key="column.name" class="flex h-6 min-w-0 items-center gap-1.5 border-b border-border/40 px-3 text-xs last:border-b-0">

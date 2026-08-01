@@ -123,3 +123,53 @@ test("applyLiveTablePatches skips case-insensitive name collisions", () => {
   assert.equal(merged[0].columns.length, 2);
   assert.deepEqual(merged[0].pendingColumnNames, ["nickname"]);
 });
+
+test("save/load persists dropped columns and pendingDrop", () => {
+  const tables: DiagramTable[] = [
+    {
+      ...liveTable("users", [col("id"), col("nickname")]),
+      droppedColumnNames: ["nickname"],
+    },
+    {
+      ...liveTable("orders", [col("id")]),
+      pendingDrop: true,
+    },
+  ];
+  saveLiveTablePatches(tables, "c1", "db", "public");
+  const loaded = loadLiveTablePatches("c1", "db", "public");
+  assert.equal(loaded.length, 2);
+  const users = loaded.find((p) => p.tableName === "users");
+  const orders = loaded.find((p) => p.tableName === "orders");
+  assert.deepEqual(users?.droppedColumnNames, ["nickname"]);
+  assert.equal(orders?.pendingDrop, true);
+});
+
+test("applyLiveTablePatches restores dropped columns and pendingDrop", () => {
+  const tables = [liveTable("users", [col("id"), col("nickname")]), liveTable("orders", [col("id")])];
+  const merged = applyLiveTablePatches(tables, [
+    { tableName: "users", pendingColumns: [], droppedColumnNames: ["nickname"] },
+    { tableName: "orders", pendingColumns: [], pendingDrop: true },
+  ]);
+  assert.deepEqual(merged[0].droppedColumnNames, ["nickname"]);
+  assert.equal(merged[1].pendingDrop, true);
+});
+
+test("liveTableToAlterSqlOptions marks dropped columns for drop", () => {
+  const table: DiagramTable = {
+    ...liveTable("users", [col("id", "bigint"), col("nickname")]),
+    droppedColumnNames: ["nickname"],
+  };
+  const options = liveTableToAlterSqlOptions(table, "postgres", "public");
+  assert.equal(options.columns[0].markedForDrop, false);
+  assert.ok(options.columns[0].original);
+  assert.equal(options.columns[1].markedForDrop, true);
+  assert.ok(options.columns[1].original);
+});
+
+test("validateLivePendingColumns catches missing dropped column", () => {
+  const table: DiagramTable = {
+    ...liveTable("users", [col("id")]),
+    droppedColumnNames: ["ghost"],
+  };
+  assert.ok(validateLivePendingColumns(table).some((e) => e.includes("dropped column") && e.includes("is missing")));
+});

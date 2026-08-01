@@ -57,6 +57,20 @@ test("toVueFlowNodes filters tables on hidden layers", () => {
   assert.deepEqual(nodes.map((n) => n.id).sort(), ["orders", "orphan"]);
 });
 
+test("toVueFlowNodes hides tables marked pendingDrop", () => {
+  const nodes = toVueFlowNodes(
+    [
+      { ...table("users"), pendingDrop: true },
+      table("orders"),
+    ],
+    {
+      users: { x: 10, y: 10 },
+      orders: { x: 20, y: 20 },
+    },
+  );
+  assert.deepEqual(nodes.map((n) => n.id), ["orders"]);
+});
+
 test("toVueFlowEdges filters when either endpoint layer is hidden", () => {
   const store = useLayerStore();
   const hidden = store.addLayer("Hidden");
