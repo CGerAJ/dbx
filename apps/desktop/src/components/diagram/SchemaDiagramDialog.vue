@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { VueFlow, useVueFlow, type NodeChange, type EdgeChange, type NodeDragEvent, type EdgeMouseEvent, type NodeTypesObject, type EdgeTypesObject } from "@vue-flow/core";
+import { VueFlow, useVueFlow, type NodeChange, type EdgeChange, type NodeDragEvent, type EdgeMouseEvent, type NodeMouseEvent, type NodeTypesObject, type EdgeTypesObject } from "@vue-flow/core";
 import { Background } from "@vue-flow/background";
 import { MiniMap } from "@vue-flow/minimap";
 import "@vue-flow/core/dist/style.css";
@@ -17,18 +17,37 @@ import { useGraphStore } from "@/lib/diagram/graph-store";
 import * as api from "@/lib/backend/api";
 import { DIAGRAM_SQL_TYPES, isSchemaAware as isSchemaAwareDatabase } from "@/lib/database/databaseCapabilities";
 import { databaseOptionsForConnection } from "@/composables/useDatabaseOptions";
-import { buildDiagramJoinSql, buildDiagramRelationships, filterDiagramTables, layoutDiagramTables, mergeRelationshipsWithInferred, normalizeCustomDiagramRelationship, type CustomDiagramRelationship, type DiagramPosition, type DiagramTable } from "@/lib/diagram/erDiagram";
+import {
+  buildDiagramJoinSql,
+  buildDiagramRelationships,
+  filterDiagramTables,
+  layoutDiagramTables,
+  mergeRelationshipsWithInferred,
+  normalizeCustomDiagramRelationship,
+  type CustomDiagramRelationship,
+  type DiagramPosition,
+  type DiagramTable,
+  isDraftTable,
+  needsDiagramSync,
+} from "@/lib/diagram/erDiagram";
+import { createDraftTable } from "@/lib/diagram/draft-table";
+import { cardinalityPairFromChoice } from "@/lib/diagram/cardinality";
+import { loadDraftTables, saveDraftTables, loadPersistedLayers, savePersistedLayers, loadPersistedPositions, savePersistedPositions, hasUsablePersistedPositions, loadLiveTablePatches, saveLiveTablePatches, applyLiveTablePatches } from "@/lib/diagram/draft-storage";
+import type { InspectorTarget } from "@/types/diagram";
+import DiagramInspector from "./DiagramInspector.vue";
+import DiagramSyncDialog from "./DiagramSyncDialog.vue";
+import CreateDraftTableDialog from "./CreateDraftTableDialog.vue";
 import { buildEngineeringDiagram } from "@/lib/diagram/engineeringDiagram";
-import { buildEngineeringDiagramSvg, buildTableDiagramSvg, buildTableRelationshipPaths, computeTableDiagramCanvas } from "@/lib/export/diagramSvgExport";
+import { buildEngineeringDiagramSvg, buildTableDiagramSvg, buildTableRelationshipPolylines, computeTableDiagramCanvas } from "@/lib/export/diagramSvgExport";
+import { pointsToSvgPath } from "@/lib/diagram/edge-obstacle-router";
 import { buildDiagramDbml, buildDiagramJson, buildDiagramMermaid, diagramExportFileName, svgToPngBlob, type DiagramExportFormat } from "@/lib/export/diagramFormats";
 import { saveDiagramBinaryExport, saveDiagramTextExport } from "@/lib/export/saveDiagramExport";
 import { inferRelationships, filterByStorage } from "@/lib/diagram/match-engine";
 import { loadMatchConfirms, saveMatchConfirms, loadMatchIgnores, saveMatchIgnores, isAutoMatchEnabled } from "@/lib/diagram/match-storage";
-import { toVueFlowNodes, toVueFlowEdges, toDiagramEdges, toVueFlowLayerNodes, toAbsolutePosition } from "@/lib/diagram/vue-flow-adapter";
-import { CARD_WIDTH, CARD_HEADER_HEIGHT, COLUMN_ROW_HEIGHT, CARD_BOTTOM_PADDING, GAP_X, GAP_Y, MARGIN, columnsPerRowForWidth, DIAGRAM_HOVERED_EDGE_KEY, DIAGRAM_EDGE_OBSTACLES_KEY } from "@/lib/diagram/diagram-constants";
-import { createEdgePopoverScheduler } from "@/lib/diagram/edge-popover-schedule";
+import { toVueFlowNodes, toVueFlowEdges, toDiagramEdges, toVueFlowLayerNodes, toAbsolutePosition, isTableCanvasVisible } from "@/lib/diagram/vue-flow-adapter";
+import { CARD_WIDTH, CARD_HEADER_HEIGHT, COLUMN_ROW_HEIGHT, CARD_BOTTOM_PADDING, GAP_X, GAP_Y, MARGIN, LAYER_CONTENT_PADDING, LAYER_HEADER_HEIGHT, columnsPerRowForWidth, DIAGRAM_HOVERED_EDGE_KEY, DIAGRAM_EDGE_OBSTACLES_KEY } from "@/lib/diagram/diagram-constants";
 import { sizeLayerToFit, findLayerAtPoint, placeNewLayer } from "@/lib/diagram/size-layer";
-import { orderTablesByConnectivity } from "@/lib/diagram/ltr-auto-layout";
+import { computeLtrAutoLayout, orderTablesByConnectivity } from "@/lib/diagram/ltr-auto-layout";
 import { computeLayoutWithLayers } from "@/lib/diagram/elk-layout";
 import type { ObstacleRect, Point } from "@/lib/diagram/edge-obstacle-router";
 import type { DiagramNode, DiagramEdge, MatchResult, LayerLayoutMode, HistorySnapshot } from "@/types/diagram";
@@ -39,7 +58,6 @@ import { copyToClipboard } from "@/lib/common/clipboard";
 import TableNode from "./TableNode.vue";
 import LayerNode from "./LayerNode.vue";
 import RelationshipEdge from "./RelationshipEdge.vue";
-import EdgeRelationshipPopover from "./EdgeRelationshipPopover.vue";
 import MatchPanel from "./MatchPanel.vue";
 import DiagramToolbar from "./DiagramToolbar.vue";
 import LayerPanel from "./LayerPanel.vue";
@@ -56,147 +74,10 @@ const layerStore = useLayerStore();
 const { nodes, edges, applyNodeChanges, applyEdgeChanges, setNodes, setEdges, zoomIn: vfZoomIn, zoomOut: vfZoomOut, fitView } = useVueFlow();
 
 const diagramPaneRef = ref<HTMLElement | null>(null);
-const hoveredEdgeId = ref<string | null>(null);
-const pinnedEdgeId = ref<string | null>(null);
-const edgePopoverEditing = ref(false);
-const edgePopoverPos = ref({ x: 0, y: 0 });
-const edgePopoverHovering = ref(false);
 const edgeWaypoints = ref<Record<string, Point[]>>({});
 const edgeHandleHints = ref<Record<string, { sourceHandle?: string; targetHandle?: string }>>({});
 const highlightEdgeId = ref<string | null>(null);
 provide(DIAGRAM_HOVERED_EDGE_KEY, highlightEdgeId);
-
-const edgePopoverScheduler = createEdgePopoverScheduler();
-/** Position for the edge under cursor while open-delay is pending. */
-let pendingHoverPos = { x: 0, y: 0 };
-
-function syncHighlightEdgeId() {
-  highlightEdgeId.value = pinnedEdgeId.value || hoveredEdgeId.value;
-}
-
-function clientToPanePos(clientX: number, clientY: number): { x: number; y: number } {
-  const rect = diagramPaneRef.value?.getBoundingClientRect();
-  if (!rect) return { x: clientX, y: clientY };
-  return {
-    x: Math.min(Math.max(clientX - rect.left, 24), rect.width - 24),
-    y: Math.min(Math.max(clientY - rect.top, 24), rect.height - 24),
-  };
-}
-
-function clearEdgeLeaveTimer() {
-  edgePopoverScheduler.cancelClose();
-}
-
-function clearEdgeOpenTimer() {
-  edgePopoverScheduler.cancelOpen();
-}
-
-function scheduleEdgePopoverClose() {
-  edgePopoverScheduler.scheduleClose(
-    () => !(pinnedEdgeId.value || edgePopoverHovering.value),
-    () => {
-      hoveredEdgeId.value = null;
-      edgePopoverEditing.value = false;
-      syncHighlightEdgeId();
-    },
-  );
-}
-
-function showEdgePopover(edgeId: string, pos: { x: number; y: number }) {
-  hoveredEdgeId.value = edgeId;
-  edgePopoverPos.value = pos;
-  syncHighlightEdgeId();
-}
-
-function scheduleEdgePopoverOpen(edgeId: string, pos: { x: number; y: number }) {
-  pendingHoverPos = pos;
-  edgePopoverScheduler.scheduleOpen(edgeId, (id) => {
-    if (pinnedEdgeId.value && pinnedEdgeId.value !== id) return;
-    showEdgePopover(id, pendingHoverPos);
-  });
-}
-
-function handleEdgeMouseEnter(event: EdgeMouseEvent) {
-  clearEdgeLeaveTimer();
-  if (pinnedEdgeId.value && pinnedEdgeId.value !== event.edge.id) return;
-  const ev = event.event as MouseEvent;
-  const pos = clientToPanePos(ev.clientX, ev.clientY);
-  // Already showing this edge (or pinned): keep visible, refresh position
-  if (hoveredEdgeId.value === event.edge.id || pinnedEdgeId.value === event.edge.id) {
-    edgePopoverPos.value = pos;
-    syncHighlightEdgeId();
-    return;
-  }
-  scheduleEdgePopoverOpen(event.edge.id, pos);
-}
-
-function handleEdgeMouseMove(event: EdgeMouseEvent) {
-  if (pinnedEdgeId.value) return;
-  const ev = event.event as MouseEvent;
-  const pos = clientToPanePos(ev.clientX, ev.clientY);
-  if (edgePopoverScheduler.getPendingEdgeId() === event.edge.id) {
-    pendingHoverPos = pos;
-    return;
-  }
-  if (hoveredEdgeId.value !== event.edge.id) return;
-  edgePopoverPos.value = pos;
-}
-
-function handleEdgeMouseLeave() {
-  if (pinnedEdgeId.value) return;
-  clearEdgeOpenTimer();
-  if (hoveredEdgeId.value) scheduleEdgePopoverClose();
-}
-
-function handleEdgeClick(event: EdgeMouseEvent) {
-  clearEdgeLeaveTimer();
-  clearEdgeOpenTimer();
-  pinnedEdgeId.value = event.edge.id;
-  hoveredEdgeId.value = event.edge.id;
-  const ev = event.event as MouseEvent;
-  edgePopoverPos.value = clientToPanePos(ev.clientX, ev.clientY);
-  edgePopoverEditing.value = false;
-  syncHighlightEdgeId();
-}
-
-function handlePaneClick() {
-  clearEdgeOpenTimer();
-  if (!pinnedEdgeId.value && !hoveredEdgeId.value) return;
-  pinnedEdgeId.value = null;
-  hoveredEdgeId.value = null;
-  edgePopoverEditing.value = false;
-  edgePopoverHovering.value = false;
-  syncHighlightEdgeId();
-}
-
-function closeEdgePopover() {
-  clearEdgeOpenTimer();
-  pinnedEdgeId.value = null;
-  hoveredEdgeId.value = null;
-  edgePopoverEditing.value = false;
-  edgePopoverHovering.value = false;
-  syncHighlightEdgeId();
-}
-
-const activeEdgePopoverId = computed(() => pinnedEdgeId.value || hoveredEdgeId.value);
-
-const activeEdgeRelationship = computed(() => {
-  const id = activeEdgePopoverId.value;
-  if (!id) return null;
-  return visibleRelationships.value.find((r) => r.id === id) ?? null;
-});
-
-const edgePopoverVisible = computed(() => !!activeEdgeRelationship.value);
-
-function handleEdgePopoverEnter() {
-  clearEdgeLeaveTimer();
-  edgePopoverHovering.value = true;
-}
-
-function handleEdgePopoverLeave() {
-  edgePopoverHovering.value = false;
-  if (!pinnedEdgeId.value) scheduleEdgePopoverClose();
-}
 
 function clearWaypointsForTables(tableIds: string[]) {
   if (tableIds.length === 0) return;
@@ -273,6 +154,7 @@ function captureHistorySnapshot(): HistorySnapshot {
     edges: deepCloneJson(toDiagramEdges(toVueFlowEdges(visibleRelationships.value, positions.value))),
     positions: deepCloneJson(positions.value),
     layers: layerStore.toJSON(),
+    tables: deepCloneJson(tables.value),
     customRelationships: deepCloneJson(customRelationships.value),
     edgeWaypoints: deepCloneJson(edgeWaypoints.value),
     edgeHandleHints: deepCloneJson(edgeHandleHints.value),
@@ -299,6 +181,7 @@ function syncGraphStoreFromPositions() {
 function applyHistorySnapshot(snapshot: HistorySnapshot) {
   positions.value = deepCloneJson(snapshot.positions);
   layerStore.loadLayers(deepCloneJson(snapshot.layers));
+  tables.value = deepCloneJson(snapshot.tables ?? []);
   customRelationships.value = deepCloneJson(snapshot.customRelationships);
   edgeWaypoints.value = deepCloneJson(snapshot.edgeWaypoints);
   edgeHandleHints.value = deepCloneJson(snapshot.edgeHandleHints ?? {});
@@ -306,8 +189,17 @@ function applyHistorySnapshot(snapshot: HistorySnapshot) {
   matchIgnores.value = [...(snapshot.matchIgnores ?? [])];
   graphStore.setNodes(deepCloneJson(snapshot.nodes));
   graphStore.setEdges(deepCloneJson(snapshot.edges));
+  if (inspectorTarget.value?.kind === "table" && !tables.value.some((t) => t.name === inspectorTarget.value!.tableName)) {
+    inspectorTarget.value = null;
+  }
+  if (inspectorTarget.value?.kind === "edge") {
+    const edgeId = inspectorTarget.value.edgeId;
+    const edgeExists = customRelationships.value.some((r) => r.id === edgeId) || matchResult.value.relationships.some((r) => r.id === edgeId) || snapshot.edges.some((e) => e.id === edgeId);
+    if (!edgeExists) inspectorTarget.value = null;
+  }
   saveCustomRelationships();
   saveMatchData();
+  persistDraftAndLayers();
   refreshMatchResult();
   fitAllFreeLayers();
   syncVueFlowNodes();
@@ -354,6 +246,7 @@ async function handleNodeDragStop(event: NodeDragEvent) {
     clearWaypointsForTables(layer?.tableNames ?? []);
     syncGraphStoreFromPositions();
     syncVueFlowNodes();
+    persistDraftAndLayers();
     return;
   }
 
@@ -381,6 +274,7 @@ async function handleNodeDragStop(event: NodeDragEvent) {
   clearWaypointsForTables([node.id]);
   syncGraphStoreFromPositions();
   syncVueFlowNodes();
+  persistDraftAndLayers();
 }
 
 const props = defineProps<{
@@ -444,6 +338,25 @@ async function setDiagramMode(mode: "table" | "engineering") {
 const showMatchPanel = ref(false);
 const showLayersPanel = ref(true);
 const showManualAdd = ref(false);
+const showCreateTableDialog = ref(false);
+const showSyncDialog = ref(false);
+const inspectorTarget = ref<InspectorTarget>(null);
+
+function syncHighlightEdgeId() {
+  highlightEdgeId.value = inspectorTarget.value?.kind === "edge" ? inspectorTarget.value.edgeId : null;
+}
+
+function handleEdgeClick(event: EdgeMouseEvent) {
+  showMatchPanel.value = false;
+  inspectorTarget.value = { kind: "edge", edgeId: event.edge.id };
+  syncHighlightEdgeId();
+}
+
+function handlePaneClick() {
+  inspectorTarget.value = null;
+  syncHighlightEdgeId();
+}
+
 const matchResult = ref<MatchResult>({ relationships: [], conflicts: [], pending: [], stats: { total: 0, high: 0, medium: 0 } });
 const matchConfirms = ref<string[]>([]);
 const matchIgnores = ref<string[]>([]);
@@ -521,9 +434,14 @@ const visibleRelationships = computed(() => {
   return mergeRelationshipsWithInferred(baseRelationships, inferredVisible);
 });
 
+/** Tables/edges currently drawn on the canvas (excludes members of hidden layers). */
+const canvasVisibleTables = computed(() => visibleTables.value.filter((table) => isTableCanvasVisible(table.name, layerStore.layers)));
+
+const canvasVisibleRelationships = computed(() => visibleRelationships.value.filter((rel) => isTableCanvasVisible(rel.sourceTable, layerStore.layers) && isTableCanvasVisible(rel.targetTable, layerStore.layers)));
+
 const edgeObstacles = computed<ObstacleRect[]>(() => {
   const rects: ObstacleRect[] = [];
-  for (const table of visibleTables.value) {
+  for (const table of canvasVisibleTables.value) {
     const pos = positions.value[table.name];
     if (!pos) continue;
     rects.push({
@@ -553,6 +471,8 @@ provide(DIAGRAM_EDGE_OBSTACLES_KEY, edgeObstacles);
 
 const diagramReady = computed(() => !!connectionId.value && !!database.value && (!isSchemaAware.value || !!schema.value));
 
+const showRightPanel = computed(() => diagramReady.value && (showMatchPanel.value || !!inspectorTarget.value));
+
 const loadingText = computed(() => (totalTableCount.value > 0 ? t("diagram.loadingProgress", { loaded: loadedTableCount.value, total: totalTableCount.value }) : t("diagram.loading")));
 
 const sourceColumns = computed(() => tableMap.value.get(relationshipDraft.value.sourceTable)?.columns ?? []);
@@ -572,7 +492,7 @@ function tableHeight(table: DiagramTable): number {
 const canvasSize = computed(() => {
   let width = 960;
   let height = 540;
-  for (const table of visibleTables.value) {
+  for (const table of canvasVisibleTables.value) {
     const position = positions.value[table.name];
     if (!position) continue;
     width = Math.max(width, position.x + CARD_WIDTH + 80);
@@ -586,9 +506,13 @@ const engineeringDiagram = computed(() => buildEngineeringDiagram(visibleTables.
 const activeCanvasSize = computed(() => (diagramMode.value === "engineering" ? engineeringDiagram.value.canvas : canvasSize.value));
 
 async function resetLayout(options?: { skipHistory?: boolean }) {
-  const count = visibleTables.value.length;
-  if (count === 0) {
+  const layoutTables = canvasVisibleTables.value;
+  if (visibleTables.value.length === 0) {
     positions.value = {};
+    syncVueFlowNodes();
+    return;
+  }
+  if (layoutTables.length === 0) {
     syncVueFlowNodes();
     return;
   }
@@ -598,20 +522,38 @@ async function resetLayout(options?: { skipHistory?: boolean }) {
   // Wait for pane to have real dimensions before measuring width
   await nextTick();
   const paneWidth = diagramPaneWidth();
-  const ordered = orderTablesByConnectivity(visibleTables.value, visibleRelationships.value);
-  positions.value = layoutDiagramTables(ordered, {
+  const ordered = orderTablesByConnectivity(layoutTables, canvasVisibleRelationships.value);
+  const laidOut = layoutDiagramTables(ordered, {
     columnsPerRow: columnsPerRowForWidth(paneWidth),
     cardWidth: CARD_WIDTH,
     gapX: GAP_X,
     gapY: GAP_Y,
     margin: MARGIN,
   });
-  edgeWaypoints.value = {};
-  edgeHandleHints.value = {};
+  // Freeze positions for tables in hidden layers
+  const nextPositions: Record<string, DiagramPosition> = { ...positions.value };
+  for (const table of layoutTables) {
+    const pos = laidOut[table.name];
+    if (pos) nextPositions[table.name] = pos;
+  }
+  positions.value = nextPositions;
+  // Drop waypoints only for edges still on canvas; keep frozen hidden-end edges
+  const canvasEdgeIds = new Set(canvasVisibleRelationships.value.map((r) => r.id));
+  const nextWaypoints: Record<string, Point[]> = {};
+  const nextHandleHints: Record<string, { sourceHandle?: string; targetHandle?: string }> = {};
+  for (const [id, wp] of Object.entries(edgeWaypoints.value)) {
+    if (!canvasEdgeIds.has(id)) nextWaypoints[id] = wp;
+  }
+  for (const [id, hint] of Object.entries(edgeHandleHints.value)) {
+    if (!canvasEdgeIds.has(id)) nextHandleHints[id] = hint;
+  }
+  edgeWaypoints.value = nextWaypoints;
+  edgeHandleHints.value = nextHandleHints;
   fitAllFreeLayers();
   syncVueFlowNodes();
   await nextTick();
   fitDiagramView();
+  persistDraftAndLayers();
 }
 
 function handleAddLayer() {
@@ -621,35 +563,41 @@ function handleAddLayer() {
     width: placement.width,
     height: placement.height,
   });
+  persistDraftAndLayers();
   syncVueFlowNodes();
 }
 
 function handleLayerChanged() {
   fitAllLayers();
+  persistDraftAndLayers();
   syncVueFlowNodes();
 }
 
 async function applyAutoLayout(options?: { skipHistory?: boolean }) {
   await nextTick();
-  if (visibleTables.value.length === 0) return;
+  const layoutTables = canvasVisibleTables.value;
+  if (layoutTables.length === 0) return;
 
   if (!options?.skipHistory) recordHistory();
 
-  const diagramNodes: DiagramNode[] = visibleTables.value.map((table) => ({
+  const diagramNodes: DiagramNode[] = layoutTables.map((table) => ({
     id: table.name,
     type: "table",
     position: positions.value[table.name] ? { ...positions.value[table.name] } : { x: 0, y: 0 },
     data: { table },
   }));
-  const diagramEdges: DiagramEdge[] = visibleRelationships.value.map((rel) => ({
+  const diagramEdges: DiagramEdge[] = canvasVisibleRelationships.value.map((rel) => ({
     id: rel.id,
     source: rel.sourceTable,
     target: rel.targetTable,
     data: { relationship: rel },
   }));
 
-  const result = await computeLayoutWithLayers(diagramNodes, diagramEdges, layerStore.layers);
+  // Only pass visible layers into ELK so hidden layers are not reflowed
+  const layoutLayers = layerStore.layers.filter((l) => l.visible);
+  const result = await computeLayoutWithLayers(diagramNodes, diagramEdges, layoutLayers);
 
+  // Freeze positions for tables in hidden layers
   const nextPositions: Record<string, DiagramPosition> = { ...positions.value };
   for (const node of result.nodes) {
     nextPositions[node.id] = { ...node.position };
@@ -664,8 +612,16 @@ async function applyAutoLayout(options?: { skipHistory?: boolean }) {
     layer.height = layout.height;
   }
 
+  const canvasEdgeIds = new Set(canvasVisibleRelationships.value.map((r) => r.id));
   const nextWaypoints: Record<string, Point[]> = {};
   const nextHandleHints: Record<string, { sourceHandle?: string; targetHandle?: string }> = {};
+  // Keep waypoints for edges that touch hidden tables
+  for (const [id, wp] of Object.entries(edgeWaypoints.value)) {
+    if (!canvasEdgeIds.has(id)) nextWaypoints[id] = wp;
+  }
+  for (const [id, hint] of Object.entries(edgeHandleHints.value)) {
+    if (!canvasEdgeIds.has(id)) nextHandleHints[id] = hint;
+  }
   for (const edge of result.edges) {
     if (edge.waypoints && edge.waypoints.length >= 2) {
       nextWaypoints[edge.id] = edge.waypoints.map((p) => ({ x: p.x, y: p.y }));
@@ -685,6 +641,21 @@ async function applyAutoLayout(options?: { skipHistory?: boolean }) {
   syncVueFlowNodes();
   await nextTick();
   fitDiagramView();
+  persistDraftAndLayers();
+}
+
+async function handleFocusLayer(layerId: string) {
+  const layer = layerStore.layers.find((l) => l.id === layerId);
+  if (!layer) return;
+  layerStore.setActiveLayer(layerId);
+  if (!layer.visible) {
+    toast(t("diagram.layerHiddenCannotFocus"), 3000);
+    return;
+  }
+  if (diagramMode.value !== "table") return;
+  await nextTick();
+  const nodeIds = [layerId, ...layer.tableNames];
+  void fitView({ nodes: nodeIds, ...FIT_VIEW_OPTIONS });
 }
 
 async function handleLayerLayoutModeChanged(payload: { layerId: string; layoutMode: LayerLayoutMode }) {
@@ -702,6 +673,11 @@ async function handleLayerLayoutModeChanged(payload: { layerId: string; layoutMo
 }
 
 function openTableData(tableName: string) {
+  const table = tables.value.find((t) => t.name === tableName);
+  if (table && isDraftTable(table)) {
+    openInspectorForTable(tableName);
+    return;
+  }
   if (!connectionId.value || !database.value || !tableName) return;
   emit("open-target", {
     connectionId: connectionId.value,
@@ -710,6 +686,138 @@ function openTableData(tableName: string) {
     tableName,
     tableType: "TABLE",
   });
+}
+
+const draftTableCount = computed(() => tables.value.filter(needsDiagramSync).length);
+
+function persistDraftAndLayers() {
+  if (!connectionId.value || !database.value) return;
+  const schemaKey = schema.value || "";
+  saveDraftTables(tables.value, connectionId.value, database.value, schemaKey);
+  saveLiveTablePatches(tables.value, connectionId.value, database.value, schemaKey);
+  savePersistedLayers(layerStore.toJSON(), connectionId.value, database.value, schemaKey);
+  savePersistedPositions(positions.value, connectionId.value, database.value, schemaKey);
+}
+
+function openInspectorForTable(tableName: string) {
+  showMatchPanel.value = false;
+  inspectorTarget.value = { kind: "table", tableName };
+  syncHighlightEdgeId();
+}
+
+function handleNodeClick(event: NodeMouseEvent) {
+  if (event.node.type === "layer") return;
+  openInspectorForTable(event.node.id);
+}
+
+function handleCreateDraftTable(payload: { name: string; layerId: string | null; withDefaultId: boolean }) {
+  recordHistory();
+  const draft = createDraftTable(payload.name, { withDefaultId: payload.withDefaultId, databaseType: selectedConnection.value?.db_type });
+  tables.value = [...tables.value, draft];
+  const targetLayerId = payload.layerId || layerStore.activeLayerId;
+  const targetLayer = targetLayerId ? layerStore.layers.find((l) => l.id === targetLayerId) : undefined;
+
+  let x: number;
+  let y: number;
+  if (targetLayer?.position) {
+    const memberPositions = targetLayer.tableNames.map((name) => positions.value[name]).filter((pos): pos is DiagramPosition => !!pos);
+    const heights = tableHeightsMap();
+    if (memberPositions.length === 0) {
+      x = targetLayer.position.x + LAYER_CONTENT_PADDING;
+      y = targetLayer.position.y + LAYER_HEADER_HEIGHT + LAYER_CONTENT_PADDING;
+    } else {
+      let maxBottom = targetLayer.position.y + LAYER_HEADER_HEIGHT;
+      let leftMost = targetLayer.position.x + LAYER_CONTENT_PADDING;
+      for (const name of targetLayer.tableNames) {
+        const pos = positions.value[name];
+        if (!pos) continue;
+        leftMost = Math.min(leftMost, pos.x);
+        maxBottom = Math.max(maxBottom, pos.y + (heights[name] ?? 120));
+      }
+      x = leftMost;
+      y = maxBottom + GAP_Y / 2;
+    }
+  } else {
+    x = MARGIN + (Object.keys(positions.value).length % 3) * (CARD_WIDTH + GAP_X);
+    y = MARGIN + Math.floor(Object.keys(positions.value).length / 3) * 200;
+  }
+
+  positions.value = { ...positions.value, [draft.name]: { x, y } };
+  if (targetLayerId) {
+    layerStore.addTableToLayer(targetLayerId, draft.name);
+    const layer = layerStore.layers.find((l) => l.id === targetLayerId);
+    if (layer) sizeLayerToFit(layer, positions.value, tableHeightsMap());
+  }
+  persistDraftAndLayers();
+  syncVueFlowNodes();
+  openInspectorForTable(draft.name);
+}
+
+function handleInspectorUpdateTable(next: DiagramTable) {
+  recordHistory();
+  const targetName = inspectorTarget.value?.kind === "table" ? inspectorTarget.value.tableName : next.name;
+  const oldName = tables.value.find((t) => t.name === targetName)?.name;
+  if (!oldName) return;
+  tables.value = tables.value.map((t) => (t.name === oldName ? next : t));
+  if (oldName !== next.name) {
+    const pos = positions.value[oldName];
+    const { [oldName]: _removed, ...rest } = positions.value;
+    positions.value = pos ? { ...rest, [next.name]: pos } : rest;
+    for (const layer of layerStore.layers) {
+      const idx = layer.tableNames.indexOf(oldName);
+      if (idx >= 0) layer.tableNames[idx] = next.name;
+    }
+    customRelationships.value = customRelationships.value.map((r) => ({
+      ...r,
+      sourceTable: r.sourceTable === oldName ? next.name : r.sourceTable,
+      targetTable: r.targetTable === oldName ? next.name : r.targetTable,
+    }));
+    saveCustomRelationships();
+    inspectorTarget.value = { kind: "table", tableName: next.name };
+  }
+  persistDraftAndLayers();
+  const layer = layerStore.getLayerByTable(next.name);
+  if (layer) sizeLayerToFit(layer, positions.value, tableHeightsMap());
+  syncVueFlowNodes();
+}
+
+function handleDeleteDraftTable(tableName: string) {
+  recordHistory();
+  tables.value = tables.value.filter((t) => t.name !== tableName);
+  const { [tableName]: _removed, ...rest } = positions.value;
+  positions.value = rest;
+  const layer = layerStore.getLayerByTable(tableName);
+  if (layer) {
+    layerStore.removeTableFromLayer(layer.id, tableName);
+    sizeLayerToFit(layer, positions.value, tableHeightsMap());
+  }
+  customRelationships.value = customRelationships.value.filter((r) => r.sourceTable !== tableName && r.targetTable !== tableName);
+  saveCustomRelationships();
+  if (inspectorTarget.value?.kind === "table" && inspectorTarget.value.tableName === tableName) {
+    inspectorTarget.value = null;
+  }
+  persistDraftAndLayers();
+  syncVueFlowNodes();
+}
+
+function handleInspectorRemoveRelationship(id: string) {
+  recordHistory();
+  customRelationships.value = customRelationships.value.filter((r) => r.id !== id);
+  matchConfirms.value = matchConfirms.value.filter((x) => x !== id);
+  if (!matchIgnores.value.includes(id)) matchIgnores.value = [...matchIgnores.value, id];
+  saveCustomRelationships();
+  saveMatchData();
+  refreshMatchResult();
+  if (inspectorTarget.value?.kind === "edge" && inspectorTarget.value.edgeId === id) {
+    inspectorTarget.value = null;
+  }
+  syncHighlightEdgeId();
+  syncVueFlowNodes();
+}
+
+async function handleSyncedDraftTables(_names: string[]) {
+  toast(t("diagram.syncToDatabase"), 2000);
+  await loadDiagram();
 }
 
 function syncVueFlowNodes() {
@@ -886,6 +994,8 @@ function refreshMatchResult() {
 function handleToggleMatchPanel() {
   showMatchPanel.value = !showMatchPanel.value;
   if (showMatchPanel.value) {
+    inspectorTarget.value = null;
+    syncHighlightEdgeId();
     updateRelationshipDraftDefaults();
     refreshMatchResult();
     syncVueFlowNodes();
@@ -897,10 +1007,7 @@ function defaultRelationshipName(relationship: Omit<CustomDiagramRelationship, "
 }
 
 function relationshipCardinality(): Pick<CustomDiagramRelationship, "sourceCardinality" | "targetCardinality"> {
-  if (relationshipDraft.value.cardinality === "one-to-one") return { sourceCardinality: "1", targetCardinality: "1" };
-  if (relationshipDraft.value.cardinality === "many-to-one") return { sourceCardinality: "N", targetCardinality: "1" };
-  if (relationshipDraft.value.cardinality === "many-to-many") return { sourceCardinality: "N", targetCardinality: "N" };
-  return { sourceCardinality: "1", targetCardinality: "N" };
+  return cardinalityPairFromChoice(relationshipDraft.value.cardinality);
 }
 
 function updateRelationshipDraftDefaults() {
@@ -986,37 +1093,26 @@ function updateCustomRelationship(oldId: string, patch: Omit<CustomDiagramRelati
   }
   saveCustomRelationships();
   syncVueFlowNodes();
-  pinnedEdgeId.value = next.id;
-  hoveredEdgeId.value = next.id;
-  edgePopoverEditing.value = false;
+  inspectorTarget.value = { kind: "edge", edgeId: next.id };
   syncHighlightEdgeId();
   toast(t("diagram.relationshipUpdated"), 2000);
 }
 
-function handleEdgePopoverSave(payload: Omit<CustomDiagramRelationship, "id"> & { id?: string }) {
-  const currentId = activeEdgePopoverId.value;
+function handleInspectorSaveRelationship(payload: Omit<CustomDiagramRelationship, "id"> & { id?: string }) {
+  const currentId = inspectorTarget.value?.kind === "edge" ? inspectorTarget.value.edgeId : null;
   if (!currentId) return;
   updateCustomRelationship(payload.id || currentId, payload);
 }
 
-function handleEdgePopoverDelete(id: string) {
-  removeCustomRelationship(id);
-  closeEdgePopover();
-}
-
-function handleEdgePopoverConfirm(payload: { id: string; sourceCardinality: "1" | "N"; targetCardinality: "1" | "N" }) {
+function handleInspectorConfirmRelationship(payload: { id: string; sourceCardinality: "1" | "N"; targetCardinality: "1" | "N" }) {
   confirmMatch(payload);
-  closeEdgePopover();
+  inspectorTarget.value = null;
+  syncHighlightEdgeId();
 }
 
-function handleEdgePopoverIgnore(id: string) {
+function handleInspectorIgnoreRelationship(id: string) {
   ignoreMatch(id);
-  closeEdgePopover();
-}
-
-function pinAndEditEdge() {
-  pinnedEdgeId.value = activeEdgePopoverId.value;
-  edgePopoverEditing.value = true;
+  inspectorTarget.value = null;
   syncHighlightEdgeId();
 }
 
@@ -1147,6 +1243,21 @@ async function loadDiagram() {
     }
 
     tables.value = loadedTables;
+    const schemaKey = schema.value || "";
+    const drafts = loadDraftTables(connectionId.value, database.value, schemaKey);
+    const liveNames = new Set(loadedTables.map((t) => t.name));
+    const pendingDrafts = drafts.filter((d) => !liveNames.has(d.name));
+    if (pendingDrafts.length) {
+      tables.value = [...loadedTables, ...pendingDrafts];
+    }
+    const livePatches = loadLiveTablePatches(connectionId.value, database.value, schemaKey);
+    tables.value = applyLiveTablePatches(tables.value, livePatches);
+    saveDraftTables(tables.value.filter(isDraftTable), connectionId.value, database.value, schemaKey);
+    saveLiveTablePatches(tables.value, connectionId.value, database.value, schemaKey);
+    const savedLayers = loadPersistedLayers(connectionId.value, database.value, schema.value || "");
+    if (savedLayers.length) {
+      layerStore.loadLayers(savedLayers);
+    }
     loadCustomRelationships();
     loadMatchData();
     updateRelationshipDraftDefaults();
@@ -1161,9 +1272,129 @@ async function loadDiagram() {
   }
   if (tables.value.length > 0) {
     await nextTick();
-    await resetLayout({ skipHistory: true });
+    await restoreOrInitializeLayout();
     graphStore.clearHistory();
+  } else {
+    syncVueFlowNodes();
   }
+}
+
+/** Restore saved table positions, or run layer-aware LTR layout when none exist. */
+async function restoreOrInitializeLayout() {
+  const schemaKey = schema.value || "";
+  const tableNames = tables.value.map((t) => t.name);
+  const savedPositions = loadPersistedPositions(connectionId.value, database.value, schemaKey);
+
+  if (hasUsablePersistedPositions(savedPositions, tableNames)) {
+    const next: Record<string, DiagramPosition> = {};
+    for (const name of tableNames) {
+      const pos = savedPositions[name];
+      if (pos) next[name] = { ...pos };
+    }
+    positions.value = next;
+    fillMissingTablePositions();
+    fitAllLayers();
+    persistDraftAndLayers();
+    syncVueFlowNodes();
+    await nextTick();
+    fitDiagramView();
+    return;
+  }
+
+  await applyInitialLayerAwareLayout();
+}
+
+/** Place tables that have no saved position into their layer (or canvas grid). */
+function fillMissingTablePositions() {
+  const heights = tableHeightsMap();
+  const missing = tables.value.filter((t) => !positions.value[t.name]);
+  if (missing.length === 0) return;
+
+  for (const table of missing) {
+    const layer = layerStore.getLayerByTable(table.name);
+    if (layer?.position) {
+      const memberPositions = layer.tableNames.map((name) => positions.value[name]).filter((pos): pos is DiagramPosition => !!pos);
+      if (memberPositions.length === 0) {
+        positions.value = {
+          ...positions.value,
+          [table.name]: {
+            x: layer.position.x + LAYER_CONTENT_PADDING,
+            y: layer.position.y + LAYER_HEADER_HEIGHT + LAYER_CONTENT_PADDING,
+          },
+        };
+      } else {
+        let maxBottom = layer.position.y + LAYER_HEADER_HEIGHT;
+        let leftMost = layer.position.x + LAYER_CONTENT_PADDING;
+        for (const name of layer.tableNames) {
+          const pos = positions.value[name];
+          if (!pos) continue;
+          leftMost = Math.min(leftMost, pos.x);
+          maxBottom = Math.max(maxBottom, pos.y + (heights[name] ?? 120));
+        }
+        positions.value = {
+          ...positions.value,
+          [table.name]: { x: leftMost, y: maxBottom + GAP_Y / 2 },
+        };
+      }
+    } else {
+      const count = Object.keys(positions.value).length;
+      positions.value = {
+        ...positions.value,
+        [table.name]: {
+          x: MARGIN + (count % 3) * (CARD_WIDTH + GAP_X),
+          y: MARGIN + Math.floor(count / 3) * 200,
+        },
+      };
+    }
+  }
+}
+
+async function applyInitialLayerAwareLayout() {
+  await nextTick();
+  const layoutTables = canvasVisibleTables.value;
+  if (layoutTables.length === 0) {
+    syncVueFlowNodes();
+    return;
+  }
+
+  // Free layers with no member positions cannot preserve relative layout — treat as auto for init.
+  const layersForLayout = layerStore.layers
+    .filter((l) => l.visible)
+    .map((l) => {
+      const hasMemberPos = l.tableNames.some((name) => positions.value[name]);
+      if ((l.layoutMode ?? "auto") === "free" && !hasMemberPos) {
+        return { ...l, layoutMode: "auto" as const };
+      }
+      return l;
+    });
+
+  const result = computeLtrAutoLayout({
+    tables: layoutTables,
+    positions: positions.value,
+    layers: layersForLayout,
+    paneWidth: diagramPaneWidth(),
+    relationships: canvasVisibleRelationships.value.map((r) => ({
+      sourceTable: r.sourceTable,
+      targetTable: r.targetTable,
+    })),
+  });
+
+  const nextPositions: Record<string, DiagramPosition> = { ...positions.value, ...result.positions };
+  positions.value = nextPositions;
+
+  for (const updated of result.layers) {
+    const layer = layerStore.layers.find((l) => l.id === updated.id);
+    if (!layer) continue;
+    layer.position = updated.position ? { ...updated.position } : layer.position;
+    layer.width = updated.width;
+    layer.height = updated.height;
+  }
+
+  fitAllFreeLayers();
+  persistDraftAndLayers();
+  syncVueFlowNodes();
+  await nextTick();
+  fitDiagramView();
 }
 
 function requestRefreshDiagram() {
@@ -1343,13 +1574,15 @@ function currentDiagramSvg(): string {
   }
 
   const layers = exportSvgLayers();
-  const relationshipPaths = buildTableRelationshipPaths({
+  const geometryInput = {
     relationships: visibleRelationships.value,
     positions: positions.value,
     tables: visibleTables.value,
     waypoints: edgeWaypoints.value,
     cardWidth: CARD_WIDTH,
-  });
+  };
+  const relationshipPolylines = buildTableRelationshipPolylines(geometryInput);
+  const relationshipPaths = Object.fromEntries(Object.entries(relationshipPolylines).map(([id, points]) => [id, pointsToSvgPath(points)]));
   const canvas = computeTableDiagramCanvas(visibleTables.value, positions.value, {
     cardWidth: CARD_WIDTH,
     cardHeaderHeight: CARD_HEADER_HEIGHT,
@@ -1363,6 +1596,7 @@ function currentDiagramSvg(): string {
     relationships: visibleRelationships.value,
     positions: positions.value,
     relationshipPaths,
+    relationshipPolylines,
     canvas,
     cardWidth: CARD_WIDTH,
     cardHeaderHeight: CARD_HEADER_HEIGHT,
@@ -1447,9 +1681,10 @@ async function exportDiagram(format: DiagramExportFormat) {
 const isSpacePressed = ref(false);
 
 function handleKeydown(e: KeyboardEvent) {
-  if (e.key === "Escape" && (pinnedEdgeId.value || hoveredEdgeId.value || edgePopoverEditing.value)) {
+  if (e.key === "Escape" && inspectorTarget.value) {
     e.preventDefault();
-    closeEdgePopover();
+    inspectorTarget.value = null;
+    syncHighlightEdgeId();
     return;
   }
   const target = e.target as HTMLElement | null;
@@ -1573,6 +1808,7 @@ onUnmounted(() => {
         :focus-table-name="focusTableName ?? ''"
         :generated-join-sql="generatedJoinSql"
         :is-fullscreen="isFullscreen"
+        :draft-table-count="draftTableCount"
         @set-connection="setConnection"
         @set-database="setDatabase"
         @set-schema="setSchema"
@@ -1588,14 +1824,16 @@ onUnmounted(() => {
         @zoom-in="zoomIn"
         @toggle-fullscreen="toggleFullscreen"
         @auto-layout="applyAutoLayout"
+        @create-table="showCreateTableDialog = true"
+        @sync-to-database="showSyncDialog = true"
       />
 
       <div class="flex min-h-0 flex-1 flex-col bg-muted/20">
         <div class="min-h-0 flex-1 flex overflow-hidden">
-          <div v-if="showLayersPanel && tables.length > 0" class="flex flex-col overflow-hidden" :style="{ width: `${leftPanelWidth}px` }">
-            <LayerPanel :tables="tables" :record-history="recordHistory" class="h-full overflow-y-auto" @add-layer="handleAddLayer" @layer-changed="handleLayerChanged" @layout-mode-changed="handleLayerLayoutModeChanged" />
+          <div v-if="showLayersPanel && diagramReady" class="flex flex-col overflow-hidden" :style="{ width: `${leftPanelWidth}px` }">
+            <LayerPanel :tables="tables" :record-history="recordHistory" class="h-full overflow-y-auto" @add-layer="handleAddLayer" @layer-changed="handleLayerChanged" @layout-mode-changed="handleLayerLayoutModeChanged" @focus-layer="handleFocusLayer" @create-draft-table="handleCreateDraftTable" />
           </div>
-          <ResizerHandle v-if="showLayersPanel && tables.length > 0" @resize="handleLeftResize" />
+          <ResizerHandle v-if="showLayersPanel && diagramReady" @resize="handleLeftResize" />
           <div class="min-h-0 flex-1 overflow-hidden">
             <div v-if="loadingDiagram" class="h-full flex items-center justify-center text-sm text-muted-foreground">
               <Loader2 class="mr-2 h-4 w-4 animate-spin" />
@@ -1604,13 +1842,17 @@ onUnmounted(() => {
             <div v-else-if="!diagramReady" class="h-full flex items-center justify-center text-sm text-muted-foreground">
               {{ t("diagram.selectTarget") }}
             </div>
-            <div v-else-if="tables.length === 0" class="h-full flex items-center justify-center text-sm text-muted-foreground">
-              {{ t("diagram.empty") }}
-            </div>
-            <div v-else-if="visibleTables.length === 0" class="h-full flex items-center justify-center text-sm text-muted-foreground">
+            <div v-else-if="visibleTables.length === 0 && tables.length > 0" class="h-full flex items-center justify-center text-sm text-muted-foreground">
               {{ t("diagram.noMatches") }}
             </div>
             <div v-else-if="diagramMode === 'table'" ref="diagramPaneRef" class="relative w-full h-full">
+              <div v-if="tables.length === 0" class="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-muted/30 text-sm text-muted-foreground pointer-events-none">
+                <p class="max-w-md text-center px-4 pointer-events-none">{{ t("diagram.emptyDesignHint") }}</p>
+                <Button type="button" size="sm" class="pointer-events-auto" @click="showCreateTableDialog = true">
+                  <Plus class="mr-1 h-3.5 w-3.5" />
+                  {{ t("diagram.createTable") }}
+                </Button>
+              </div>
               <VueFlow
                 :nodes="nodes"
                 :edges="edges"
@@ -1623,33 +1865,15 @@ onUnmounted(() => {
                 class="diagram-flow w-full h-full"
                 @nodes-change="handleNodesChange"
                 @edges-change="handleEdgesChange"
+                @node-click="handleNodeClick"
                 @node-drag-start="handleNodeDragStart"
                 @node-drag-stop="handleNodeDragStop"
-                @edge-mouse-enter="handleEdgeMouseEnter"
-                @edge-mouse-move="handleEdgeMouseMove"
-                @edge-mouse-leave="handleEdgeMouseLeave"
                 @edge-click="handleEdgeClick"
                 @pane-click="handlePaneClick"
               >
                 <Background />
                 <MiniMap pannable zoomable class="!bg-background/95" />
               </VueFlow>
-              <EdgeRelationshipPopover
-                :visible="edgePopoverVisible"
-                :relationship="activeEdgeRelationship"
-                :tables="visibleTables"
-                :editing="edgePopoverEditing"
-                :position="edgePopoverPos"
-                @popover-enter="handleEdgePopoverEnter"
-                @popover-leave="handleEdgePopoverLeave"
-                @start-edit="pinAndEditEdge"
-                @cancel-edit="edgePopoverEditing = false"
-                @close="closeEdgePopover"
-                @save="handleEdgePopoverSave"
-                @delete="handleEdgePopoverDelete"
-                @confirm="handleEdgePopoverConfirm"
-                @ignore="handleEdgePopoverIgnore"
-              />
               <ZoomControls :can-undo="graphStore.canUndo" :can-redo="graphStore.canRedo" @undo="handleUndo" @redo="handleRedo" />
             </div>
             <div v-else class="min-h-0 h-full overflow-auto">
@@ -1744,106 +1968,128 @@ onUnmounted(() => {
               </div>
             </div>
           </div>
-          <ResizerHandle v-if="showMatchPanel && tables.length > 0" @resize="handleRightResize" />
-          <div v-if="showMatchPanel && tables.length > 0" class="flex min-w-0 shrink-0 flex-col overflow-hidden border-l border-border bg-background/95" :style="{ width: `${rightPanelWidth}px` }">
-            <div class="flex items-center justify-between px-3 py-2 border-b border-border shrink-0">
-              <h3 class="text-sm font-semibold text-foreground">{{ t("diagram.modelRelationships") }}</h3>
-              <button type="button" class="p-1.5 rounded-md hover:bg-muted transition-colors" @click="showMatchPanel = false">
-                <X class="h-4 w-4 text-muted-foreground" />
-              </button>
-            </div>
-
-            <div class="flex min-h-0 flex-1 flex-col overflow-hidden">
-              <div class="min-h-0 flex-1 overflow-hidden">
-                <MatchPanel
-                  v-if="isAutoMatchEnabled()"
-                  :relationships="matchResult.relationships"
-                  :conflicts="matchResult.conflicts"
-                  :pending="matchResult.pending"
-                  :confirmed-ids="matchConfirms"
-                  :ignored-ids="matchIgnores"
-                  @confirm="confirmMatch"
-                  @ignore="ignoreMatch"
-                  @confirm-all="confirmAllMatches"
-                  @ignore-all="ignoreAllMatches"
-                  @clear-all="clearAllMatches"
-                />
-                <div v-else class="flex h-full flex-col items-center justify-center gap-2 p-4 text-center text-xs text-muted-foreground">
-                  <span>{{ t("diagram.noInferred") }}</span>
-                </div>
+          <ResizerHandle v-if="showRightPanel" @resize="handleRightResize" />
+          <div v-if="showRightPanel" class="flex min-w-0 shrink-0 flex-col overflow-hidden border-l border-border bg-background/95" :style="{ width: `${rightPanelWidth}px` }">
+            <template v-if="inspectorTarget">
+              <DiagramInspector
+                :target="inspectorTarget"
+                :tables="tables"
+                :relationships="visibleRelationships"
+                :database-type="selectedConnection?.db_type"
+                @close="
+                  inspectorTarget = null;
+                  syncHighlightEdgeId();
+                "
+                @update-table="handleInspectorUpdateTable"
+                @delete-draft-table="handleDeleteDraftTable"
+                @remove-relationship="handleInspectorRemoveRelationship"
+                @save-relationship="handleInspectorSaveRelationship"
+                @confirm-relationship="handleInspectorConfirmRelationship"
+                @ignore-relationship="handleInspectorIgnoreRelationship"
+              />
+            </template>
+            <template v-else-if="showMatchPanel">
+              <div class="flex items-center justify-between px-3 py-2 border-b border-border shrink-0">
+                <h3 class="text-sm font-semibold text-foreground">{{ t("diagram.modelRelationships") }}</h3>
+                <button type="button" class="p-1.5 rounded-md hover:bg-muted transition-colors" @click="showMatchPanel = false">
+                  <X class="h-4 w-4 text-muted-foreground" />
+                </button>
               </div>
 
-              <div class="shrink-0 border-t border-border">
-                <button type="button" class="flex w-full items-center gap-1.5 px-3 py-2 text-left text-xs font-medium text-foreground hover:bg-muted/50" @click="showManualAdd = !showManualAdd">
-                  <ChevronDown v-if="showManualAdd" class="h-3.5 w-3.5 shrink-0" />
-                  <ChevronRight v-else class="h-3.5 w-3.5 shrink-0" />
-                  {{ t("diagram.manualAddRelationship") }}
-                </button>
-                <div v-if="showManualAdd" class="space-y-2 border-t border-border px-3 py-2">
-                  <Input v-model="relationshipDraft.name" class="h-8 text-xs" :placeholder="t('diagram.relationshipNamePlaceholder')" />
-                  <Select v-model="relationshipDraft.sourceTable">
-                    <SelectTrigger class="h-8 text-xs">
-                      <SelectValue :placeholder="t('diagram.sourceTable')" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem v-for="table in tables" :key="`source-${table.name}`" :value="table.name" :disabled="table.columns.length === 0">{{ table.name }}</SelectItem>
-                    </SelectContent>
-                  </Select>
-                  <Select v-model="relationshipDraft.sourceColumn">
-                    <SelectTrigger class="h-8 text-xs">
-                      <SelectValue :placeholder="t('diagram.sourceColumn')" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem v-for="column in sourceColumns" :key="`source-column-${column.name}`" :value="column.name">{{ column.name }}</SelectItem>
-                    </SelectContent>
-                  </Select>
-                  <Select v-model="relationshipDraft.cardinality">
-                    <SelectTrigger class="h-8 text-xs">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="one-to-one">{{ t("diagram.cardinalityOneToOne") }}</SelectItem>
-                      <SelectItem value="one-to-many">{{ t("diagram.cardinalityOneToMany") }}</SelectItem>
-                      <SelectItem value="many-to-one">{{ t("diagram.cardinalityManyToOne") }}</SelectItem>
-                      <SelectItem value="many-to-many">{{ t("diagram.cardinalityManyToMany") }}</SelectItem>
-                    </SelectContent>
-                  </Select>
-                  <Select v-model="relationshipDraft.targetTable">
-                    <SelectTrigger class="h-8 text-xs">
-                      <SelectValue :placeholder="t('diagram.targetTable')" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem v-for="table in tables" :key="`target-${table.name}`" :value="table.name" :disabled="table.columns.length === 0">{{ table.name }}</SelectItem>
-                    </SelectContent>
-                  </Select>
-                  <Select v-model="relationshipDraft.targetColumn">
-                    <SelectTrigger class="h-8 text-xs">
-                      <SelectValue :placeholder="t('diagram.targetColumn')" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem v-for="column in targetColumns" :key="`target-column-${column.name}`" :value="column.name">{{ column.name }}</SelectItem>
-                    </SelectContent>
-                  </Select>
-                  <Button variant="default" size="sm" class="h-8 w-full px-2 text-xs" @click="addCustomRelationship">
-                    <Plus class="mr-1 h-3.5 w-3.5" />
-                    {{ t("diagram.addRelationship") }}
-                  </Button>
-                  <div v-if="customRelationships.length > 0" class="flex max-h-32 flex-wrap gap-1.5 overflow-y-auto">
-                    <Badge v-for="relationship in customRelationships" :key="relationship.id" variant="secondary" class="gap-1 pr-1">
-                      <span class="max-w-48 truncate text-[10px]"> {{ relationship.sourceTable }}.{{ relationship.sourceColumn }} {{ relationship.sourceCardinality }}:{{ relationship.targetCardinality }} {{ relationship.targetTable }}.{{ relationship.targetColumn }} </span>
-                      <button type="button" class="rounded-sm p-0.5 hover:bg-background/80" :title="t('diagram.removeRelationship')" @click="removeCustomRelationship(relationship.id)">
-                        <Trash2 class="h-3 w-3" />
-                      </button>
-                    </Badge>
+              <div class="flex min-h-0 flex-1 flex-col overflow-hidden">
+                <div class="min-h-0 flex-1 overflow-hidden">
+                  <MatchPanel
+                    v-if="isAutoMatchEnabled()"
+                    :relationships="matchResult.relationships"
+                    :conflicts="matchResult.conflicts"
+                    :pending="matchResult.pending"
+                    :confirmed-ids="matchConfirms"
+                    :ignored-ids="matchIgnores"
+                    @confirm="confirmMatch"
+                    @ignore="ignoreMatch"
+                    @confirm-all="confirmAllMatches"
+                    @ignore-all="ignoreAllMatches"
+                    @clear-all="clearAllMatches"
+                  />
+                  <div v-else class="flex h-full flex-col items-center justify-center gap-2 p-4 text-center text-xs text-muted-foreground">
+                    <span>{{ t("diagram.noInferred") }}</span>
+                  </div>
+                </div>
+
+                <div class="shrink-0 border-t border-border">
+                  <button type="button" class="flex w-full items-center gap-1.5 px-3 py-2 text-left text-xs font-medium text-foreground hover:bg-muted/50" @click="showManualAdd = !showManualAdd">
+                    <ChevronDown v-if="showManualAdd" class="h-3.5 w-3.5 shrink-0" />
+                    <ChevronRight v-else class="h-3.5 w-3.5 shrink-0" />
+                    {{ t("diagram.manualAddRelationship") }}
+                  </button>
+                  <div v-if="showManualAdd" class="space-y-2 border-t border-border px-3 py-2">
+                    <Input v-model="relationshipDraft.name" class="h-8 text-xs" :placeholder="t('diagram.relationshipNamePlaceholder')" />
+                    <Select v-model="relationshipDraft.sourceTable">
+                      <SelectTrigger class="h-8 text-xs">
+                        <SelectValue :placeholder="t('diagram.sourceTable')" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem v-for="table in tables" :key="`source-${table.name}`" :value="table.name" :disabled="table.columns.length === 0">{{ table.name }}</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <Select v-model="relationshipDraft.sourceColumn">
+                      <SelectTrigger class="h-8 text-xs">
+                        <SelectValue :placeholder="t('diagram.sourceColumn')" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem v-for="column in sourceColumns" :key="`source-column-${column.name}`" :value="column.name">{{ column.name }}</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <Select v-model="relationshipDraft.cardinality">
+                      <SelectTrigger class="h-8 text-xs">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="one-to-one">{{ t("diagram.cardinalityOneToOne") }}</SelectItem>
+                        <SelectItem value="one-to-many">{{ t("diagram.cardinalityOneToMany") }}</SelectItem>
+                        <SelectItem value="many-to-one">{{ t("diagram.cardinalityManyToOne") }}</SelectItem>
+                        <SelectItem value="many-to-many">{{ t("diagram.cardinalityManyToMany") }}</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <Select v-model="relationshipDraft.targetTable">
+                      <SelectTrigger class="h-8 text-xs">
+                        <SelectValue :placeholder="t('diagram.targetTable')" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem v-for="table in tables" :key="`target-${table.name}`" :value="table.name" :disabled="table.columns.length === 0">{{ table.name }}</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <Select v-model="relationshipDraft.targetColumn">
+                      <SelectTrigger class="h-8 text-xs">
+                        <SelectValue :placeholder="t('diagram.targetColumn')" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem v-for="column in targetColumns" :key="`target-column-${column.name}`" :value="column.name">{{ column.name }}</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <Button variant="default" size="sm" class="h-8 w-full px-2 text-xs" @click="addCustomRelationship">
+                      <Plus class="mr-1 h-3.5 w-3.5" />
+                      {{ t("diagram.addRelationship") }}
+                    </Button>
+                    <div v-if="customRelationships.length > 0" class="flex max-h-32 flex-wrap gap-1.5 overflow-y-auto">
+                      <Badge v-for="relationship in customRelationships" :key="relationship.id" variant="secondary" class="gap-1 pr-1">
+                        <span class="max-w-48 truncate text-[10px]"> {{ relationship.sourceTable }}.{{ relationship.sourceColumn }} {{ relationship.sourceCardinality }}:{{ relationship.targetCardinality }} {{ relationship.targetTable }}.{{ relationship.targetColumn }} </span>
+                        <button type="button" class="rounded-sm p-0.5 hover:bg-background/80" :title="t('diagram.removeRelationship')" @click="removeCustomRelationship(relationship.id)">
+                          <Trash2 class="h-3 w-3" />
+                        </button>
+                      </Badge>
+                    </div>
                   </div>
                 </div>
               </div>
-            </div>
+            </template>
           </div>
         </div>
       </div>
     </DialogContent>
   </Dialog>
 
+  <CreateDraftTableDialog v-model:open="showCreateTableDialog" :layers="layerStore.layers" :active-layer-id="layerStore.activeLayerId" :existing-names="tables.map((t) => t.name)" @create="handleCreateDraftTable" />
+  <DiagramSyncDialog v-model:open="showSyncDialog" :tables="tables" :connection-id="connectionId" :database="database" :schema="schema" :database-type="selectedConnection?.db_type" @synced="handleSyncedDraftTables" />
   <DangerConfirmDialog v-model:open="showRefreshConfirm" :title="t('diagram.refresh')" :message="t('diagram.refreshConfirm')" :confirm-label="t('diagram.refresh')" @confirm="confirmRefreshDiagram" />
 </template>

@@ -25,6 +25,18 @@ test("addLayer defaults visible, auto layout, Layer N name, and unique colors", 
   assert.equal(store.activeLayerId, b.id);
 });
 
+test("addLayer collapses all existing layers", () => {
+  const store = useLayerStore();
+  const a = store.addLayer("A");
+  assert.equal(a.collapsed, false);
+  const b = store.addLayer("B");
+  assert.equal(store.layers.find((l) => l.id === a.id)?.collapsed, true);
+  assert.equal(b.collapsed, false);
+  store.addLayer("C");
+  assert.equal(store.layers.find((l) => l.id === a.id)?.collapsed, true);
+  assert.equal(store.layers.find((l) => l.id === b.id)?.collapsed, true);
+});
+
 test("moveTableToLayer enforces single-layer membership", () => {
   const store = useLayerStore();
   const layerA = store.addLayer("A");

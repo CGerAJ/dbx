@@ -26,6 +26,7 @@ export interface HistorySnapshot {
   edges: DiagramEdge[];
   positions: Record<string, DiagramPosition>;
   layers: DiagramLayer[];
+  tables: DiagramTable[];
   customRelationships: CustomDiagramRelationship[];
   edgeWaypoints: Record<string, { x: number; y: number }[]>;
   edgeHandleHints: Record<string, { sourceHandle?: string; targetHandle?: string }>;
@@ -86,3 +87,6 @@ export interface DiagramLayer {
 }
 
 export const LAYER_COLORS = ["#3b82f6", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#ec4899", "#06b6d4", "#84cc16"];
+
+/** Canvas selection driving the diagram inspector panel */
+export type InspectorTarget = { kind: "table"; tableName: string } | { kind: "edge"; edgeId: string } | null;

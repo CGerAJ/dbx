@@ -1,8 +1,11 @@
 import type { EngineeringDiagram, EngineeringEntityNode } from "@/lib/diagram/engineeringDiagram";
 import type { DiagramPosition, DiagramRelationship, DiagramTable } from "@/lib/diagram/erDiagram";
 import { pickHandles } from "@/lib/diagram/vue-flow-adapter";
-import { pointsToSvgPath, type Point } from "@/lib/diagram/edge-obstacle-router";
+import { pointAlongPolyline, pointsToSvgPath, type Point } from "@/lib/diagram/edge-obstacle-router";
 import { CARD_BOTTOM_PADDING, CARD_HEADER_HEIGHT, CARD_WIDTH, COLUMN_ROW_HEIGHT, MARGIN } from "@/lib/diagram/diagram-constants";
+
+const SOURCE_CARDINALITY_T = 0.18;
+const TARGET_CARDINALITY_T = 0.82;
 
 interface DiagramCanvas {
   width: number;
@@ -24,6 +27,8 @@ export interface TableDiagramSvgOptions {
   relationships: DiagramRelationship[];
   positions: Record<string, DiagramPosition>;
   relationshipPaths: Record<string, string>;
+  /** Polyline points for endpoint cardinality badges (aligned with relationshipPaths). */
+  relationshipPolylines?: Record<string, Point[]>;
   canvas: DiagramCanvas;
   cardWidth: number;
   cardHeaderHeight: number;
@@ -75,10 +80,6 @@ function svgCardHeight(columnCount: number, metrics: CardHeightMetrics): number 
   return metrics.cardHeaderHeight + columnCount * metrics.columnRowHeight + (metrics.cardBottomPadding ?? CARD_BOTTOM_PADDING);
 }
 
-function tableDiagramDefs(): string {
-  return ["<defs>", '<marker id="dbx-diagram-arrow" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto" markerUnits="strokeWidth">', '<path d="M 0 0 L 8 4 L 0 8 z" fill="#2563eb"/>', "</marker>", "</defs>"].join("");
-}
-
 function isForeignKeyColumn(table: DiagramTable, columnName: string): boolean {
   return table.foreignKeys.some((fk) => fk.column === columnName);
 }
@@ -92,19 +93,16 @@ function handleAnchor(pos: DiagramPosition, handle: string, width: number, heigh
   return { x: cx, y: pos.y };
 }
 
-/** Orthogonal fallback path when no ELK/obstacle waypoints are stored. */
-function orthogonalPathBetweenTables(sourcePos: DiagramPosition, targetPos: DiagramPosition, sourceHeight: number, targetHeight: number, cardWidth: number): string {
+/** Orthogonal fallback polyline when no ELK/obstacle waypoints are stored. */
+function orthogonalPointsBetweenTables(sourcePos: DiagramPosition, targetPos: DiagramPosition, sourceHeight: number, targetHeight: number, cardWidth: number): Point[] {
   const { sourceHandle, targetHandle } = pickHandles(sourcePos, targetPos, sourceHeight, targetHeight, cardWidth);
   const s = handleAnchor(sourcePos, sourceHandle, cardWidth, sourceHeight);
   const t = handleAnchor(targetPos, targetHandle.replace(/-target$/, ""), cardWidth, targetHeight);
   const mid: Point = Math.abs(s.x - t.x) >= Math.abs(s.y - t.y) ? { x: t.x, y: s.y } : { x: s.x, y: t.y };
-  return pointsToSvgPath([s, mid, t]);
+  return [s, mid, t];
 }
 
-/**
- * Build SVG path `d` strings for relationships from live waypoints or table positions.
- */
-export function buildTableRelationshipPaths(input: {
+type RelationshipGeometryInput = {
   relationships: DiagramRelationship[];
   positions: Record<string, DiagramPosition>;
   tables: DiagramTable[];
@@ -113,7 +111,12 @@ export function buildTableRelationshipPaths(input: {
   cardHeaderHeight?: number;
   columnRowHeight?: number;
   cardBottomPadding?: number;
-}): Record<string, string> {
+};
+
+/**
+ * Build relationship polylines from live waypoints or table positions.
+ */
+export function buildTableRelationshipPolylines(input: RelationshipGeometryInput): Record<string, Point[]> {
   const cardWidth = input.cardWidth ?? CARD_WIDTH;
   const metrics: CardHeightMetrics = {
     cardHeaderHeight: input.cardHeaderHeight ?? CARD_HEADER_HEIGHT,
@@ -121,12 +124,12 @@ export function buildTableRelationshipPaths(input: {
     cardBottomPadding: input.cardBottomPadding ?? CARD_BOTTOM_PADDING,
   };
   const heightByName = new Map(input.tables.map((t) => [t.name, svgCardHeight(t.columns.length, metrics)]));
-  const paths: Record<string, string> = {};
+  const polylines: Record<string, Point[]> = {};
 
   for (const rel of input.relationships) {
     const stored = input.waypoints?.[rel.id];
     if (stored && stored.length >= 2) {
-      paths[rel.id] = pointsToSvgPath(stored);
+      polylines[rel.id] = stored.map((p) => ({ ...p }));
       continue;
     }
     const sourcePos = input.positions[rel.sourceTable];
@@ -134,7 +137,19 @@ export function buildTableRelationshipPaths(input: {
     if (!sourcePos || !targetPos) continue;
     const sh = heightByName.get(rel.sourceTable) ?? svgCardHeight(0, metrics);
     const th = heightByName.get(rel.targetTable) ?? svgCardHeight(0, metrics);
-    paths[rel.id] = orthogonalPathBetweenTables(sourcePos, targetPos, sh, th, cardWidth);
+    polylines[rel.id] = orthogonalPointsBetweenTables(sourcePos, targetPos, sh, th, cardWidth);
+  }
+  return polylines;
+}
+
+/**
+ * Build SVG path `d` strings for relationships from live waypoints or table positions.
+ */
+export function buildTableRelationshipPaths(input: RelationshipGeometryInput): Record<string, string> {
+  const polylines = buildTableRelationshipPolylines(input);
+  const paths: Record<string, string> = {};
+  for (const [id, points] of Object.entries(polylines)) {
+    paths[id] = pointsToSvgPath(points);
   }
   return paths;
 }
@@ -173,7 +188,7 @@ export function computeTableDiagramCanvas(
 }
 
 export function buildTableDiagramSvg(options: TableDiagramSvgOptions): string {
-  const parts = [svgHeader(options.canvas), tableDiagramDefs()];
+  const parts = [svgHeader(options.canvas)];
 
   const layers = (options.layers ?? []).filter((l) => l.width > 0 && l.height > 0);
   if (layers.length > 0) {
@@ -196,7 +211,34 @@ export function buildTableDiagramSvg(options: TableDiagramSvgOptions): string {
   for (const relationship of options.relationships) {
     const path = options.relationshipPaths[relationship.id];
     if (!path) continue;
-    parts.push(`<path d="${escapeXml(path)}" marker-end="url(#dbx-diagram-arrow)">` + `<title>${escapeXml(`${relationship.sourceTable}.${relationship.sourceColumn} -> ${relationship.targetTable}.${relationship.targetColumn}`)}</title>` + "</path>");
+    parts.push(`<path d="${escapeXml(path)}">` + `<title>${escapeXml(`${relationship.sourceTable}.${relationship.sourceColumn} -> ${relationship.targetTable}.${relationship.targetColumn}`)}</title>` + "</path>");
+  }
+  parts.push("</g>");
+
+  parts.push('<g class="diagram-cardinality">');
+  for (const relationship of options.relationships) {
+    const points = options.relationshipPolylines?.[relationship.id];
+    if (!points || points.length < 2) continue;
+    const sourcePos = pointAlongPolyline(points, SOURCE_CARDINALITY_T);
+    const targetPos = pointAlongPolyline(points, TARGET_CARDINALITY_T);
+    const sourceCard = relationship.sourceCardinality || "N";
+    const targetCard = relationship.targetCardinality || "1";
+    parts.push(
+      svgText(sourceCard, sourcePos.x, sourcePos.y, {
+        size: 11,
+        weight: "700",
+        anchor: "middle",
+        fill: "#18181b",
+      }),
+    );
+    parts.push(
+      svgText(targetCard, targetPos.x, targetPos.y, {
+        size: 11,
+        weight: "700",
+        anchor: "middle",
+        fill: "#18181b",
+      }),
+    );
   }
   parts.push("</g>");
 

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed } from "vue";
+import { ref, reactive, computed, nextTick } from "vue";
 import { useI18n } from "vue-i18n";
 import { Plus, Trash2, Eye, EyeOff, ChevronDown, ChevronRight, Edit3, Check, X, CheckSquare, Square, Lock, Unlock } from "@lucide/vue";
 import { useLayerStore } from "@/lib/diagram/layer-store";
@@ -16,6 +16,8 @@ const emit = defineEmits<{
   (e: "layer-changed"): void;
   (e: "add-layer"): void;
   (e: "layout-mode-changed", payload: { layerId: string; layoutMode: LayerLayoutMode }): void;
+  (e: "focus-layer", layerId: string): void;
+  (e: "create-draft-table", payload: { name: string; layerId: string | null; withDefaultId: boolean }): void;
 }>();
 
 const store = useLayerStore();
@@ -26,14 +28,52 @@ function beforeMutate() {
   props.recordHistory?.();
 }
 
+type AddTableTab = "existing" | "create";
+
 const editingLayerId = ref<string | null>(null);
 const editingName = ref("");
-const expandedMultiSelectLayerId = ref<string | null>(null);
+const renameInputRef = ref<HTMLInputElement | null>(null);
 const selectedTableNames = ref<Map<string, Set<string>>>(new Map());
 const addTableFilter = ref("");
 /** Layer ids whose "tables in other layers" section is expanded (default: collapsed). */
 const otherLayersExpandedByLayer = ref<Set<string>>(new Set());
+const addTableTabByLayerId = reactive<Record<string, AddTableTab>>({});
+const createNameByLayerId = reactive<Record<string, string>>({});
+const createWithIdByLayerId = reactive<Record<string, boolean>>({});
+const createErrorByLayerId = reactive<Record<string, string>>({});
 
+function getAddTableTab(layerId: string): AddTableTab {
+  return addTableTabByLayerId[layerId] || "existing";
+}
+
+function ensureCreateFormDefaults(layerId: string) {
+  if (createNameByLayerId[layerId] === undefined) createNameByLayerId[layerId] = "";
+  if (createWithIdByLayerId[layerId] === undefined) createWithIdByLayerId[layerId] = true;
+}
+
+function setAddTableTab(layerId: string, tab: AddTableTab) {
+  addTableTabByLayerId[layerId] = tab;
+  if (tab === "create") ensureCreateFormDefaults(layerId);
+}
+
+function submitCreateDraft(layerId: string) {
+  const trimmed = (createNameByLayerId[layerId] || "").trim();
+  if (!trimmed) {
+    createErrorByLayerId[layerId] = t("diagram.tableNameRequired");
+    return;
+  }
+  if (props.tables.some((tbl) => tbl.name.toLowerCase() === trimmed.toLowerCase())) {
+    createErrorByLayerId[layerId] = t("diagram.tableNameExists");
+    return;
+  }
+  delete createErrorByLayerId[layerId];
+  createNameByLayerId[layerId] = "";
+  emit("create-draft-table", {
+    name: trimmed,
+    layerId,
+    withDefaultId: createWithIdByLayerId[layerId] ?? true,
+  });
+}
 function getSelectedTables(layerId: string): Set<string> {
   return selectedTableNames.value.get(layerId) || new Set();
 }
@@ -111,23 +151,7 @@ function handleAddSelectedTables(layerId: string) {
   next.delete(layerId);
   otherLayersExpandedByLayer.value = next;
   addTableFilter.value = "";
-  expandedMultiSelectLayerId.value = null;
   emit("layer-changed");
-}
-
-function toggleMultiSelect(layerId: string) {
-  if (expandedMultiSelectLayerId.value === layerId) {
-    expandedMultiSelectLayerId.value = null;
-    selectedTableNames.value.delete(layerId);
-    const next = new Set(otherLayersExpandedByLayer.value);
-    next.delete(layerId);
-    otherLayersExpandedByLayer.value = next;
-    addTableFilter.value = "";
-  } else {
-    expandedMultiSelectLayerId.value = layerId;
-    selectedTableNames.value.set(layerId, new Set());
-    addTableFilter.value = "";
-  }
 }
 
 function selectAllAvailableTables(layerId: string) {
@@ -155,6 +179,10 @@ function handleRemoveLayer(layerId: string) {
   beforeMutate();
   store.removeLayer(layerId);
   selectedTableNames.value.delete(layerId);
+  delete addTableTabByLayerId[layerId];
+  delete createNameByLayerId[layerId];
+  delete createWithIdByLayerId[layerId];
+  delete createErrorByLayerId[layerId];
   const next = new Set(otherLayersExpandedByLayer.value);
   next.delete(layerId);
   otherLayersExpandedByLayer.value = next;
@@ -206,12 +234,19 @@ function cancelRename() {
   editingName.value = "";
 }
 
-function startRename(layerId: string) {
+async function startRename(layerId: string) {
   const layer = store.layers.find((l) => l.id === layerId);
-  if (layer) {
-    editingLayerId.value = layerId;
-    editingName.value = layer.name;
-  }
+  if (!layer) return;
+  editingLayerId.value = layerId;
+  editingName.value = layer.name;
+  await nextTick();
+  const focusRenameInput = () => {
+    renameInputRef.value?.focus();
+    renameInputRef.value?.select();
+  };
+  focusRenameInput();
+  // dblclick 前的 click 会触发 focus-layer → fitView，延后一帧避免被抢走焦点
+  requestAnimationFrame(focusRenameInput);
 }
 
 function handleRemoveTable(layerId: string, tableName: string) {
@@ -243,6 +278,7 @@ function handleToggleCollapse(layerId: string) {
 
 function handleSetActiveLayer(layerId: string) {
   store.setActiveLayer(layerId);
+  emit("focus-layer", layerId);
 }
 
 function getLayerTables(layerId: string): DiagramTable[] {
@@ -279,7 +315,7 @@ function getLayerColor(layerId: string): string {
           <div class="w-3 h-3 rounded-full shrink-0" :style="{ backgroundColor: layer.color }" />
 
           <template v-if="editingLayerId === layer.id">
-            <input v-model="editingName" class="flex-1 min-w-0 text-xs bg-background border border-border rounded px-1.5 py-0.5 outline-none focus:border-primary" @keydown.enter="handleRenameLayer(layer.id)" @keydown.escape="cancelRename" autofocus />
+            <input ref="renameInputRef" v-model="editingName" class="flex-1 min-w-0 text-xs bg-background border border-border rounded px-1.5 py-0.5 outline-none focus:border-primary" @mousedown.stop @click.stop @keydown.enter="handleRenameLayer(layer.id)" @keydown.escape="cancelRename" />
             <button type="button" class="p-0.5 rounded hover:bg-muted transition-colors" @click.stop="handleRenameLayer(layer.id)">
               <Check class="h-3 w-3 text-green-500" />
             </button>
@@ -301,7 +337,7 @@ function getLayerColor(layerId: string): string {
               <Eye v-if="layer.visible" class="h-3 w-3 text-muted-foreground" />
               <EyeOff v-else class="h-3 w-3 text-muted-foreground/50" />
             </button>
-            <button type="button" class="p-0.5 rounded hover:bg-muted transition-colors opacity-0 hover:opacity-100" @click.stop="handleRemoveLayer(layer.id)" :title="t('diagram.deleteLayer')">
+            <button type="button" class="p-0.5 rounded hover:bg-muted transition-colors" @click.stop="handleRemoveLayer(layer.id)" :title="t('diagram.deleteLayer')">
               <Trash2 class="h-3 w-3 text-red-500" />
             </button>
           </template>
@@ -317,15 +353,17 @@ function getLayerColor(layerId: string): string {
             </div>
           </div>
 
-          <div v-if="availableTables.length > 0 || store.layers.length > 1" class="mt-1">
-            <div class="flex items-center justify-between mb-1">
-              <span class="text-[10px] text-muted-foreground">{{ t("diagram.addTables") }}</span>
-              <button type="button" class="text-[10px] text-primary hover:text-primary/80" @click.stop="toggleMultiSelect(layer.id)">
-                {{ expandedMultiSelectLayerId === layer.id ? t("diagram.closeMultiSelect") : t("diagram.multiSelect") }}
+          <div class="mt-2 space-y-1.5">
+            <div class="flex border-b border-border">
+              <button type="button" class="flex-1 px-1 py-1 text-[10px] transition-colors" :class="getAddTableTab(layer.id) === 'existing' ? 'border-b-2 border-primary text-primary font-medium' : 'text-muted-foreground hover:text-foreground'" @click.stop="setAddTableTab(layer.id, 'existing')">
+                {{ t("diagram.tabSelectExisting") }}
+              </button>
+              <button type="button" class="flex-1 px-1 py-1 text-[10px] transition-colors" :class="getAddTableTab(layer.id) === 'create' ? 'border-b-2 border-primary text-primary font-medium' : 'text-muted-foreground hover:text-foreground'" @click.stop="setAddTableTab(layer.id, 'create')">
+                {{ t("diagram.tabCreateTable") }}
               </button>
             </div>
 
-            <div v-if="expandedMultiSelectLayerId === layer.id" class="space-y-1">
+            <div v-if="getAddTableTab(layer.id) === 'existing'" class="space-y-1">
               <div class="flex gap-1">
                 <button type="button" class="flex-1 text-[9px] bg-muted hover:bg-muted/80 py-0.5 rounded transition-colors" @click.stop="selectAllAvailableTables(layer.id)">
                   {{ t("diagram.selectAll") }}
@@ -382,10 +420,17 @@ function getLayerColor(layerId: string): string {
               </button>
             </div>
 
-            <button v-else type="button" class="w-full text-xs bg-muted hover:bg-muted/80 py-1 rounded transition-colors flex items-center justify-center gap-1" @click.stop="toggleMultiSelect(layer.id)">
-              <Plus class="h-3 w-3" />
-              {{ t("diagram.addTables") }}...
-            </button>
+            <div v-else class="space-y-1.5" @click.stop>
+              <input v-model="createNameByLayerId[layer.id]" class="w-full h-7 text-[11px] bg-background border border-border rounded px-2 outline-none focus:border-primary" :placeholder="t('diagram.tableName')" @keydown.enter="submitCreateDraft(layer.id)" />
+              <label class="flex items-center gap-1.5 text-[10px] text-muted-foreground">
+                <input v-model="createWithIdByLayerId[layer.id]" type="checkbox" />
+                {{ t("diagram.withDefaultIdPk") }}
+              </label>
+              <p v-if="createErrorByLayerId[layer.id]" class="text-[10px] text-destructive">{{ createErrorByLayerId[layer.id] }}</p>
+              <button type="button" class="w-full text-xs bg-primary text-primary-foreground py-1 rounded hover:bg-primary/90 transition-colors" @click.stop="submitCreateDraft(layer.id)">
+                {{ t("diagram.create") }}
+              </button>
+            </div>
           </div>
         </div>
       </div>

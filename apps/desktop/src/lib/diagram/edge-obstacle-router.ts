@@ -86,45 +86,106 @@ function relevantObstacles(input: RouteInput, pad: number): ObstacleRect[] {
     .map((o) => inflate(o, pad));
 }
 
+/** Table rects for the edge endpoints (source/target), optionally inflated. */
+export function endpointRectsFromObstacles(obstacles: ObstacleRect[], endpointIds: [string, string], pad = 0): ObstacleRect[] {
+  const [srcId, tgtId] = endpointIds;
+  return obstacles.filter((o) => o.kind === "table" && (o.id === srcId || o.id === tgtId)).map((o) => (pad > 0 ? inflate(o, pad) : { ...o }));
+}
+
+export function stubOut(point: Point, position: Position, offset: number): Point {
+  if (position === Position.Left) return { x: point.x - offset, y: point.y };
+  if (position === Position.Top) return { x: point.x, y: point.y - offset };
+  if (position === Position.Bottom) return { x: point.x, y: point.y + offset };
+  return { x: point.x + offset, y: point.y };
+}
+
+/** Point just outside the target handle before the final inbound stub. */
+export function stubIn(point: Point, position: Position, offset: number): Point {
+  if (position === Position.Right) return { x: point.x + offset, y: point.y };
+  if (position === Position.Top) return { x: point.x, y: point.y - offset };
+  if (position === Position.Bottom) return { x: point.x, y: point.y + offset };
+  return { x: point.x - offset, y: point.y };
+}
+
+function pointOnRectBorder(p: Point, rect: ObstacleRect): boolean {
+  const rx2 = rect.x + rect.width;
+  const ry2 = rect.y + rect.height;
+  const onVertical = (nearlyEqual(p.x, rect.x) || nearlyEqual(p.x, rx2)) && p.y >= rect.y - AXIS_EPS && p.y <= ry2 + AXIS_EPS;
+  const onHorizontal = (nearlyEqual(p.y, rect.y) || nearlyEqual(p.y, ry2)) && p.x >= rect.x - AXIS_EPS && p.x <= rx2 + AXIS_EPS;
+  return onVertical || onHorizontal;
+}
+
 /**
- * Build candidate orthogonal polylines; return the first that clears obstacles,
- * or null to let the caller fall back to getSmoothStepPath.
+ * True when a segment runs along/through an endpoint table beyond a short handle stub.
+ * Short outward/inward stubs (length ≤ stubLen) that touch the border are allowed.
+ */
+export function pathSkimsEndpoints(points: Point[], endpointRects: ObstacleRect[], stubLen = EDGE_ROUTE_OFFSET): boolean {
+  if (endpointRects.length === 0 || points.length < 2) return false;
+  for (let i = 0; i < points.length - 1; i++) {
+    const a = points[i];
+    const b = points[i + 1];
+    const segLen = Math.hypot(b.x - a.x, b.y - a.y);
+    for (const rect of endpointRects) {
+      if (!segmentIntersectsRect(a, b, rect)) continue;
+      const stubOk = segLen <= stubLen + AXIS_EPS && (pointOnRectBorder(a, rect) || pointOnRectBorder(b, rect));
+      if (stubOk) continue;
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Build candidate orthogonal polylines with exit/entry stubs; return the shortest that
+ * clears non-endpoint obstacles and does not skim endpoint tables on middle segments.
  */
 export function routeOrthogonalAroundObstacles(input: RouteInput): Point[] | null {
   const offset = input.offset ?? EDGE_ROUTE_OFFSET;
   const obstacles = relevantObstacles(input, 6);
+  const endpoints = endpointRectsFromObstacles(input.obstacles, input.endpointIds, 0);
   const { source: s, target: t } = input;
+  const so = stubOut(s, input.sourcePosition, offset);
+  const si = stubIn(t, input.targetPosition, offset);
 
-  const candidates: Point[][] = [
-    [s, { x: t.x, y: s.y }, t],
-    [s, { x: s.x, y: t.y }, t],
-    [s, { x: s.x + offset, y: s.y }, { x: s.x + offset, y: t.y }, t],
-    [s, { x: s.x - offset, y: s.y }, { x: s.x - offset, y: t.y }, t],
-    [s, { x: s.x, y: s.y + offset }, { x: t.x, y: s.y + offset }, t],
-    [s, { x: s.x, y: s.y - offset }, { x: t.x, y: s.y - offset }, t],
-    [s, { x: t.x + offset, y: s.y }, { x: t.x + offset, y: t.y }, t],
-    [s, { x: t.x - offset, y: s.y }, { x: t.x - offset, y: t.y }, t],
-    [s, { x: s.x, y: Math.min(s.y, t.y) - offset }, { x: t.x, y: Math.min(s.y, t.y) - offset }, t],
-    [s, { x: s.x, y: Math.max(s.y, t.y) + offset }, { x: t.x, y: Math.max(s.y, t.y) + offset }, t],
+  // Corridors from stubOut → stubIn (handles attached outside)
+  const corridors: Point[][] = [
+    [so, { x: si.x, y: so.y }, si],
+    [so, { x: so.x, y: si.y }, si],
+    [so, { x: so.x + offset, y: so.y }, { x: so.x + offset, y: si.y }, si],
+    [so, { x: so.x - offset, y: so.y }, { x: so.x - offset, y: si.y }, si],
+    [so, { x: so.x, y: so.y + offset }, { x: si.x, y: so.y + offset }, si],
+    [so, { x: so.x, y: so.y - offset }, { x: si.x, y: so.y - offset }, si],
+    [so, { x: si.x + offset, y: so.y }, { x: si.x + offset, y: si.y }, si],
+    [so, { x: si.x - offset, y: so.y }, { x: si.x - offset, y: si.y }, si],
+    [so, { x: so.x, y: Math.min(so.y, si.y) - offset }, { x: si.x, y: Math.min(so.y, si.y) - offset }, si],
+    [so, { x: so.x, y: Math.max(so.y, si.y) + offset }, { x: si.x, y: Math.max(so.y, si.y) + offset }, si],
+    [so, { x: Math.min(so.x, si.x) - offset, y: so.y }, { x: Math.min(so.x, si.x) - offset, y: si.y }, si],
+    [so, { x: Math.max(so.x, si.x) + offset, y: so.y }, { x: Math.max(so.x, si.x) + offset, y: si.y }, si],
   ];
 
-  if (input.sourcePosition === Position.Right) {
-    candidates.unshift([s, { x: Math.max(s.x, t.x) + offset, y: s.y }, { x: Math.max(s.x, t.x) + offset, y: t.y }, t]);
-  } else if (input.sourcePosition === Position.Left) {
-    candidates.unshift([s, { x: Math.min(s.x, t.x) - offset, y: s.y }, { x: Math.min(s.x, t.x) - offset, y: t.y }, t]);
-  } else if (input.sourcePosition === Position.Bottom) {
-    candidates.unshift([s, { x: s.x, y: Math.max(s.y, t.y) + offset }, { x: t.x, y: Math.max(s.y, t.y) + offset }, t]);
-  } else if (input.sourcePosition === Position.Top) {
-    candidates.unshift([s, { x: s.x, y: Math.min(s.y, t.y) - offset }, { x: t.x, y: Math.min(s.y, t.y) - offset }, t]);
-  }
-
-  for (const path of candidates) {
-    const cleaned = dedupePoints(path);
+  let best: Point[] | null = null;
+  let bestLen = Infinity;
+  for (const corridor of corridors) {
+    const cleaned = collapseColinearPoints(dedupePoints([s, ...corridor, t]));
     if (cleaned.length < 2) continue;
-    if (!pathHitsObstacles(cleaned, obstacles)) return cleaned;
+    if (pathHitsObstacles(cleaned, obstacles)) continue;
+    if (pathSkimsEndpoints(cleaned, endpoints, offset)) continue;
+    const len = polylineLength(cleaned);
+    if (len < bestLen) {
+      bestLen = len;
+      best = cleaned;
+    }
   }
 
-  return null;
+  return best;
+}
+
+export function polylineLength(points: Point[]): number {
+  let total = 0;
+  for (let i = 1; i < points.length; i++) {
+    total += Math.hypot(points[i].x - points[i - 1].x, points[i].y - points[i - 1].y);
+  }
+  return total;
 }
 
 export function dedupePoints(points: Point[]): Point[] {
@@ -136,6 +197,23 @@ export function dedupePoints(points: Point[]): Point[] {
     }
   }
   return out;
+}
+
+/** Collapse consecutive collinear points on axis-aligned polylines. */
+export function collapseColinearPoints(points: Point[]): Point[] {
+  if (points.length <= 2) return points.map((p) => ({ ...p }));
+  const out: Point[] = [{ ...points[0] }];
+  for (let i = 1; i < points.length - 1; i++) {
+    const prev = out[out.length - 1];
+    const cur = points[i];
+    const next = points[i + 1];
+    const colinearH = nearlyEqual(prev.y, cur.y) && nearlyEqual(cur.y, next.y);
+    const colinearV = nearlyEqual(prev.x, cur.x) && nearlyEqual(cur.x, next.x);
+    if (colinearH || colinearV) continue;
+    out.push({ ...cur });
+  }
+  out.push({ ...points[points.length - 1] });
+  return dedupePoints(out);
 }
 
 function isOrthogonalPolyline(points: Point[]): boolean {
@@ -216,6 +294,8 @@ export function alignWaypointsToEndpoints(waypoints: Point[], sourceX: number, s
 
   if (merged.length < 2 || !isOrthogonalPolyline(merged)) return null;
 
+  const cleaned = collapseColinearPoints(merged);
+
   if (options?.obstacles?.length && options.endpointIds) {
     const obstacles = relevantObstacles(
       {
@@ -228,10 +308,12 @@ export function alignWaypointsToEndpoints(waypoints: Point[], sourceX: number, s
       },
       4,
     );
-    if (pathHitsObstacles(merged, obstacles)) return null;
+    if (pathHitsObstacles(cleaned, obstacles)) return null;
+    const endpoints = endpointRectsFromObstacles(options.obstacles, options.endpointIds, 0);
+    if (pathSkimsEndpoints(cleaned, endpoints, EDGE_ROUTE_OFFSET)) return null;
   }
 
-  return merged;
+  return cleaned;
 }
 
 export function pointsToSvgPath(points: Point[]): string {
@@ -239,9 +321,14 @@ export function pointsToSvgPath(points: Point[]): string {
   return points.map((p, i) => `${i === 0 ? "M" : "L"}${p.x},${p.y}`).join(" ");
 }
 
-export function midpointAlongPolyline(points: Point[]): Point {
+/**
+ * Point at fraction `t` (0..1) along the polyline by arc length.
+ * Out-of-range t is clamped.
+ */
+export function pointAlongPolyline(points: Point[], t: number): Point {
   if (points.length === 0) return { x: 0, y: 0 };
-  if (points.length === 1) return points[0];
+  if (points.length === 1) return { ...points[0] };
+  const clamped = Math.min(1, Math.max(0, t));
   let total = 0;
   const segs: number[] = [];
   for (let i = 0; i < points.length - 1; i++) {
@@ -249,17 +336,21 @@ export function midpointAlongPolyline(points: Point[]): Point {
     segs.push(d);
     total += d;
   }
-  if (total === 0) return points[0];
-  let remain = total / 2;
+  if (total === 0) return { ...points[0] };
+  let remain = total * clamped;
   for (let i = 0; i < segs.length; i++) {
     if (remain <= segs[i]) {
-      const t = segs[i] === 0 ? 0 : remain / segs[i];
+      const ratio = segs[i] === 0 ? 0 : remain / segs[i];
       return {
-        x: points[i].x + (points[i + 1].x - points[i].x) * t,
-        y: points[i].y + (points[i + 1].y - points[i].y) * t,
+        x: points[i].x + (points[i + 1].x - points[i].x) * ratio,
+        y: points[i].y + (points[i + 1].y - points[i].y) * ratio,
       };
     }
     remain -= segs[i];
   }
-  return points[points.length - 1];
+  return { ...points[points.length - 1] };
+}
+
+export function midpointAlongPolyline(points: Point[]): Point {
+  return pointAlongPolyline(points, 0.5);
 }

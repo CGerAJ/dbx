@@ -1,9 +1,43 @@
 import type { ColumnInfo, ForeignKeyInfo } from "@/types/database";
+import type { EditableStructureIndex } from "@/lib/table/tableStructureEditorSql";
+
+export type DiagramTableOrigin = "live" | "draft";
 
 export interface DiagramTable {
   name: string;
   columns: ColumnInfo[];
   foreignKeys: ForeignKeyInfo[];
+  /** Draft-only index definitions synced via buildCreateTableSql */
+  indexes?: EditableStructureIndex[];
+  /** live = from DB metadata; draft = local design not yet synced */
+  origin?: DiagramTableOrigin;
+  syncStatus?: "pending" | "synced" | "error";
+  /**
+   * Live tables only: column names not yet in DB (subset of `columns`).
+   * Editable in Inspector; synced via ALTER ADD COLUMN.
+   */
+  pendingColumnNames?: string[];
+}
+
+export function isDraftTable(table: DiagramTable): boolean {
+  return (table.origin ?? "live") === "draft";
+}
+
+export function isLiveTable(table: DiagramTable): boolean {
+  return !isDraftTable(table);
+}
+
+export function hasPendingColumns(table: DiagramTable): boolean {
+  return (table.pendingColumnNames?.length ?? 0) > 0;
+}
+
+export function isPendingColumn(table: DiagramTable, columnName: string): boolean {
+  return (table.pendingColumnNames ?? []).some((name) => name === columnName);
+}
+
+/** Tables that need sync: full draft creates and/or live pending column adds. */
+export function needsDiagramSync(table: DiagramTable): boolean {
+  return isDraftTable(table) || hasPendingColumns(table);
 }
 
 export interface DiagramRelationship {

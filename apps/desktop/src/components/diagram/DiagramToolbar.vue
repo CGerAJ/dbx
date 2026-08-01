@@ -4,7 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Copy, Download, Link2, Loader2, Maximize2, Minimize2, Network, RefreshCw, Search, Table2, X, ZoomIn, ZoomOut, LayoutGrid } from "@lucide/vue";
+import { Copy, Download, Link2, Loader2, Maximize2, Minimize2, Network, Plus, RefreshCw, Search, Table2, Upload, X, ZoomIn, ZoomOut, LayoutGrid } from "@lucide/vue";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
 import ConnectionGroupBadge from "@/components/connection/ConnectionGroupBadge.vue";
@@ -38,6 +38,7 @@ const props = defineProps<{
   focusTableName: string;
   generatedJoinSql: string;
   isFullscreen?: boolean;
+  draftTableCount?: number;
 }>();
 
 const emit = defineEmits<{
@@ -56,6 +57,8 @@ const emit = defineEmits<{
   (e: "zoom-in"): void;
   (e: "toggle-fullscreen"): void;
   (e: "auto-layout"): void;
+  (e: "create-table"): void;
+  (e: "sync-to-database"): void;
 }>();
 
 const EXPORT_FORMATS: DiagramExportFormat[] = ["svg", "png", "json", "dbml", "mermaid"];
@@ -139,12 +142,23 @@ function connectionIconType(id: string) {
       </Button>
     </div>
 
+    <Button variant="outline" size="sm" class="h-8 px-2 text-xs" :disabled="!diagramReady" :title="t('diagram.createTable')" @click="emit('create-table')">
+      <Plus class="mr-1 h-3.5 w-3.5" />
+      {{ t("diagram.createTable") }}
+    </Button>
+
+    <Button variant="outline" size="sm" class="h-8 px-2 text-xs" :disabled="!diagramReady || !(draftTableCount ?? 0)" :title="t('diagram.syncToDatabase')" :class="(draftTableCount ?? 0) > 0 ? 'bg-primary/10 border-primary text-primary' : ''" @click="emit('sync-to-database')">
+      <Upload class="mr-1 h-3.5 w-3.5" />
+      {{ t("diagram.syncToDatabase") }}
+      <Badge v-if="(draftTableCount ?? 0) > 0" variant="secondary" class="ml-1 h-4 px-1 text-[10px]">{{ draftTableCount }}</Badge>
+    </Button>
+
     <Button variant="outline" size="sm" class="h-8 px-2 text-xs" :disabled="tablesCount === 0" :title="t('diagram.modelRelationships')" :class="showMatchPanel ? 'bg-primary/10 border-primary text-primary' : ''" @click="emit('toggle-match-panel')">
       <Link2 class="mr-1 h-3.5 w-3.5" />
       {{ t("diagram.modelRelationships") }}
     </Button>
 
-    <Button variant="outline" size="sm" class="h-8 px-2 text-xs" :disabled="tablesCount === 0" :title="t('diagram.layers')" :class="showLayersPanel ? 'bg-primary/10 border-primary text-primary' : ''" @click="emit('toggle-layers-panel')">
+    <Button variant="outline" size="sm" class="h-8 px-2 text-xs" :disabled="!diagramReady" :title="t('diagram.layers')" :class="showLayersPanel ? 'bg-primary/10 border-primary text-primary' : ''" @click="emit('toggle-layers-panel')">
       <LayoutGrid class="mr-1 h-3.5 w-3.5" />
       {{ t("diagram.layers") }}
     </Button>

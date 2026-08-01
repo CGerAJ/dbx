@@ -8,10 +8,11 @@ function deepClone<T>(obj: T): T {
   return JSON.parse(JSON.stringify(obj));
 }
 
-function emptySnapshotExtras(): Pick<HistorySnapshot, "positions" | "layers" | "customRelationships" | "edgeWaypoints" | "edgeHandleHints" | "matchConfirms" | "matchIgnores"> {
+function emptySnapshotExtras(): Pick<HistorySnapshot, "positions" | "layers" | "tables" | "customRelationships" | "edgeWaypoints" | "edgeHandleHints" | "matchConfirms" | "matchIgnores"> {
   return {
     positions: {},
     layers: [],
+    tables: [],
     customRelationships: [],
     edgeWaypoints: {},
     edgeHandleHints: {},

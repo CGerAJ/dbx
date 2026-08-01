@@ -48,6 +48,9 @@ export const useLayerStore = defineStore("diagram-layer", () => {
   }
 
   function addLayer(name?: string, position?: { x: number; y: number }, size?: { width?: number; height?: number }): DiagramLayer {
+    for (const layer of layers.value) {
+      layer.collapsed = true;
+    }
     const newLayer: DiagramLayer = {
       id: generateLayerId(),
       name: name || getNextLayerName(layers.value.map((l) => l.name)),

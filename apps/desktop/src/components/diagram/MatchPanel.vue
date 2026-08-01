@@ -6,20 +6,7 @@ import { Badge } from "@/components/ui/badge";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Check, X, Trash2, Zap } from "@lucide/vue";
 import type { InferredRelationship } from "@/types/diagram";
-
-type CardinalityChoice = "one-to-one" | "one-to-many" | "many-to-one" | "many-to-many";
-
-type CardinalityPair = {
-  sourceCardinality: "1" | "N";
-  targetCardinality: "1" | "N";
-};
-
-function cardinalityPairFromChoice(choice: CardinalityChoice): CardinalityPair {
-  if (choice === "one-to-one") return { sourceCardinality: "1", targetCardinality: "1" };
-  if (choice === "one-to-many") return { sourceCardinality: "1", targetCardinality: "N" };
-  if (choice === "many-to-many") return { sourceCardinality: "N", targetCardinality: "N" };
-  return { sourceCardinality: "N", targetCardinality: "1" };
-}
+import { cardinalityPairFromChoice, type CardinalityChoice, type CardinalityPair } from "@/lib/diagram/cardinality";
 
 const DEFAULT_CHOICE: CardinalityChoice = "many-to-one";
 

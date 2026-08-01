@@ -35,6 +35,7 @@ function snapshot(partial: Partial<HistorySnapshot> = {}): HistorySnapshot {
         height: 100,
       },
     ],
+    tables: [emptyTable("users")],
     customRelationships: [
       {
         id: "custom-1",
@@ -103,4 +104,27 @@ test("undo/redo round-trips snapshot extras", () => {
   assert.deepEqual(afterRedo!.positions.users, { x: 2, y: 2 });
   assert.deepEqual(afterRedo!.matchConfirms, ["new"]);
   assert.deepEqual(afterRedo!.layers, []);
+});
+
+test("undo/redo round-trips tables field", () => {
+  const store = useGraphStore();
+  const olderTables = [emptyTable("users"), emptyTable("draft_a")];
+  const newerTables = [emptyTable("users"), emptyTable("draft_b")];
+  const older = snapshot({ tables: olderTables, positions: { users: { x: 1, y: 1 } } });
+  const newer = snapshot({ tables: newerTables, positions: { users: { x: 2, y: 2 } } });
+
+  store.pushHistory(older);
+  const afterUndo = store.undo(newer);
+  assert.ok(afterUndo);
+  assert.deepEqual(
+    afterUndo!.tables.map((t) => t.name),
+    ["users", "draft_a"],
+  );
+
+  const afterRedo = store.redo(afterUndo!);
+  assert.ok(afterRedo);
+  assert.deepEqual(
+    afterRedo!.tables.map((t) => t.name),
+    ["users", "draft_b"],
+  );
 });

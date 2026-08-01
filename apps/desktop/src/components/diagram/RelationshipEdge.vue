@@ -5,9 +5,14 @@ import type { DiagramRelationship } from "@/lib/diagram/erDiagram";
 import type { InferredRelationship } from "@/types/diagram";
 import { DIAGRAM_HOVERED_EDGE_KEY, DIAGRAM_EDGE_OBSTACLES_KEY, EDGE_ROUTE_OFFSET, EDGE_STROKE_IDLE, EDGE_STROKE_HOVER } from "@/lib/diagram/diagram-constants";
 import type { RelationshipEdgeData } from "@/lib/diagram/vue-flow-adapter";
-import { alignWaypointsToEndpoints, midpointAlongPolyline, pointsToSvgPath, routeOrthogonalAroundObstacles, type ObstacleRect, type Point } from "@/lib/diagram/edge-obstacle-router";
+import { alignWaypointsToEndpoints, endpointRectsFromObstacles, pathSkimsEndpoints, pointAlongPolyline, pointsToSvgPath, polylineLength, routeOrthogonalAroundObstacles, type ObstacleRect, type Point } from "@/lib/diagram/edge-obstacle-router";
 
 const HOVER_BLUE = "#2563eb";
+/** Prefer live obstacle routing when it is at most this fraction of aligned ELK path length. */
+const LIVE_ROUTE_LENGTH_RATIO = 0.85;
+/** Cardinality badge positions along the edge (arc-length fraction). */
+const SOURCE_CARDINALITY_T = 0.18;
+const TARGET_CARDINALITY_T = 0.82;
 
 const props = defineProps<EdgeProps<RelationshipEdgeData>>();
 
@@ -28,37 +33,56 @@ function snapRoutedToHandles(points: Point[]): Point[] {
 }
 
 function buildRoutedPoints(): Point[] | null {
-  const stored = props.data?.waypoints;
   const obstacleList = obstacles?.value ?? [];
-  if (stored?.length) {
-    const aligned = alignWaypointsToEndpoints(stored, props.sourceX, props.sourceY, props.targetX, props.targetY, { obstacles: obstacleList, endpointIds: [props.source, props.target] });
-    if (aligned?.length) return snapRoutedToHandles(aligned);
-  }
+  const endpointIds: [string, string] = [props.source, props.target];
+  const endpointRects = endpointRectsFromObstacles(obstacleList, endpointIds);
 
-  const routed = routeOrthogonalAroundObstacles({
+  const live = routeOrthogonalAroundObstacles({
     source: { x: props.sourceX, y: props.sourceY },
     target: { x: props.targetX, y: props.targetY },
     sourcePosition: props.sourcePosition,
     targetPosition: props.targetPosition,
     obstacles: obstacleList,
-    endpointIds: [props.source, props.target],
+    endpointIds,
     offset: EDGE_ROUTE_OFFSET,
   });
-  return routed?.length ? snapRoutedToHandles(routed) : null;
+
+  const stored = props.data?.waypoints;
+  let aligned: Point[] | null = null;
+  if (stored?.length) {
+    aligned = alignWaypointsToEndpoints(stored, props.sourceX, props.sourceY, props.targetX, props.targetY, {
+      obstacles: obstacleList,
+      endpointIds,
+    });
+    // Drop ELK paths that skim endpoint table borders (align also rejects when obstacles present)
+    if (aligned?.length && pathSkimsEndpoints(aligned, endpointRects)) {
+      aligned = null;
+    }
+  }
+
+  if (aligned?.length && live?.length) {
+    const alignedLen = polylineLength(aligned);
+    const liveLen = polylineLength(live);
+    if (alignedLen > 0 && liveLen <= alignedLen * LIVE_ROUTE_LENGTH_RATIO) {
+      return snapRoutedToHandles(live);
+    }
+    return snapRoutedToHandles(aligned);
+  }
+  if (aligned?.length) return snapRoutedToHandles(aligned);
+  if (live?.length) return snapRoutedToHandles(live);
+  return null;
 }
 
 const pathResult = computed(() => {
   const routed = buildRoutedPoints();
   if (routed?.length) {
-    const mid = midpointAlongPolyline(routed);
     return {
       path: pointsToSvgPath(routed),
-      labelX: mid.x,
-      labelY: mid.y,
+      points: routed,
     };
   }
 
-  const [path, labelX, labelY] = getSmoothStepPath({
+  const [path] = getSmoothStepPath({
     sourceX: props.sourceX,
     sourceY: props.sourceY,
     targetX: props.targetX,
@@ -68,12 +92,21 @@ const pathResult = computed(() => {
     borderRadius: 0,
     offset: EDGE_ROUTE_OFFSET,
   });
-  return { path, labelX, labelY };
+  // Smooth-step fallback: approximate with endpoint → mid → endpoint for badge placement
+  const mid = {
+    x: (props.sourceX + props.targetX) / 2,
+    y: (props.sourceY + props.targetY) / 2,
+  };
+  return {
+    path,
+    points: [{ x: props.sourceX, y: props.sourceY }, mid, { x: props.targetX, y: props.targetY }],
+  };
 });
 
 const path = computed(() => pathResult.value.path);
-const labelX = computed(() => pathResult.value.labelX);
-const labelY = computed(() => pathResult.value.labelY);
+
+const sourceBadgePos = computed(() => pointAlongPolyline(pathResult.value.points, SOURCE_CARDINALITY_T));
+const targetBadgePos = computed(() => pointAlongPolyline(pathResult.value.points, TARGET_CARDINALITY_T));
 
 const idleStroke = computed(() => {
   const rel = props.data?.relationship;
@@ -102,24 +135,22 @@ const strokeDasharray = computed(() => {
   return "5,5";
 });
 
-const markerId = computed(() => `relationship-arrow-${props.id}`);
-
-const cardinalityLabel = computed(() => {
+const sourceCardinality = computed(() => {
   const rel = props.data?.relationship;
-  if (!rel) return "N:1";
-  if (isDiagramRelationship(rel) && rel.sourceCardinality && rel.targetCardinality) {
-    return `${rel.sourceCardinality}:${rel.targetCardinality}`;
-  }
-  return "N:1";
+  if (rel && isDiagramRelationship(rel) && rel.sourceCardinality) return rel.sourceCardinality;
+  return "N";
 });
+
+const targetCardinality = computed(() => {
+  const rel = props.data?.relationship;
+  if (rel && isDiagramRelationship(rel) && rel.targetCardinality) return rel.targetCardinality;
+  return "1";
+});
+
+const badgeClass = computed(() => (isHovered.value ? "border-blue-500 text-blue-600" : "border-border/80 text-foreground"));
 </script>
 
 <template>
-  <defs>
-    <marker :id="markerId" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto" markerUnits="strokeWidth">
-      <path d="M 0 0 L 8 4 L 0 8 z" :fill="strokeColor" />
-    </marker>
-  </defs>
   <BaseEdge
     :id="id"
     :path="path"
@@ -129,17 +160,25 @@ const cardinalityLabel = computed(() => {
       strokeWidth: strokeWidth,
       strokeDasharray: strokeDasharray === 'none' ? undefined : strokeDasharray,
     }"
-    :marker-end="`url(#${markerId})`"
   />
   <EdgeLabelRenderer>
     <div
-      class="nopan nodrag pointer-events-none absolute z-10 rounded border bg-background/95 px-1.5 py-0.5 font-mono text-[10px] font-medium leading-none shadow-sm"
-      :class="isHovered ? 'border-blue-500 text-blue-600' : 'border-border/80 text-foreground'"
+      class="nopan nodrag pointer-events-none absolute z-10 min-w-[1.1rem] rounded border bg-background/95 px-1 py-0.5 text-center font-mono text-[10px] font-semibold leading-none shadow-sm"
+      :class="badgeClass"
       :style="{
-        transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)`,
+        transform: `translate(-50%, -50%) translate(${sourceBadgePos.x}px, ${sourceBadgePos.y}px)`,
       }"
     >
-      {{ cardinalityLabel }}
+      {{ sourceCardinality }}
+    </div>
+    <div
+      class="nopan nodrag pointer-events-none absolute z-10 min-w-[1.1rem] rounded border bg-background/95 px-1 py-0.5 text-center font-mono text-[10px] font-semibold leading-none shadow-sm"
+      :class="badgeClass"
+      :style="{
+        transform: `translate(-50%, -50%) translate(${targetBadgePos.x}px, ${targetBadgePos.y}px)`,
+      }"
+    >
+      {{ targetCardinality }}
     </div>
   </EdgeLabelRenderer>
 </template>

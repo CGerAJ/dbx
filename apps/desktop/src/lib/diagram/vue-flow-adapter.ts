@@ -13,27 +13,37 @@ export type RelationshipEdgeData = {
   waypoints?: Point[];
 };
 
+/** Table is on canvas when unlayered, or when its layer is visible. */
+export function isTableCanvasVisible(tableName: string, layers: DiagramLayer[]): boolean {
+  const layer = layers.find((l) => l.tableNames.includes(tableName));
+  if (!layer) return true;
+  return layer.visible;
+}
+
 /** positions are absolute canvas coordinates; converted to relative when parented to a visible layer */
 export function toVueFlowNodes(tables: DiagramTable[], positions?: Record<string, { x: number; y: number }>): Node<{ table: DiagramTable }>[] {
   const layerStore = useLayerStore();
+  const layers = layerStore.layers;
 
-  return tables.map((table) => {
-    const layer = layerStore.getLayerByTable(table.name);
-    const absolute = positions?.[table.name] || { x: 0, y: 0 };
-    const visibleParent = layer?.visible ? layer : undefined;
-    const layerPos = visibleParent?.position || { x: 0, y: 0 };
-    const relative = visibleParent ? { x: absolute.x - layerPos.x, y: absolute.y - layerPos.y } : absolute;
+  return tables
+    .filter((table) => isTableCanvasVisible(table.name, layers))
+    .map((table) => {
+      const layer = layerStore.getLayerByTable(table.name);
+      const absolute = positions?.[table.name] || { x: 0, y: 0 };
+      const visibleParent = layer?.visible ? layer : undefined;
+      const layerPos = visibleParent?.position || { x: 0, y: 0 };
+      const relative = visibleParent ? { x: absolute.x - layerPos.x, y: absolute.y - layerPos.y } : absolute;
 
-    return {
-      id: table.name,
-      type: "table",
-      position: relative,
-      parentNode: visibleParent?.id,
-      expandParent: false,
-      zIndex: TABLE_Z_INDEX,
-      data: { table },
-    };
-  });
+      return {
+        id: table.name,
+        type: "table",
+        position: relative,
+        parentNode: visibleParent?.id,
+        expandParent: false,
+        zIndex: TABLE_Z_INDEX,
+        data: { table },
+      };
+    });
 }
 
 export function toDiagramNodes(vueFlowNodes: Node<{ table: DiagramTable }>[]): DiagramNode[] {
@@ -74,31 +84,35 @@ export function toVueFlowEdges(
   tableHeights?: Record<string, number>,
   handleHintsById?: Record<string, { sourceHandle?: string; targetHandle?: string }>,
 ): Edge<RelationshipEdgeData>[] {
-  return relationships.map((rel) => {
-    const sourceHeight = tableHeights?.[rel.sourceTable] ?? tableCardHeight(0);
-    const targetHeight = tableHeights?.[rel.targetTable] ?? tableCardHeight(0);
-    const waypoints = waypointsById?.[rel.id];
-    const fromWaypoints = waypoints?.length ? handlesFromWaypoints(waypoints) : null;
-    const hint = handleHintsById?.[rel.id];
-    const picked = pickHandles(positions?.[rel.sourceTable], positions?.[rel.targetTable], sourceHeight, targetHeight);
-    const sourceHandle = fromWaypoints?.sourceHandle || hint?.sourceHandle || picked.sourceHandle;
-    const targetHandle = fromWaypoints?.targetHandle || hint?.targetHandle || picked.targetHandle;
-    return {
-      id: rel.id,
-      type: "relationship",
-      source: rel.sourceTable,
-      target: rel.targetTable,
-      sourceHandle,
-      targetHandle,
-      class: "relationship-edge",
-      selectable: true,
-      interactionWidth: 24,
-      data: {
-        relationship: rel,
-        ...(waypoints?.length ? { waypoints } : {}),
-      },
-    };
-  });
+  const layers = useLayerStore().layers;
+
+  return relationships
+    .filter((rel) => isTableCanvasVisible(rel.sourceTable, layers) && isTableCanvasVisible(rel.targetTable, layers))
+    .map((rel) => {
+      const sourceHeight = tableHeights?.[rel.sourceTable] ?? tableCardHeight(0);
+      const targetHeight = tableHeights?.[rel.targetTable] ?? tableCardHeight(0);
+      const waypoints = waypointsById?.[rel.id];
+      const fromWaypoints = waypoints?.length ? handlesFromWaypoints(waypoints) : null;
+      const hint = handleHintsById?.[rel.id];
+      const picked = pickHandles(positions?.[rel.sourceTable], positions?.[rel.targetTable], sourceHeight, targetHeight);
+      const sourceHandle = fromWaypoints?.sourceHandle || hint?.sourceHandle || picked.sourceHandle;
+      const targetHandle = fromWaypoints?.targetHandle || hint?.targetHandle || picked.targetHandle;
+      return {
+        id: rel.id,
+        type: "relationship",
+        source: rel.sourceTable,
+        target: rel.targetTable,
+        sourceHandle,
+        targetHandle,
+        class: "relationship-edge",
+        selectable: true,
+        interactionWidth: 24,
+        data: {
+          relationship: rel,
+          ...(waypoints?.length ? { waypoints } : {}),
+        },
+      };
+    });
 }
 
 export function toDiagramEdges(vueFlowEdges: Edge<RelationshipEdgeData>[]): DiagramEdge[] {

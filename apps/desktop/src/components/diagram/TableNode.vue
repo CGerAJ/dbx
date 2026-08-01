@@ -4,6 +4,7 @@ import { Handle, Position } from "@vue-flow/core";
 import { Table2, KeyRound, Link2 } from "@lucide/vue";
 import { Badge } from "@/components/ui/badge";
 import type { DiagramTable, DiagramRelationship } from "@/lib/diagram/erDiagram";
+import { isDraftTable } from "@/lib/diagram/erDiagram";
 import type { InferredRelationship } from "@/types/diagram";
 import { useLayerStore } from "@/lib/diagram/layer-store";
 import { CARD_WIDTH, COLUMN_TYPE_WIDTH, COLUMN_NAME_MAX_CHARS, COLUMN_TYPE_MAX_CHARS, TABLE_NAME_MAX_CHARS, EDGE_HANDLE_OUTSET } from "@/lib/diagram/diagram-constants";
@@ -20,6 +21,8 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: "dblclick", event: MouseEvent): void;
 }>();
+
+const isDraft = computed(() => isDraftTable(props.data.table));
 
 function visibleColumns(table: DiagramTable) {
   return table.columns;
@@ -69,6 +72,7 @@ const handleOffsetStyle = computed(() =>
         <span class="min-w-0 flex-1 truncate text-sm font-medium" :title="data.table.name">
           {{ truncateLabel(data.table.name, TABLE_NAME_MAX_CHARS) }}
         </span>
+        <Badge v-if="isDraft" variant="outline" class="h-5 shrink-0 px-1.5 text-[10px] border-amber-500/50 text-amber-700 dark:text-amber-400">Draft</Badge>
         <Badge variant="outline" class="h-5 px-1.5 text-[10px]">{{ data.table.columns.length }}</Badge>
       </div>
       <div>

@@ -32,6 +32,10 @@ const tables: DiagramTable[] = [
 
 test("exports the table diagram as standalone SVG", () => {
   const relationships = buildDiagramRelationships(tables);
+  const polyline = [
+    { x: 360, y: 96 },
+    { x: 310, y: 96 },
+  ];
   const svg = buildTableDiagramSvg({
     tables,
     relationships,
@@ -41,6 +45,9 @@ test("exports the table diagram as standalone SVG", () => {
     },
     relationshipPaths: {
       [relationships[0].id]: "M 360 96 L 310 96",
+    },
+    relationshipPolylines: {
+      [relationships[0].id]: polyline,
     },
     canvas: { width: 720, height: 320 },
     cardWidth: 270,
@@ -55,7 +62,14 @@ test("exports the table diagram as standalone SVG", () => {
   assert.match(svg, />name &amp; note</);
   assert.match(svg, />PK</);
   assert.match(svg, />FK</);
+  // Endpoint cardinality badges (FK defaults to N:1 — N near source, 1 near target)
+  assert.match(svg, /diagram-cardinality/);
+  assert.match(svg, />N</);
+  assert.match(svg, />1</);
+  assert.doesNotMatch(svg, /N:1/);
   assert.doesNotMatch(svg, /<foreignObject/);
+  assert.doesNotMatch(svg, /marker-end=/);
+  assert.doesNotMatch(svg, /id="dbx-diagram-arrow"/);
 });
 
 test("omits relationship paths when relationshipPaths entry is missing", () => {
@@ -74,7 +88,8 @@ test("omits relationship paths when relationshipPaths entry is missing", () => {
     columnRowHeight: COLUMN_ROW_HEIGHT,
   });
 
-  assert.doesNotMatch(svg, /marker-end="url\(#dbx-diagram-arrow\)"/);
+  assert.doesNotMatch(svg, /marker-end=/);
+  assert.doesNotMatch(svg, /id="dbx-diagram-arrow"/);
 });
 
 test("draws visible layers and skips zero-size layers", () => {
