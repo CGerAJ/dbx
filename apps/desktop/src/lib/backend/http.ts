@@ -4,6 +4,7 @@ import type {
   DatabaseConnectionInfo,
   DatabaseInfo,
   DatabaseStorageInfo,
+  SqlServerCompletionContext,
   SchemaInfo,
   LinkedServerInfo,
   CatalogInfo,
@@ -632,6 +633,10 @@ export async function listDatabaseStorage(connectionId: string, databases: strin
     connection_id: connectionId,
     databases,
   });
+}
+
+export async function getSqlServerCompletionContext(connectionId: string, database: string): Promise<SqlServerCompletionContext> {
+  return get(`/api/schema/sqlserver/completion-context?${qs({ connection_id: connectionId, database })}`);
 }
 
 export async function listDorisCatalogs(connectionId: string): Promise<CatalogInfo[]> {
@@ -3135,13 +3140,14 @@ export async function mongoDeleteDocument(connectionId: string, database: string
   return documentDeleteDocument(connectionId, database, collection, id, routing);
 }
 
-export async function documentDeleteDocument(connectionId: string, database: string, collection: string, id: string, routing?: string): Promise<number> {
+export async function documentDeleteDocument(connectionId: string, database: string, collection: string, id: string, routing?: string, documentType?: string): Promise<number> {
   return post("/api/document-store/delete-document", {
     connectionId,
     database,
     collection,
     id,
     routing,
+    documentType,
   });
 }
 

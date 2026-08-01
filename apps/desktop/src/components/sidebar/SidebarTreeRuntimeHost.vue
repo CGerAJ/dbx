@@ -90,6 +90,7 @@ import {
   supportsTableStructureEditing,
   supportsTransfer,
   usesTreeSchemaMode,
+  isSingleDatabase,
 } from "@/lib/database/databaseCapabilities";
 import { copyNameForTreeNode, isDocumentBrowserTreeNode, objectSourceKindForTreeNode, shouldRunTreeNodeRowAction, treeNodeRowAction, treeNodeRowDoubleClickAction } from "@/lib/sidebar/treeNodeClick";
 import { dataTabOpenModeFromTreeClick, type DataTabOpenMode } from "@/lib/sidebar/dataTabOpenPolicy";
@@ -104,6 +105,7 @@ import {
   buildDropDatabaseSql,
   buildDropObjectSql,
   buildDropSchemaSql,
+  damengDropSchemaExecutionSchema,
   buildGetDatabaseCommentSql,
   buildGetSchemaCommentSql,
   buildUpdateDatabasePropertiesSql,
@@ -113,6 +115,7 @@ import {
   buildCopyTableDataSql,
   buildEmptyTableSql,
   buildTruncateTableSql,
+  duplicateTableStructureRequiresScript,
   supportsDropTableCascade,
   supportsTruncateTableCascade,
   supportsSchemaComment,
@@ -921,6 +924,7 @@ function requestPasteTreeClipboard(): boolean {
     connectionId: entry.connectionId,
     database: entry.database,
     schema: normalizeTreeClipboardSchema(entry.connectionId, entry.database, entry.schema),
+    tableComment: entry.tableComment,
   }));
   showPasteDialog.value = true;
   return true;
@@ -1042,7 +1046,7 @@ function activateDataTableFromDoubleClick() {
   if (node.type !== "table" || !hasNodeDatabaseContext(node)) return;
   const activation = settingsStore.editorSettings.sidebarActivation;
   const existingSameTableTab = findExistingSameTableDataTab();
-  const action = dataTableDoubleClickAction(existingSameTableTab, activation);
+  const action = dataTableDoubleClickAction(existingSameTableTab, activation, settingsStore.editorSettings.reuseDataTab);
   if (action === "none") return;
   if (action === "open") {
     openDataImmediately(node);
@@ -1248,7 +1252,8 @@ async function loadTemplateContext(allowView = false) {
     }
   }
 
-  return { node, dbType, tableSchema, columns, tableType };
+  const identifierQuote = connectionStore.connectionIdentifierQuote(node.connectionId);
+  return { node, dbType, identifierQuote, tableSchema, columns, tableType };
 }
 
 function openSqlTemplateTab(connectionId: string, database: string, schema: string | undefined, catalog: string | undefined, sql: string, title?: string) {
@@ -1262,6 +1267,7 @@ async function newSelectTemplate() {
     if (!context) return;
     const sql = buildTableSelectTemplate({
       databaseType: context.dbType,
+      identifierQuote: context.identifierQuote,
       catalog: context.node.catalog,
       database: context.node.database,
       schema: context.tableSchema,
@@ -1280,6 +1286,7 @@ async function newInsertTemplate() {
     if (!context) return;
     const sql = buildTableInsertTemplate({
       databaseType: context.dbType,
+      identifierQuote: context.identifierQuote,
       catalog: context.node.catalog,
       database: context.node.database,
       schema: context.tableSchema,
@@ -1299,6 +1306,7 @@ async function newUpdateTemplate() {
     if (!context) return;
     const sql = buildTableUpdateTemplate({
       databaseType: context.dbType,
+      identifierQuote: context.identifierQuote,
       catalog: context.node.catalog,
       database: context.node.database,
       schema: context.tableSchema,
@@ -1317,6 +1325,7 @@ async function newDeleteTemplate() {
     if (!context) return;
     const sql = buildTableDeleteTemplate({
       databaseType: context.dbType,
+      identifierQuote: context.identifierQuote,
       catalog: context.node.catalog,
       database: context.node.database,
       schema: context.tableSchema,
@@ -1416,6 +1425,7 @@ function updateTreeClipboardForNodes(nodes: TreeNode[]) {
       database: node.database,
       schema: normalizeTreeClipboardSchema(node.connectionId, node.database, node.schema),
       tableName: node.label,
+      tableComment: node.comment,
     })),
   };
 }
@@ -1918,7 +1928,7 @@ function openRenameObjectDialog() {
   showRenameObjectDialog.value = true;
 }
 
-async function executeTreeNodeSqlWithProductionGuard(node: Pick<TreeNode, "connectionId" | "database" | "schema">, sql: string, options: { database?: string; schema?: string } = {}) {
+async function executeTreeNodeSqlWithProductionGuard(node: Pick<TreeNode, "connectionId" | "database" | "schema">, sql: string, options: { database?: string; schema?: string; executeAsScript?: boolean } = {}) {
   if (!node.connectionId) return undefined;
   const database = options.database ?? node.database ?? "";
   return executeWithProductionSqlGuard({
@@ -1926,7 +1936,7 @@ async function executeTreeNodeSqlWithProductionGuard(node: Pick<TreeNode, "conne
     database,
     sql,
     source: t("production.sourceSidebar"),
-    execute: () => api.executeQuery(node.connectionId!, database, sql, options.schema ?? node.schema),
+    execute: () => (options.executeAsScript ? api.executeScript(node.connectionId!, database, sql, options.schema ?? node.schema) : api.executeQuery(node.connectionId!, database, sql, options.schema ?? node.schema)),
   });
 }
 
@@ -2025,15 +2035,17 @@ async function confirmDropObject() {
     const msgKey = node.type === "view" ? "contextMenu.dropViewSuccess" : node.type === "materialized_view" ? "contextMenu.dropViewSuccess" : node.type === "procedure" ? "contextMenu.dropProcedureSuccess" : "contextMenu.dropFunctionSuccess";
     toast(t(msgKey, { name: node.label }), 3000);
     closeDroppedTableObjectTabsForNode(node);
-    // Procedure/function drops refresh their parent instead of removing this
-    // node directly, so clear their pin before the old identity can survive.
+    // Refresh the parent object list so group badges and children stay in sync.
+    // Clear the pin first — refresh rebuilds nodes and the old identity must not survive.
     connectionStore.removePinnedTreeNodes([node]);
-    if (node.type === "view" || node.type === "materialized_view") {
-      connectionStore.removeTreeNode(node.id);
-      releaseActiveNodeReference([node.id]);
-    } else {
+    try {
       await refreshTableList(node);
+    } catch (error: any) {
+      // DROP already succeeded; keep the sidebar consistent if metadata refresh fails.
+      connectionStore.removeTreeNode(node.id);
+      toast(t("contextMenu.objectDropRefreshFailed", { message: error?.message || String(error) }), 5000);
     }
+    releaseActiveNodeReference([node.id]);
   } catch (e: any) {
     toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
   }
@@ -2129,6 +2141,7 @@ async function confirmBatchDrop() {
       showBatchDropConfirm.value = false;
       return;
     }
+    const refreshScopes = new Map<string, TreeNode>();
     for (const target of targets) {
       if (!target.connectionId || !target.database) continue;
       await connectionStore.ensureConnected(target.connectionId);
@@ -2136,11 +2149,18 @@ async function confirmBatchDrop() {
       if (!sql) continue;
       await executeTreeNodeSqlWithProductionGuard(target, sql, { database: target.database, schema: target.schema });
       closeDroppedTableObjectTabsForNode(target);
+      // Remove immediately so a later failure cannot leave dropped objects in the tree.
       connectionStore.removeTreeNode(target.id);
       releaseActiveNodeReference([target.id]);
+      refreshScopes.set(`${target.connectionId}:${target.database}:${target.schema ?? ""}`, target);
     }
     toast(t("contextMenu.batchDropSuccess", { count: targets.length }), 3000);
     showBatchDropConfirm.value = false;
+    const refreshResults = await Promise.allSettled([...refreshScopes.values()].map((target) => refreshTableList(target)));
+    const refreshFailure = refreshResults.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (refreshFailure) {
+      toast(t("contextMenu.objectDropRefreshFailed", { message: refreshFailure.reason?.message || String(refreshFailure.reason) }), 5000);
+    }
   } catch (e: any) {
     toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
   }
@@ -2272,7 +2292,8 @@ const canCreateSchema = computed(() => {
 
 const canDropSchema = computed(() => {
   const config = activeNode.value.connectionId ? connectionStore.getConfig(activeNode.value.connectionId) : undefined;
-  return activeNode.value.type === "schema" && !isSqlServerLinkedNode(activeNode.value) && usesTreeSchemaMode(effectiveDatabaseTypeForConnection(config)) && !connectionUsesDatabaseObjectTreeMode(config);
+  const dbType = effectiveDatabaseTypeForConnection(config);
+  return activeNode.value.type === "schema" && !isSqlServerLinkedNode(activeNode.value) && (usesTreeSchemaMode(dbType) || dbType === "dameng") && !connectionUsesDatabaseObjectTreeMode(config);
 });
 
 const canEditSchemaComment = computed(() => {
@@ -2931,17 +2952,25 @@ async function confirmDropSchema() {
   if (!node.connectionId || !node.database) return;
   try {
     await connectionStore.ensureConnected(node.connectionId);
+    const config = connectionStore.getConfig(node.connectionId);
+    const dbType = effectiveDatabaseTypeForConnection(config);
+    let dropExecutionSchema: string | undefined;
+    if (dbType === "dameng") {
+      dropExecutionSchema = damengDropSchemaExecutionSchema(config?.username, node.label) ?? undefined;
+      if (!dropExecutionSchema) throw new Error(t("contextMenu.dropDamengSchemaRequiresDifferentDba"));
+    }
     const sql =
       dropSchemaPreviewSql.value ||
       (await buildDropSchemaSql({
         databaseType: databaseTypeForNode(node),
         name: node.label,
       }));
-    await executeTreeNodeSqlWithProductionGuard(node, sql, { database: node.database });
+    await executeTreeNodeSqlWithProductionGuard(node, sql, { database: node.database, schema: dropExecutionSchema });
     toast(t("contextMenu.dropSchemaSuccess", { name: node.label }), 3000);
-    const config = connectionStore.getConfig(node.connectionId);
     if (config?.db_type === "sqlserver") {
       await connectionStore.loadSqlServerDatabaseObjects(node.connectionId, node.database, { force: true });
+    } else if (isSingleDatabase(dbType)) {
+      await connectionStore.loadDatabases(node.connectionId, { force: true });
     } else {
       await connectionStore.loadSchemas(node.connectionId, node.database, { force: true });
     }
@@ -2974,8 +3003,13 @@ async function confirmDuplicateStructure() {
       schema: node.schema,
       sourceName: node.label,
       targetName: newName,
+      tableComment: node.comment,
     });
-    await executeTreeNodeSqlWithProductionGuard(node, sql, { database: node.database, schema: node.schema });
+    await executeTreeNodeSqlWithProductionGuard(node, sql, {
+      database: node.database,
+      schema: node.schema,
+      executeAsScript: duplicateTableStructureRequiresScript(sql),
+    });
     toast(t("contextMenu.duplicateStructureSuccess", { name: newName }), 3000);
     await refreshTableList(node);
   } catch (e: any) {
@@ -3016,8 +3050,13 @@ async function confirmPasteTable() {
           schema: entry.schema,
           sourceName: entry.sourceName,
           targetName,
+          tableComment: entry.tableComment,
         });
-        const structureExecuted = await executeTreeNodeSqlWithProductionGuard(entry, structureSql, { database: entry.database, schema: entry.schema });
+        const structureExecuted = await executeTreeNodeSqlWithProductionGuard(entry, structureSql, {
+          database: entry.database,
+          schema: entry.schema,
+          executeAsScript: duplicateTableStructureRequiresScript(structureSql),
+        });
         if (!structureExecuted) {
           pasteCancelled = true;
           break;
@@ -3106,6 +3145,7 @@ function openPasteTableDialog() {
     connectionId: entry.connectionId,
     database: entry.database,
     schema: normalizeTreeClipboardSchema(entry.connectionId, entry.database, entry.schema),
+    tableComment: entry.tableComment,
   }));
   showPasteDialog.value = true;
 }

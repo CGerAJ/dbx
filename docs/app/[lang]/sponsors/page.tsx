@@ -12,6 +12,8 @@ const i18n = {
     qiniuSponsorAction: "Visit Qiniu Cloud",
     rainyunSponsorDesc: "RainYun is a cloud service provider offering cloud servers, physical servers, game hosting, and developer-friendly infrastructure services.",
     rainyunSponsorAction: "Visit RainYun",
+    easysearchSponsorDesc: "Easysearch is an enterprise-grade distributed search engine compatible with Elasticsearch APIs, combining full-text, vector, geospatial search, real-time analytics, and AI capabilities in one platform.",
+    easysearchSponsorAction: "Visit Easysearch",
     becomeTitle: "Support DBX",
     becomeDesc: "Financial sponsorship, infrastructure, developer tools, services, and other forms of support are all welcome from individuals and organizations.",
     becomeContact: "QQ: 86554840",
@@ -24,6 +26,8 @@ const i18n = {
     qiniuSponsorAction: "访问七牛云",
     rainyunSponsorDesc: "雨云是面向开发者和站长的云服务提供商，提供云服务器、物理服务器、游戏云和配套基础设施服务。",
     rainyunSponsorAction: "访问雨云",
+    easysearchSponsorDesc: "Easysearch 是一款企业级分布式搜索引擎，兼容 ES API、融合全文检索、向量检索、地理空间位置检索、实时分析与 AI 能力，为企业提供统一的数据检索与智能分析基础设施。",
+    easysearchSponsorAction: "访问 Easysearch",
     becomeTitle: "支持 DBX",
     becomeDesc: "无论是个人还是团队，资金赞助、基础设施、开发工具、服务资源或其他形式的支持都十分欢迎。",
     becomeContact: "QQ：86554840",
@@ -64,6 +68,14 @@ export default async function SponsorsPage({ params }: { params: Promise<{ lang:
       logoClass: "h-16 w-16 object-contain",
       description: t.qiniuSponsorDesc,
       action: t.qiniuSponsorAction,
+    },
+    {
+      name: "Easysearch",
+      href: "https://easysearch.cn",
+      logo: "/sponsors/easysearch.png",
+      logoClass: "w-full max-w-[136px] object-contain",
+      description: t.easysearchSponsorDesc,
+      action: t.easysearchSponsorAction,
     },
   ];
 
