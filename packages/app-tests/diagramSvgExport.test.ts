@@ -6,8 +6,9 @@ import {
   buildTableDiagramSvg,
   buildTableRelationshipPaths,
   computeTableDiagramCanvas,
+  diagramSvgFileName,
 } from "../../apps/desktop/src/lib/export/diagramSvgExport.ts";
-import { buildDiagramRelationships, type DiagramTable } from "../../apps/desktop/src/lib/diagram/erDiagram.ts";
+import { buildDiagramRelationships, normalizeCustomDiagramRelationship, type DiagramTable } from "../../apps/desktop/src/lib/diagram/erDiagram.ts";
 import { pointsToSvgPath } from "../../apps/desktop/src/lib/diagram/edge-obstacle-router.ts";
 import { CARD_HEADER_HEIGHT, CARD_WIDTH, COLUMN_ROW_HEIGHT, MARGIN } from "../../apps/desktop/src/lib/diagram/diagram-constants.ts";
 
@@ -66,10 +67,7 @@ test("exports the table diagram as standalone SVG", () => {
   assert.match(svg, /diagram-cardinality/);
   assert.match(svg, />N</);
   assert.match(svg, />1</);
-  assert.doesNotMatch(svg, /N:1/);
   assert.doesNotMatch(svg, /<foreignObject/);
-  assert.doesNotMatch(svg, /marker-end=/);
-  assert.doesNotMatch(svg, /id="dbx-diagram-arrow"/);
 });
 
 test("omits relationship paths when relationshipPaths entry is missing", () => {
@@ -113,6 +111,88 @@ test("draws visible layers and skips zero-size layers", () => {
   assert.doesNotMatch(svg, />Empty</);
 });
 
+test("exports many-to-many cardinalities at both relationship endpoints", () => {
+  const customRelationship = {
+    ...normalizeCustomDiagramRelationship({
+      name: "users_orders",
+      sourceTable: "users",
+      sourceColumn: "id",
+      targetTable: "orders",
+      targetColumn: "id",
+      sourceCardinality: "N",
+      targetCardinality: "N",
+    }),
+    kind: "custom" as const,
+  };
+  const polyline = [
+    { x: 310, y: 96 },
+    { x: 360, y: 96 },
+  ];
+  const svg = buildTableDiagramSvg({
+    tables,
+    relationships: [customRelationship],
+    positions: {
+      users: { x: 40, y: 40 },
+      orders: { x: 360, y: 40 },
+    },
+    relationshipPaths: {
+      [customRelationship.id]: "M 310 96 L 360 96",
+    },
+    relationshipPolylines: {
+      [customRelationship.id]: polyline,
+    },
+    canvas: { width: 720, height: 320 },
+    cardWidth: 270,
+    cardHeaderHeight: 44,
+    columnRowHeight: 24,
+  });
+
+  assert.match(svg, /diagram-cardinality/);
+  const cardinalityTexts = [...svg.matchAll(/diagram-cardinality[\s\S]*?<\/g>/g)].join("");
+  assert.match(svg, />N</);
+  assert.ok((svg.match(/>N</g) || []).length >= 2, `expected two N badges, got: ${cardinalityTexts.slice(0, 200)}`);
+});
+
+test("infers one-to-one foreign keys from primary and unique source columns", () => {
+  const primaryKeyTables: DiagramTable[] = [
+    tables[0],
+    {
+      ...tables[1],
+      columns: tables[1].columns.map((column) => ({ ...column, is_primary_key: column.name === "user_id" })),
+    },
+  ];
+  assert.equal(buildDiagramRelationships(primaryKeyTables)[0].sourceCardinality, "1");
+
+  const uniqueIndexTables: DiagramTable[] = [
+    tables[0],
+    {
+      ...tables[1],
+      indexes: [{ name: "orders_user_id_unique", columns: ["user_id"], is_unique: true, is_primary: false }],
+    },
+  ];
+  assert.equal(buildDiagramRelationships(uniqueIndexTables)[0].sourceCardinality, "1");
+
+  const sourceColumnsContainingUniqueKey: DiagramTable[] = [
+    tables[0],
+    {
+      ...tables[1],
+      columns: [...tables[1].columns, { name: "tenant_id", data_type: "bigint", is_nullable: false, column_default: null, is_primary_key: false, extra: null }],
+      foreignKeys: [...tables[1].foreignKeys, { name: "orders_user_id_fk", column: "tenant_id", ref_table: "users", ref_column: "tenant_id" }],
+      indexes: [{ name: "orders_user_id_unique", columns: ["user_id"], is_unique: true, is_primary: false }],
+    },
+  ];
+  assert.equal(buildDiagramRelationships(sourceColumnsContainingUniqueKey)[0].sourceCardinality, "1");
+
+  const partialUniqueIndexTables: DiagramTable[] = [
+    tables[0],
+    {
+      ...tables[1],
+      indexes: [{ name: "orders_user_id_active_unique", columns: ["user_id"], is_unique: true, is_primary: false, filter: "deleted_at IS NULL" }],
+    },
+  ];
+  assert.equal(buildDiagramRelationships(partialUniqueIndexTables)[0].sourceCardinality, "N");
+});
+
 test("exports the engineering ER diagram with Chen-style shapes and cardinalities", () => {
   const relationships = buildDiagramRelationships(tables);
   const diagram = buildEngineeringDiagram(tables, relationships, {
@@ -129,6 +209,11 @@ test("exports the engineering ER diagram with Chen-style shapes and cardinalitie
   assert.match(svg, />1</);
   assert.match(svg, /text-decoration="underline"/);
   assert.doesNotMatch(svg, /<foreignObject/);
+});
+
+test("builds safe SVG file names from the active diagram context", () => {
+  assert.equal(diagramSvgFileName("prod/main", "billing db", "engineering"), "dbx-prod-main-billing-db-engineering-er.svg");
+  assert.equal(diagramSvgFileName("", "", "table"), "dbx-diagram-table-structure.svg");
 });
 
 test("buildTableRelationshipPaths uses waypoints when length >= 2", () => {

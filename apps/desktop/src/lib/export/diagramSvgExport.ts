@@ -388,3 +388,20 @@ export function buildEngineeringDiagramSvg(diagram: EngineeringDiagram): string 
   parts.push("</svg>");
   return parts.join("");
 }
+
+type DiagramSvgMode = "table" | "engineering";
+
+function fileToken(value: string): string {
+  return value
+    .trim()
+    .replace(/[^\p{L}\p{N}._-]+/gu, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+}
+
+/** Stable download name for SVG exports (shared with upstream contract tests). */
+export function diagramSvgFileName(connectionName: string, databaseName: string, mode: DiagramSvgMode): string {
+  const context = [connectionName, databaseName].map(fileToken).filter(Boolean);
+  const suffix = mode === "engineering" ? "engineering-er" : "table-structure";
+  return ["dbx", ...(context.length > 0 ? context : ["diagram"]), suffix].join("-") + ".svg";
+}

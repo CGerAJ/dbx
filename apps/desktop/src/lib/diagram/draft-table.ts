@@ -1,6 +1,6 @@
 import type { ColumnInfo, DatabaseType } from "@/types/database";
 import type { DiagramTable } from "./erDiagram";
-import { hasDroppedColumns, hasPendingColumns, isPendingColumn } from "./erDiagram";
+import { editableStructureIndexes, hasDroppedColumns, hasPendingColumns, isPendingColumn } from "./erDiagram";
 import type { BuildTableStructureChangeSqlOptions, EditableStructureColumn, EditableStructureIndex } from "@/lib/table/tableStructureEditorSql";
 import { generateUniqueIndexName } from "@/lib/table/tableStructureEditorState";
 import { resolveDiagramDialectAdapter } from "./diagram-dialect-adapter";
@@ -66,7 +66,7 @@ export function draftTableToCreateSqlOptions(table: DiagramTable, databaseType: 
     schema: schema || undefined,
     tableName: table.name,
     columns: table.columns.map(columnToEditable),
-    indexes: (table.indexes ?? []).filter((index) => !index.markedForDrop),
+    indexes: editableStructureIndexes(table).filter((index) => !index.markedForDrop),
     foreignKeys: [],
     triggers: [],
   };
@@ -118,7 +118,7 @@ export function validateDraftTable(table: DiagramTable): string[] {
     if (!col.data_type.trim()) errors.push(`Column "${table.name}.${col.name}" needs a type`);
   }
   const columnNames = new Set(table.columns.map((c) => c.name.toLowerCase()));
-  for (const index of table.indexes ?? []) {
+  for (const index of editableStructureIndexes(table)) {
     if (index.markedForDrop) continue;
     if (!index.name.trim()) errors.push(`Table "${table.name}" has an index with an empty name`);
     if (index.columns.length === 0) errors.push(`Index "${index.name || "(unnamed)"}" on "${table.name}" needs at least one column`);

@@ -2479,7 +2479,9 @@ pub async fn execute_query_with_max_rows(
 ) -> Result<QueryResult, String> {
     let start = Instant::now();
 
-    if starts_with_executable_sql_keyword(sql, &["SELECT", "EXEC", "WITH", "TABLE"]) {
+    if starts_with_executable_sql_keyword(sql, &["SELECT", "EXEC", "WITH", "TABLE"])
+        || sqlserver_dml_output_returns_rows(sql)
+    {
         let query = match sqlserver_unsafe_type_query(client, sql).await {
             Ok(Some(query)) => query,
             Ok(None) => SqlServerUnsafeTypeQuery::plain(sql),
@@ -2603,8 +2605,8 @@ pub async fn execute_batch_with_max_rows(
 /// Execute a SQL Server batch directly through TDS simple-query mode.
 ///
 /// This intentionally bypasses result-set type probing and SQL rewriting. It is
-/// required while `SHOWPLAN_XML` is enabled because any probe issued on the same
-/// session is itself affected by SHOWPLAN state.
+/// required while `SHOWPLAN_XML` or `STATISTICS XML` is enabled because any probe
+/// issued on the same session is itself affected by the plan-capture state.
 pub async fn execute_simple_batch_with_max_rows(
     client: &mut SqlServerClient,
     sql: &str,
@@ -2744,6 +2746,13 @@ fn requires_simple_query_batch(sql: &str) -> bool {
 
     let tokens = first_sql_tokens(sql, 4);
     if tokens.len() >= 2 && tokens[0].eq_ignore_ascii_case("SET") && tokens[1].eq_ignore_ascii_case("SHOWPLAN_XML") {
+        return true;
+    }
+    if tokens.len() >= 3
+        && tokens[0].eq_ignore_ascii_case("SET")
+        && tokens[1].eq_ignore_ascii_case("STATISTICS")
+        && tokens[2].eq_ignore_ascii_case("XML")
+    {
         return true;
     }
     if tokens.len() >= 2 && tokens[0].eq_ignore_ascii_case("CREATE") && tokens[1].eq_ignore_ascii_case("SCHEMA") {
@@ -3010,6 +3019,9 @@ mod tests {
     fn sqlserver_module_definitions_require_simple_query_batch() {
         assert!(requires_simple_query_batch("SET SHOWPLAN_XML ON;"));
         assert!(requires_simple_query_batch("SET SHOWPLAN_XML OFF;"));
+        assert!(requires_simple_query_batch("SET STATISTICS XML ON;"));
+        assert!(requires_simple_query_batch("SET STATISTICS XML OFF;"));
+        assert!(!requires_simple_query_batch("SET STATISTICS IO ON;"));
         assert!(requires_simple_query_batch("CREATE SCHEMA [analytics];"));
         assert!(requires_simple_query_batch("CREATE FUNCTION dbo.fn_demo() RETURNS INT AS BEGIN RETURN 1; END;"));
         assert!(requires_simple_query_batch("ALTER PROCEDURE dbo.usp_demo AS SELECT 1;"));
@@ -3154,6 +3166,32 @@ mod tests {
             "DECLARE @id INT = 1; UPDATE dbo.users SET active = 0 WHERE id = @id;"
         ));
         assert!(sqlserver_dml_output_returns_rows("DELETE FROM dbo.users OUTPUT deleted.id WHERE id = 1;"));
+    }
+
+    #[test]
+    fn sqlserver_dml_output_detection_distinguishes_client_rows_from_output_into() {
+        assert!(sqlserver_dml_output_returns_rows(
+            "INSERT INTO dbo.users(name) OUTPUT inserted.id, inserted.name VALUES (N'Ada')"
+        ));
+        assert!(sqlserver_dml_output_returns_rows("UPDATE dbo.users SET active = 1 OUTPUT inserted.id WHERE id = 1"));
+        assert!(sqlserver_dml_output_returns_rows("DELETE FROM dbo.users OUTPUT deleted.id WHERE id = 1"));
+        assert!(!sqlserver_dml_output_returns_rows(
+            "INSERT INTO dbo.audit OUTPUT inserted.id INTO dbo.audit_ids VALUES (1)"
+        ));
+        assert!(!sqlserver_dml_output_returns_rows(
+            "UPDATE dbo.users SET note = N'OUTPUT inserted.id' WHERE id = 1 -- OUTPUT deleted.id"
+        ));
+        assert!(!sqlserver_dml_output_returns_rows("SELECT N'OUTPUT inserted.id'"));
+    }
+
+    #[test]
+    fn sqlserver_dml_output_uses_the_result_set_execution_path() {
+        let source = include_str!("sqlserver.rs");
+        let execute_query = source.split("pub async fn execute_query_with_max_rows").nth(1).unwrap();
+        let execute_query = execute_query.split("pub async fn execute_batch").next().unwrap();
+
+        assert!(execute_query.contains("sqlserver_dml_output_returns_rows(sql)"));
+        assert!(execute_query.contains("client.query(query.sql.as_str(), &[])"));
     }
 
     #[test]

@@ -1,14 +1,25 @@
-import type { ColumnInfo, ForeignKeyInfo } from "@/types/database";
+import type { ColumnInfo, ForeignKeyInfo, IndexInfo } from "@/types/database";
 import type { EditableStructureIndex } from "@/lib/table/tableStructureEditorSql";
 
 export type DiagramTableOrigin = "live" | "draft";
+
+/** Live metadata (`IndexInfo`) or draft editor indexes (`EditableStructureIndex`). */
+export type DiagramTableIndex = IndexInfo | EditableStructureIndex;
+
+export function isEditableStructureIndex(index: DiagramTableIndex): index is EditableStructureIndex {
+  return "isUnique" in index || "markedForDrop" in index;
+}
+
+export function editableStructureIndexes(table: DiagramTable): EditableStructureIndex[] {
+  return (table.indexes ?? []).filter(isEditableStructureIndex);
+}
 
 export interface DiagramTable {
   name: string;
   columns: ColumnInfo[];
   foreignKeys: ForeignKeyInfo[];
-  /** Draft-only index definitions synced via buildCreateTableSql */
-  indexes?: EditableStructureIndex[];
+  /** Unique/PK indexes used for FK cardinality; drafts also sync via buildCreateTableSql */
+  indexes?: DiagramTableIndex[];
   /** live = from DB metadata; draft = local design not yet synced */
   origin?: DiagramTableOrigin;
   syncStatus?: "pending" | "synced" | "error";
@@ -115,6 +126,45 @@ function columnExists(table: DiagramTable | undefined, columnName: string): bool
   return !!table?.columns.some((column) => column.name === columnName);
 }
 
+/** True when every unique-key column appears among the FK source columns (unique ⊆ FK). */
+function sourceColumnsContainUniqueKey(sourceColumns: string[], keyColumns: string[]): boolean {
+  if (keyColumns.length === 0) return false;
+  const sourceColumnSet = new Set(sourceColumns);
+  return keyColumns.every((column) => sourceColumnSet.has(column));
+}
+
+function foreignKeySourceColumns(table: DiagramTable, foreignKey: ForeignKeyInfo): string[] {
+  if (!foreignKey.name) return [foreignKey.column];
+  return table.foreignKeys.filter((candidate) => candidate.name === foreignKey.name && candidate.ref_table === foreignKey.ref_table).map((candidate) => candidate.column);
+}
+
+function diagramIndexIsUnique(index: DiagramTableIndex): boolean {
+  if ("isUnique" in index) return !!(index.isUnique || index.isPrimary);
+  return !!(index.is_unique || index.is_primary);
+}
+
+function diagramIndexFilter(index: DiagramTableIndex): string {
+  return (index.filter ?? "").trim();
+}
+
+function diagramIndexMarkedForDrop(index: DiagramTableIndex): boolean {
+  return "markedForDrop" in index && !!index.markedForDrop;
+}
+
+export function foreignKeySourceCardinality(table: DiagramTable, foreignKey: ForeignKeyInfo): "1" | "N" {
+  const sourceColumns = foreignKeySourceColumns(table, foreignKey);
+  const primaryKeyColumns = table.columns.filter((column) => column.is_primary_key).map((column) => column.name);
+  if (sourceColumnsContainUniqueKey(sourceColumns, primaryKeyColumns)) return "1";
+
+  if (sourceColumns.length === 1) {
+    const col = table.columns.find((column) => column.name === sourceColumns[0]);
+    if (col?.is_unique) return "1";
+  }
+
+  const hasUniqueIndex = (table.indexes ?? []).some((index) => diagramIndexIsUnique(index) && !diagramIndexFilter(index) && !diagramIndexMarkedForDrop(index) && sourceColumnsContainUniqueKey(sourceColumns, index.columns));
+  return hasUniqueIndex ? "1" : "N";
+}
+
 function customRelationshipId(relationship: Omit<CustomDiagramRelationship, "id">): string {
   return ["custom", relationship.sourceTable, relationship.sourceColumn, relationship.targetTable, relationship.targetColumn, relationship.sourceCardinality, relationship.targetCardinality].join(":");
 }
@@ -141,7 +191,7 @@ export function buildDiagramRelationships(tables: DiagramTable[], customRelation
         sourceColumn: fk.column,
         targetTable: fk.ref_table,
         targetColumn: fk.ref_column,
-        sourceCardinality: "N" as const,
+        sourceCardinality: foreignKeySourceCardinality(table, fk),
         targetCardinality: "1" as const,
       })),
   );

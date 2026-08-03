@@ -4462,18 +4462,58 @@ test("mongo dropIndex execution uses the dedicated drop-indexes endpoint", async
   }
 });
 
-test("mongo dropIndexes execution returns dropped index names", async () => {
+test("mongo dropIndexes execution exposes partial failures and refreshes loaded index metadata", async () => {
   const restoreStorage = installMemoryStorage();
   setActivePinia(createPinia());
   const connectionStore = useConnectionStore();
   const store = useQueryStore();
   const originalFetch = globalThis.fetch;
   let dropIndexesBody: any;
+  let indexRefreshRequested = false;
 
   connectionStore.addEphemeralConnection({
     ...conn("mongo-1"),
     db_type: "mongodb",
     port: 27017,
+  });
+  connectionStore.treeNodes.push({
+    id: "mongo-1",
+    label: "Mongo",
+    type: "connection",
+    connectionId: "mongo-1",
+    isExpanded: true,
+    children: [
+      {
+        id: "mongo-1:accounting",
+        label: "accounting",
+        type: "mongo-db",
+        connectionId: "mongo-1",
+        database: "accounting",
+        isExpanded: true,
+        children: [
+          {
+            id: "mongo-1:accounting:users",
+            label: "users",
+            type: "mongo-collection",
+            connectionId: "mongo-1",
+            database: "accounting",
+            isExpanded: true,
+            children: [
+              {
+                id: "mongo-1:accounting:users:__indexes",
+                label: "tree.indexes",
+                type: "group-indexes",
+                connectionId: "mongo-1",
+                database: "accounting",
+                tableName: "users",
+                isExpanded: false,
+                children: [],
+              },
+            ],
+          },
+        ],
+      },
+    ],
   });
 
   globalThis.fetch = withConnectionHealthMock(async (input, init) => {
@@ -4487,10 +4527,14 @@ test("mongo dropIndexes execution returns dropped index names", async () => {
     }
     if (url === "/api/mongo/drop-indexes") {
       dropIndexesBody = JSON.parse(String(init?.body ?? "{}"));
-      return new Response(JSON.stringify({ dropped_names: ["a_1", "b_1"], affected_rows: 2 }), {
+      return new Response(JSON.stringify({ dropped_names: ["a_1"], affected_rows: 1, failures: [{ name: "b_1", message: "index not found" }] }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
       });
+    }
+    if (url.startsWith("/api/schema/indexes?")) {
+      indexRefreshRequested = true;
+      return Response.json([{ name: "_id_", columns: ["_id"], is_unique: true, is_primary: true }]);
     }
     return new Response("unexpected request", { status: 500 });
   });
@@ -4506,8 +4550,15 @@ test("mongo dropIndexes execution returns dropped index names", async () => {
       collection: "users",
       single: false,
     });
-    assert.deepEqual(tab?.result?.columns, ["name"]);
-    assert.deepEqual(tab?.result?.rows, [["a_1"], ["b_1"]]);
+    assert.deepEqual(tab?.result?.columns, ["name", "status", "message"]);
+    assert.deepEqual(tab?.result?.rows, [
+      ["a_1", "dropped", null],
+      ["b_1", "failed", "index not found"],
+    ]);
+    assert.equal(indexRefreshRequested, true);
+    const indexGroup = connectionStore.treeNodes[0]?.children?.[0]?.children?.[0]?.children?.[0];
+    assert.equal(indexGroup?.isExpanded, false);
+    assert.deepEqual(indexGroup?.children?.map((node) => node.label), ["_id_ (_id)"]);
   } finally {
     globalThis.fetch = originalFetch;
     restoreStorage();
@@ -5857,6 +5908,7 @@ test("failed schema session reset blocks query and Oracle explain execution", as
     const queryTab = store.tabs.find((tab) => tab.id === queryTabId)!;
     assert.equal(executeRequests, 0);
     assert.equal(queryTab.result?.execution_error, true);
+    assert.equal(queryTab.result?.error?.detail, "reset failed");
     assert.match(String(queryTab.result?.rows[0]?.[0]), /reset failed/i);
 
     store.updateSchema(explainTabId, undefined);
@@ -6937,6 +6989,20 @@ test("table structure refresh versions are scoped by table target", () => {
   assert.equal(store.tableStructureRefreshVersion("conn-1", "db", "public", "users"), 2);
   assert.equal(store.tableStructureRefreshVersion("conn-1", "db", undefined, "users"), 1);
   assert.equal(store.tableStructureRefreshVersion("conn-1", "db", "public", "orders"), 0);
+});
+
+test("table structure invalidation refreshes matching query completion contexts", () => {
+  setActivePinia(createPinia());
+  const store = useQueryStore();
+  const matchingTabId = store.createTab("conn-1", "db", "Query A", "query", "public");
+  const sameDatabaseTabId = store.createTab("conn-1", "db", "Query B", "query", "audit");
+  const otherDatabaseTabId = store.createTab("conn-1", "analytics", "Query C", "query", "public");
+
+  store.invalidateTableStructure("conn-1", "db", "public", "users");
+
+  assert.equal(store.tabs.find((tab) => tab.id === matchingTabId)?.completionContextVersion, 1);
+  assert.equal(store.tabs.find((tab) => tab.id === sameDatabaseTabId)?.completionContextVersion, 1);
+  assert.equal(store.tabs.find((tab) => tab.id === otherDatabaseTabId)?.completionContextVersion, undefined);
 });
 
 test("duplicating a table structure tab clones its unsaved draft", () => {
