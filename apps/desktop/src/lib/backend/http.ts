@@ -745,7 +745,7 @@ export async function getSqlServerColumnMetadata(connectionId: string, database:
 }
 
 export interface TableColumnsResult {
-  tableName: string;
+  table_name: string;
   columns: ColumnInfo[];
   error?: string;
 }

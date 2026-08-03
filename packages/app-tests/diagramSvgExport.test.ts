@@ -1,13 +1,7 @@
 import { strict as assert } from "node:assert";
 import { test } from "vitest";
 import { buildEngineeringDiagram } from "../../apps/desktop/src/lib/diagram/engineeringDiagram.ts";
-import {
-  buildEngineeringDiagramSvg,
-  buildTableDiagramSvg,
-  buildTableRelationshipPaths,
-  computeTableDiagramCanvas,
-  diagramSvgFileName,
-} from "../../apps/desktop/src/lib/export/diagramSvgExport.ts";
+import { buildEngineeringDiagramSvg, buildTableDiagramSvg, buildTableRelationshipPaths, computeTableDiagramCanvas, diagramSvgFileName } from "../../apps/desktop/src/lib/export/diagramSvgExport.ts";
 import { buildDiagramRelationships, normalizeCustomDiagramRelationship, type DiagramTable } from "../../apps/desktop/src/lib/diagram/erDiagram.ts";
 import { pointsToSvgPath } from "../../apps/desktop/src/lib/diagram/edge-obstacle-router.ts";
 import { CARD_HEADER_HEIGHT, CARD_WIDTH, COLUMN_ROW_HEIGHT, MARGIN } from "../../apps/desktop/src/lib/diagram/diagram-constants.ts";
@@ -264,11 +258,15 @@ test("buildTableRelationshipPaths skips relationships with missing positions", (
 });
 
 test("computeTableDiagramCanvas uses default floor and MARGIN padding", () => {
-  const canvas = computeTableDiagramCanvas([], {}, {
-    cardWidth: CARD_WIDTH,
-    cardHeaderHeight: CARD_HEADER_HEIGHT,
-    columnRowHeight: COLUMN_ROW_HEIGHT,
-  });
+  const canvas = computeTableDiagramCanvas(
+    [],
+    {},
+    {
+      cardWidth: CARD_WIDTH,
+      cardHeaderHeight: CARD_HEADER_HEIGHT,
+      columnRowHeight: COLUMN_ROW_HEIGHT,
+    },
+  );
 
   assert.deepEqual(canvas, { width: 400 + MARGIN, height: 300 + MARGIN });
 });
@@ -287,12 +285,16 @@ test("computeTableDiagramCanvas expands for tables and ignores zero-size layers"
   assert.ok(withTable.width >= 1000 + CARD_WIDTH + MARGIN);
   assert.ok(withTable.height >= 800 + MARGIN);
 
-  const withLayer = computeTableDiagramCanvas([], {}, {
-    cardWidth: CARD_WIDTH,
-    cardHeaderHeight: CARD_HEADER_HEIGHT,
-    columnRowHeight: COLUMN_ROW_HEIGHT,
-    layers: [{ id: "big", name: "big", color: "#000", x: 0, y: 0, width: 2000, height: 1500 }],
-  });
+  const withLayer = computeTableDiagramCanvas(
+    [],
+    {},
+    {
+      cardWidth: CARD_WIDTH,
+      cardHeaderHeight: CARD_HEADER_HEIGHT,
+      columnRowHeight: COLUMN_ROW_HEIGHT,
+      layers: [{ id: "big", name: "big", color: "#000", x: 0, y: 0, width: 2000, height: 1500 }],
+    },
+  );
   assert.equal(withLayer.width, 2000 + MARGIN);
   assert.equal(withLayer.height, 1500 + MARGIN);
 });

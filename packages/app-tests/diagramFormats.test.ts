@@ -1,13 +1,6 @@
 import { strict as assert } from "node:assert";
 import { test } from "vitest";
-import {
-  buildDiagramDbml,
-  buildDiagramJson,
-  buildDiagramMermaid,
-  diagramExportDialogFilter,
-  diagramExportFileName,
-  type DiagramJsonSnapshot,
-} from "../../apps/desktop/src/lib/export/diagramFormats.ts";
+import { buildDiagramDbml, buildDiagramJson, buildDiagramMermaid, diagramExportDialogFilter, diagramExportFileName, type DiagramJsonSnapshot } from "../../apps/desktop/src/lib/export/diagramFormats.ts";
 import { buildDiagramRelationships, type DiagramRelationship, type DiagramTable } from "../../apps/desktop/src/lib/diagram/erDiagram.ts";
 
 const tables: DiagramTable[] = [
@@ -29,10 +22,7 @@ const tables: DiagramTable[] = [
   },
 ];
 
-function rel(
-  partial: Pick<DiagramRelationship, "sourceCardinality" | "targetCardinality"> &
-    Partial<Pick<DiagramRelationship, "id" | "sourceTable" | "sourceColumn" | "targetTable" | "targetColumn">>,
-): DiagramRelationship {
+function rel(partial: Pick<DiagramRelationship, "sourceCardinality" | "targetCardinality"> & Partial<Pick<DiagramRelationship, "id" | "sourceTable" | "sourceColumn" | "targetTable" | "targetColumn">>): DiagramRelationship {
   return {
     id: partial.id ?? "rel-1",
     sourceTable: partial.sourceTable ?? "users",
@@ -46,10 +36,7 @@ function rel(
 
 test("diagramExportFileName builds safe names for each format and mode", () => {
   assert.equal(diagramExportFileName("", "", "table", "svg"), "dbx-diagram-table-structure.svg");
-  assert.equal(
-    diagramExportFileName("prod/main", "billing db", "engineering", "png"),
-    "dbx-prod-main-billing-db-engineering-er.png",
-  );
+  assert.equal(diagramExportFileName("prod/main", "billing db", "engineering", "png"), "dbx-prod-main-billing-db-engineering-er.png");
   assert.equal(diagramExportFileName("a", "b", "table", "json"), "dbx-a-b-diagram.json");
   assert.equal(diagramExportFileName("a", "b", "table", "dbml"), "dbx-a-b-schema.dbml");
   assert.equal(diagramExportFileName("a", "b", "engineering", "mermaid"), "dbx-a-b-er.mmd");
@@ -113,12 +100,7 @@ test("buildDiagramJson round-trips non-empty layers", () => {
 });
 
 test("buildDiagramDbml emits tables, quoted types, and Ref operators", () => {
-  const dbml = buildDiagramDbml(tables, [
-    rel({ sourceCardinality: "1", targetCardinality: "1" }),
-    rel({ id: "r2", sourceCardinality: "N", targetCardinality: "1" }),
-    rel({ id: "r3", sourceCardinality: "1", targetCardinality: "N" }),
-    rel({ id: "r4", sourceCardinality: "N", targetCardinality: "N" }),
-  ]);
+  const dbml = buildDiagramDbml(tables, [rel({ sourceCardinality: "1", targetCardinality: "1" }), rel({ id: "r2", sourceCardinality: "N", targetCardinality: "1" }), rel({ id: "r3", sourceCardinality: "1", targetCardinality: "N" }), rel({ id: "r4", sourceCardinality: "N", targetCardinality: "N" })]);
 
   assert.match(dbml, /Table users \{/);
   assert.match(dbml, /id bigint \[pk, not null\]/);
@@ -139,10 +121,7 @@ test("buildDiagramMermaid emits erDiagram entities, PK markers, and cardinalitie
       foreignKeys: [{ name: "fk", column: "user_id", ref_table: "users", ref_column: "id" }],
     },
   ]);
-  const mermaid = buildDiagramMermaid(
-    [tables[0], { ...tables[1], name: "orders", foreignKeys: [{ name: "fk", column: "user_id", ref_table: "users", ref_column: "id" }] }],
-    relationships,
-  );
+  const mermaid = buildDiagramMermaid([tables[0], { ...tables[1], name: "orders", foreignKeys: [{ name: "fk", column: "user_id", ref_table: "users", ref_column: "id" }] }], relationships);
 
   assert.ok(mermaid.startsWith("erDiagram\n"));
   assert.match(mermaid, /bigint id PK/);
@@ -159,6 +138,22 @@ test("buildDiagramMermaid maps all cardinality pairs", () => {
   assert.match(oneN, /\|\|--o\{/);
   assert.match(nOne, /\}o--\|\|/);
   assert.match(nN, /\}o--o\{/);
+});
+
+test("buildDiagramRelationships unique FK exports as 1:1 in Mermaid/DBML", () => {
+  const profileTables: DiagramTable[] = [
+    tables[0],
+    {
+      name: "profiles",
+      columns: [{ name: "user_id", data_type: "bigint", is_nullable: false, column_default: null, is_primary_key: true, extra: null }],
+      foreignKeys: [{ name: "profiles_user_fk", column: "user_id", ref_table: "users", ref_column: "id" }],
+    },
+  ];
+  const relationships = buildDiagramRelationships(profileTables);
+  assert.equal(relationships[0].sourceCardinality, "1");
+  assert.equal(relationships[0].targetCardinality, "1");
+  assert.match(buildDiagramMermaid(profileTables, relationships), /\|\|--\|\|/);
+  assert.match(buildDiagramDbml(profileTables, relationships), /Ref: profiles\.user_id - users\.id/);
 });
 
 test("diagramExportDialogFilter returns expected extensions", () => {

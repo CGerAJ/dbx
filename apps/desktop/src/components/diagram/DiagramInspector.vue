@@ -7,7 +7,7 @@ import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { SearchableSelect } from "@/components/ui/searchable-select";
 import type { DiagramTable, DiagramRelationship, CustomDiagramRelationship } from "@/lib/diagram/erDiagram";
-import { hasDroppedColumns, hasPendingColumns, isDraftTable, isDroppedColumn, isPendingColumn } from "@/lib/diagram/erDiagram";
+import { editableStructureIndexes, hasDroppedColumns, hasPendingColumns, isDraftTable, isDroppedColumn, isPendingColumn } from "@/lib/diagram/erDiagram";
 import type { InferredRelationship } from "@/types/diagram";
 import type { InspectorTarget } from "@/types/diagram";
 import type { ColumnInfo, DatabaseType } from "@/types/database";
@@ -104,7 +104,7 @@ function canRemoveColumn(columnName: string): boolean {
   return canDropLiveColumn.value;
 }
 
-const tableIndexes = computed(() => (selectedTable.value?.indexes ?? []).filter((index) => !index.markedForDrop));
+const tableIndexes = computed(() => editableStructureIndexes(selectedTable.value ?? { name: "", columns: [], foreignKeys: [] }).filter((index) => !index.markedForDrop));
 
 function syncRelationshipDraft() {
   const rel = selectedEdge.value;
@@ -153,7 +153,7 @@ function patchTable(mutator: (table: DiagramTable) => void, options?: { requireD
     ...table,
     columns: table.columns.map((c) => ({ ...c })),
     foreignKeys: [...table.foreignKeys],
-    indexes: (table.indexes ?? []).map((index) => ({
+    indexes: editableStructureIndexes(table).map((index) => ({
       ...index,
       columns: [...index.columns],
       includedColumns: [...index.includedColumns],
@@ -256,9 +256,9 @@ function addIndex() {
   if (!adapter.value.supportsCreateIndex) return;
   patchTable(
     (table) => {
-      if (!table.indexes) table.indexes = [];
+      const existing = editableStructureIndexes(table);
       const firstCol = table.columns[0]?.name;
-      table.indexes.push(createDraftIndex(table.name, firstCol ? [firstCol] : [], table.indexes));
+      table.indexes = [...existing, createDraftIndex(table.name, firstCol ? [firstCol] : [], existing)];
     },
     { requireDraft: true },
   );
@@ -267,9 +267,10 @@ function addIndex() {
 function updateIndex(indexId: string, patch: Partial<EditableStructureIndex>) {
   patchTable(
     (table) => {
-      const index = table.indexes?.find((item) => item.id === indexId);
+      const index = editableStructureIndexes(table).find((item) => item.id === indexId);
       if (!index) return;
       Object.assign(index, patch);
+      table.indexes = editableStructureIndexes(table).map((item) => (item.id === indexId ? { ...item, ...patch } : item));
     },
     { requireDraft: true },
   );
@@ -278,13 +279,13 @@ function updateIndex(indexId: string, patch: Partial<EditableStructureIndex>) {
 function toggleIndexColumn(indexId: string, columnName: string) {
   patchTable(
     (table) => {
-      const index = table.indexes?.find((item) => item.id === indexId);
-      if (!index) return;
-      if (index.columns.includes(columnName)) {
-        index.columns = index.columns.filter((col) => col !== columnName);
-      } else {
-        index.columns = [...index.columns, columnName];
-      }
+      table.indexes = editableStructureIndexes(table).map((index) => {
+        if (index.id !== indexId) return index;
+        if (index.columns.includes(columnName)) {
+          return { ...index, columns: index.columns.filter((col) => col !== columnName) };
+        }
+        return { ...index, columns: [...index.columns, columnName] };
+      });
     },
     { requireDraft: true },
   );
@@ -293,7 +294,7 @@ function toggleIndexColumn(indexId: string, columnName: string) {
 function removeIndex(indexId: string) {
   patchTable(
     (table) => {
-      table.indexes = (table.indexes ?? []).filter((index) => index.id !== indexId);
+      table.indexes = editableStructureIndexes(table).filter((index) => index.id !== indexId);
     },
     { requireDraft: true },
   );

@@ -1184,12 +1184,33 @@ async function setSchema(value: string) {
 
 async function loadTableDiagramData(tableName: string, querySchema: string): Promise<DiagramTable> {
   try {
-    const [columns, foreignKeys] = await Promise.all([api.getColumns(connectionId.value, database.value, querySchema, tableName), api.listForeignKeys(connectionId.value, database.value, querySchema, tableName).catch(() => [])]);
-    return { name: tableName, columns, foreignKeys };
+    const [columns, foreignKeys, indexes] = await Promise.all([
+      api.getColumns(connectionId.value, database.value, querySchema, tableName),
+      api.listForeignKeys(connectionId.value, database.value, querySchema, tableName).catch(() => []),
+      api.listIndexes(connectionId.value, database.value, querySchema, tableName).catch(() => []),
+    ]);
+    return {
+      name: tableName,
+      columns,
+      foreignKeys,
+      indexes: indexes.map((index) => ({
+        id: index.name,
+        name: index.name,
+        columns: [...index.columns],
+        isUnique: index.is_unique,
+        isPrimary: index.is_primary,
+        filter: index.filter ?? "",
+        indexType: index.index_type ?? "",
+        includedColumns: index.included_columns ?? [],
+        comment: index.comment ?? "",
+        markedForDrop: false,
+        original: index,
+      })),
+    };
   } catch (e) {
     failedTableCount.value += 1;
     console.warn(`[diagram] failed to load table metadata: ${tableName}`, e);
-    return { name: tableName, columns: [], foreignKeys: [] };
+    return { name: tableName, columns: [], foreignKeys: [], indexes: [] };
   }
 }
 
