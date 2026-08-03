@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button";
 import type { DiagramTable } from "@/lib/diagram/erDiagram";
 import { isDraftTable, needsDiagramSync } from "@/lib/diagram/erDiagram";
 import { draftTableToCreateSqlOptions, hasLiveColumnChanges, liveTableToAlterSqlOptions, validateDraftTable, validateLivePendingColumns } from "@/lib/diagram/draft-table";
-import { buildDropTableSql, supportsDropTableCascade } from "@/lib/database/dbAdminSql";
+import { buildDropTableSql } from "@/lib/database/dbAdminSql";
 import { getTableStructureCapabilities } from "@/lib/table/tableStructureCapabilities";
 import type { DatabaseType } from "@/types/database";
 import * as api from "@/lib/backend/api";
@@ -91,13 +91,12 @@ async function rebuildSql() {
       allStatements.push(...result.statements);
       allWarnings.push(...result.warnings);
     }
-    const cascade = supportsDropTableCascade(props.databaseType);
     for (const table of liveDropTables.value) {
       const sql = await buildDropTableSql({
         databaseType: props.databaseType,
         schema: props.schema || undefined,
         tableName: table.name,
-        cascade,
+        cascade: false,
       });
       if (sql.trim()) allStatements.push(sql.trim());
     }
