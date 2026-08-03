@@ -1,14 +1,20 @@
+/**
+ * Thin column factories for the ER diagram.
+ *
+ * Dialect capability / SQL truth lives in the shared table-structure stack:
+ * - `tableStructureCapabilities` (UI gates)
+ * - `tableStructureEditorState` (type options / defaults)
+ * - Rust `table_structure_sql` via `buildCreateTableSql` / `buildTableStructureChangeSql`
+ *
+ * Do not add ER-specific dialect matrices or SQL generation here.
+ * Adding a dialect: update that shared stack (same checklist as TableStructureEditor).
+ */
 import type { ColumnInfo, DatabaseType } from "@/types/database";
 import { getTableStructureCapabilities, type TableStructureDialect } from "@/lib/table/tableStructureCapabilities";
 import { defaultNewColumnDataType, getDataTypeOptions } from "@/lib/table/tableStructureEditorState";
 
 export interface DiagramDialectAdapter {
   databaseType: DatabaseType | undefined;
-  supportsCreateTable: boolean;
-  supportsCreateIndex: boolean;
-  supportsComment: boolean;
-  supportsDropColumn: boolean;
-  dataTypeOptions: string[];
   createDefaultIdColumn(): ColumnInfo;
   createEmptyColumn(name?: string): ColumnInfo;
 }
@@ -27,8 +33,10 @@ const DEFAULT_ID_TYPE_BY_DIALECT: Partial<Record<TableStructureDialect, string>>
 
 function resolveDefaultIdType(dialect: TableStructureDialect, dataTypeOptions: readonly string[]): string {
   const preferred = DEFAULT_ID_TYPE_BY_DIALECT[dialect];
-  if (preferred && (dataTypeOptions.length === 0 || dataTypeOptions.includes(preferred))) {
-    return preferred;
+  if (preferred) {
+    if (dataTypeOptions.length === 0) return preferred;
+    const matched = dataTypeOptions.find((type) => type.trim().toLowerCase() === preferred.toLowerCase());
+    if (matched) return matched;
   }
   const integerLike = dataTypeOptions.find((type) => /^(bigint|int|integer|number|uint64|int64)/i.test(type.trim()));
   if (integerLike) return integerLike;
@@ -41,11 +49,6 @@ export function resolveDiagramDialectAdapter(databaseType?: DatabaseType): Diagr
 
   return {
     databaseType,
-    supportsCreateTable: caps.createTable,
-    supportsCreateIndex: caps.createIndex,
-    supportsComment: caps.comment,
-    supportsDropColumn: caps.dropColumn,
-    dataTypeOptions,
     createDefaultIdColumn() {
       return {
         name: "id",

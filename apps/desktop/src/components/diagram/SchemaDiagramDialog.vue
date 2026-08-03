@@ -20,6 +20,8 @@ import { databaseOptionsForConnection } from "@/composables/useDatabaseOptions";
 import { buildDiagramJoinSql, buildDiagramRelationships, filterDiagramTables, mergeRelationshipsWithInferred, normalizeCustomDiagramRelationship, type CustomDiagramRelationship, type DiagramPosition, type DiagramTable, isDraftTable, needsDiagramSync } from "@/lib/diagram/erDiagram";
 import { createDraftTable } from "@/lib/diagram/draft-table";
 import { cardinalityPairFromChoice } from "@/lib/diagram/cardinality";
+import { getTableStructureCapabilities } from "@/lib/table/tableStructureCapabilities";
+import { supportsTableStructureEditing } from "@/lib/database/databaseFeatureSupport";
 import { loadDraftTables, saveDraftTables, loadPersistedLayers, savePersistedLayers, loadPersistedPositions, savePersistedPositions, hasUsablePersistedPositions, loadLiveTablePatches, saveLiveTablePatches, applyLiveTablePatches } from "@/lib/diagram/draft-storage";
 import type { InspectorTarget } from "@/types/diagram";
 import DiagramInspector from "./DiagramInspector.vue";
@@ -629,6 +631,9 @@ function openTableData(tableName: string) {
 }
 
 const draftTableCount = computed(() => tables.value.filter(needsDiagramSync).length);
+const structureCapabilities = computed(() => getTableStructureCapabilities(selectedConnection.value?.db_type));
+const canCreateDraftTable = computed(() => structureCapabilities.value.createTable);
+const canSyncStructure = computed(() => supportsTableStructureEditing(selectedConnection.value?.db_type));
 
 function persistDraftAndLayers() {
   if (!connectionId.value || !database.value) return;
@@ -651,6 +656,7 @@ function handleNodeClick(event: NodeMouseEvent) {
 }
 
 function handleCreateDraftTable(payload: { name: string; layerId: string | null; withDefaultId: boolean }) {
+  if (!canCreateDraftTable.value) return;
   recordHistory();
   const draft = createDraftTable(payload.name, { withDefaultId: payload.withDefaultId, databaseType: selectedConnection.value?.db_type });
   tables.value = [...tables.value, draft];
@@ -1564,32 +1570,53 @@ function exportSvgLayers() {
     }));
 }
 
+/** Sync Vue Flow node positions into absolute canvas coords and fit visible layer bounds before export. */
+function prepareTableDiagramExportGeometry() {
+  const nextPositions: Record<string, DiagramPosition> = { ...positions.value };
+  for (const node of nodes.value) {
+    if (node.type === "layer") continue;
+    nextPositions[node.id] = toAbsolutePosition(node.id, node.position, layerStore.layers);
+  }
+  positions.value = nextPositions;
+
+  const heights = tableHeightsMap();
+  for (const layer of layerStore.layers) {
+    if (!layer.visible) continue;
+    sizeLayerToFit(layer, positions.value, heights);
+  }
+}
+
 function currentDiagramSvg(): string {
   if (diagramMode.value === "engineering") {
     return buildEngineeringDiagramSvg(engineeringDiagram.value);
   }
 
+  prepareTableDiagramExportGeometry();
+
+  const exportTables = canvasVisibleTables.value;
+  const exportRelationships = canvasVisibleRelationships.value;
   const layers = exportSvgLayers();
   const geometryInput = {
-    relationships: visibleRelationships.value,
+    relationships: exportRelationships,
     positions: positions.value,
-    tables: visibleTables.value,
+    tables: exportTables,
     waypoints: edgeWaypoints.value,
     cardWidth: CARD_WIDTH,
   };
   const relationshipPolylines = buildTableRelationshipPolylines(geometryInput);
   const relationshipPaths = Object.fromEntries(Object.entries(relationshipPolylines).map(([id, points]) => [id, pointsToSvgPath(points)]));
-  const canvas = computeTableDiagramCanvas(visibleTables.value, positions.value, {
+  const canvas = computeTableDiagramCanvas(exportTables, positions.value, {
     cardWidth: CARD_WIDTH,
     cardHeaderHeight: CARD_HEADER_HEIGHT,
     columnRowHeight: COLUMN_ROW_HEIGHT,
     cardBottomPadding: CARD_BOTTOM_PADDING,
     layers,
+    relationshipPolylines,
   });
 
   return buildTableDiagramSvg({
-    tables: visibleTables.value,
-    relationships: visibleRelationships.value,
+    tables: exportTables,
+    relationships: exportRelationships,
     positions: positions.value,
     relationshipPaths,
     relationshipPolylines,
@@ -1811,6 +1838,8 @@ onUnmounted(() => {
         :generated-join-sql="generatedJoinSql"
         :is-fullscreen="isFullscreen"
         :draft-table-count="draftTableCount"
+        :can-create-table="canCreateDraftTable"
+        :can-sync-to-database="canSyncStructure"
         @set-connection="setConnection"
         @set-database="setDatabase"
         @set-schema="setSchema"
@@ -1860,10 +1889,11 @@ onUnmounted(() => {
             <div v-else-if="diagramMode === 'table'" ref="diagramPaneRef" class="relative w-full h-full">
               <div v-if="tables.length === 0" class="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-muted/30 text-sm text-muted-foreground pointer-events-none">
                 <p class="max-w-md text-center px-4 pointer-events-none">{{ t("diagram.emptyDesignHint") }}</p>
-                <Button type="button" size="sm" class="pointer-events-auto" @click="showCreateTableDialog = true">
+                <Button v-if="canCreateDraftTable" type="button" size="sm" class="pointer-events-auto" @click="showCreateTableDialog = true">
                   <Plus class="mr-1 h-3.5 w-3.5" />
                   {{ t("diagram.createTable") }}
                 </Button>
+                <p v-else class="max-w-md text-center px-4 text-xs pointer-events-none">{{ t("diagram.createTableNotSupported") }}</p>
               </div>
               <VueFlow
                 :nodes="nodes"

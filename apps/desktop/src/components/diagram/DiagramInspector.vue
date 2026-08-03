@@ -15,7 +15,8 @@ import type { EditableStructureIndex } from "@/lib/table/tableStructureEditorSql
 import { createDraftIndex, nextUniqueColumnName } from "@/lib/diagram/draft-table";
 import { resolveDiagramDialectAdapter } from "@/lib/diagram/diagram-dialect-adapter";
 import { cardinalityChoiceFromPair, cardinalityPairFromChoice, edgeCardinalityPair, type CardinalityChoice } from "@/lib/diagram/cardinality";
-import { combineDataTypeForDatabase, combineDataTypeForDatabaseWithLengthUnit, dataTypeLengthInputValue, dataTypeLengthUnitValue, getDataTypeLengthUnitOptions, getDefaultLengthForType, isDataTypeLengthDisabled, splitDataType } from "@/lib/table/tableStructureEditorState";
+import { canAddTableStructureColumn, getTableStructureCapabilities } from "@/lib/table/tableStructureCapabilities";
+import { combineDataTypeForDatabase, combineDataTypeForDatabaseWithLengthUnit, dataTypeLengthInputValue, dataTypeLengthUnitValue, getDataTypeLengthUnitOptions, getDataTypeOptions, getDefaultLengthForType, isDataTypeLengthDisabled, splitDataType } from "@/lib/table/tableStructureEditorState";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 
 const { t } = useI18n();
@@ -55,6 +56,7 @@ const relationshipDraft = reactive({
 
 const adapter = computed(() => resolveDiagramDialectAdapter(props.databaseType));
 const databaseType = computed(() => props.databaseType);
+const structureCapabilities = computed(() => getTableStructureCapabilities(props.databaseType));
 
 const selectedTable = computed(() => {
   const target = props.target;
@@ -84,9 +86,15 @@ const targetColumns = computed(() => tableMap.value.get(relationshipDraft.target
 /** Full draft table edit (rename, indexes, delete draft). */
 const editable = computed(() => selectedTable.value != null && isDraftTable(selectedTable.value));
 const isLive = computed(() => selectedTable.value != null && !isDraftTable(selectedTable.value));
-const canAddField = computed(() => selectedTable.value != null);
-const showLivePendingHint = computed(() => isLive.value && selectedTable.value != null);
-const canDropLiveColumn = computed(() => isLive.value && adapter.value.supportsDropColumn);
+const canAddField = computed(() => {
+  if (!selectedTable.value) return false;
+  return canAddTableStructureColumn(props.databaseType, isDraftTable(selectedTable.value));
+});
+const showLivePendingHint = computed(() => isLive.value && selectedTable.value != null && canAddField.value);
+const canDropLiveColumn = computed(() => isLive.value && structureCapabilities.value.dropColumn);
+const canDropLiveTable = computed(() => isLive.value && structureCapabilities.value.createTable);
+const supportsCreateIndex = computed(() => structureCapabilities.value.createIndex);
+const supportsComment = computed(() => structureCapabilities.value.comment);
 
 function isColumnEditable(columnName: string): boolean {
   const table = selectedTable.value;
@@ -253,7 +261,7 @@ function cancelDeleteLiveTable() {
 }
 
 function addIndex() {
-  if (!adapter.value.supportsCreateIndex) return;
+  if (!supportsCreateIndex.value) return;
   patchTable(
     (table) => {
       const existing = editableStructureIndexes(table);
@@ -388,7 +396,7 @@ function updateColumnLengthUnit(index: number, value: unknown) {
 }
 
 const dataTypeOptionsForColumn = computed(() => {
-  const options = adapter.value.dataTypeOptions;
+  const options = getDataTypeOptions(props.databaseType);
   const table = selectedTable.value;
   if (!table) return options;
   const seen = new Set(options.map((type) => type.toLowerCase()));
@@ -496,14 +504,15 @@ const dataTypeOptionsForColumn = computed(() => {
                   NULL
                 </label>
               </div>
-              <Input v-if="adapter.supportsComment" class="h-7 text-[11px]" :model-value="col.comment ?? ''" :disabled="!isColumnEditable(col.name)" :placeholder="t('diagram.fieldComment')" @update:model-value="(v: string | number) => updateColumn(index, { comment: String(v) })" />
+              <Input v-if="supportsComment" class="h-7 text-[11px]" :model-value="col.comment ?? ''" :disabled="!isColumnEditable(col.name)" :placeholder="t('diagram.fieldComment')" @update:model-value="(v: string | number) => updateColumn(index, { comment: String(v) })" />
             </div>
             <p v-if="selectedTable.columns.length === 0" class="text-[11px] text-muted-foreground">{{ t("diagram.noFieldsYet") }}</p>
+            <p v-else-if="!canAddField && isLive" class="text-[11px] text-muted-foreground">{{ t("diagram.addColumnNotSupported") }}</p>
           </div>
         </template>
 
         <template v-else>
-          <div v-if="!adapter.supportsCreateIndex" class="text-[11px] text-muted-foreground">
+          <div v-if="!supportsCreateIndex" class="text-[11px] text-muted-foreground">
             {{ t("diagram.indexesNotSupported") }}
           </div>
           <template v-else>
@@ -549,7 +558,7 @@ const dataTypeOptionsForColumn = computed(() => {
           {{ t("diagram.deleteDraftTable") }}
         </Button>
 
-        <template v-else-if="isLive">
+        <template v-else-if="isLive && canDropLiveTable">
           <div v-if="!confirmingDropTable" class="space-y-1">
             <Button type="button" variant="destructive" size="sm" class="w-full h-8 text-xs" @click="requestDeleteLiveTable">
               {{ t("diagram.deleteLiveTable") }}
@@ -564,6 +573,7 @@ const dataTypeOptionsForColumn = computed(() => {
             </div>
           </div>
         </template>
+        <p v-else-if="isLive && !canDropLiveTable" class="text-[11px] text-muted-foreground">{{ t("diagram.dropTableNotSupported") }}</p>
       </template>
 
       <template v-else-if="selectedEdge">

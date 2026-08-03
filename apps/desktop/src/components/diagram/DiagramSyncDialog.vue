@@ -7,6 +7,7 @@ import type { DiagramTable } from "@/lib/diagram/erDiagram";
 import { isDraftTable, needsDiagramSync } from "@/lib/diagram/erDiagram";
 import { draftTableToCreateSqlOptions, hasLiveColumnChanges, liveTableToAlterSqlOptions, validateDraftTable, validateLivePendingColumns } from "@/lib/diagram/draft-table";
 import { buildDropTableSql, supportsDropTableCascade } from "@/lib/database/dbAdminSql";
+import { getTableStructureCapabilities } from "@/lib/table/tableStructureCapabilities";
 import type { DatabaseType } from "@/types/database";
 import * as api from "@/lib/backend/api";
 import { copyToClipboard } from "@/lib/common/clipboard";
@@ -36,12 +37,31 @@ const syncTables = computed(() => props.tables.filter(needsDiagramSync));
 const draftTables = computed(() => syncTables.value.filter(isDraftTable));
 const liveDropTables = computed(() => syncTables.value.filter((table) => !isDraftTable(table) && !!table.pendingDrop));
 const liveAlterTables = computed(() => syncTables.value.filter((table) => !isDraftTable(table) && !table.pendingDrop && hasLiveColumnChanges(table)));
+const structureCapabilities = computed(() => getTableStructureCapabilities(props.databaseType));
 const validationErrors = ref<string[]>([]);
 const sqlText = ref("");
 const warnings = ref<string[]>([]);
 const building = ref(false);
 const executing = ref(false);
 const execError = ref("");
+
+function validateStructureCapabilities(): string[] {
+  const caps = structureCapabilities.value;
+  const errors: string[] = [];
+  if (draftTables.value.length && !caps.createTable) {
+    errors.push(t("diagram.createTableNotSupported"));
+  }
+  if (liveAlterTables.value.some((table) => (table.pendingColumnNames?.length ?? 0) > 0) && !caps.addColumn) {
+    errors.push(t("diagram.addColumnNotSupported"));
+  }
+  if (liveAlterTables.value.some((table) => (table.droppedColumnNames?.length ?? 0) > 0) && !caps.dropColumn) {
+    errors.push(t("diagram.dropColumnNotSupported"));
+  }
+  if (liveDropTables.value.length && !caps.createTable) {
+    errors.push(t("diagram.dropTableNotSupported"));
+  }
+  return errors;
+}
 
 async function rebuildSql() {
   building.value = true;
@@ -50,19 +70,23 @@ async function rebuildSql() {
   sqlText.value = "";
   execError.value = "";
   try {
-    const errors = [...draftTables.value.flatMap(validateDraftTable), ...liveAlterTables.value.flatMap(validateLivePendingColumns)];
+    const capabilityErrors = validateStructureCapabilities();
+    const errors = [...capabilityErrors, ...draftTables.value.flatMap(validateDraftTable), ...liveAlterTables.value.flatMap(validateLivePendingColumns)];
     if (errors.length) {
       validationErrors.value = errors;
       return;
     }
     const allStatements: string[] = [];
     const allWarnings: string[] = [];
+    // Same SQL APIs as TableStructureEditor — do not generate dialect SQL in the diagram layer.
     for (const table of draftTables.value) {
       const result = await api.buildCreateTableSql(draftTableToCreateSqlOptions(table, props.databaseType, props.schema || undefined));
       allStatements.push(...result.statements);
       allWarnings.push(...result.warnings);
     }
     for (const table of liveAlterTables.value) {
+      // Live ER sync only maps ADD/DROP COLUMN. Existing-column type changes stay in TableStructureEditor
+      // (including SQLite rebuild via previewSqliteTableStructureChange).
       const result = await api.buildTableStructureChangeSql(liveTableToAlterSqlOptions(table, props.databaseType, props.schema || undefined));
       allStatements.push(...result.statements);
       allWarnings.push(...result.warnings);

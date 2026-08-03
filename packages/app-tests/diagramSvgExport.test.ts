@@ -4,7 +4,7 @@ import { buildEngineeringDiagram } from "../../apps/desktop/src/lib/diagram/engi
 import { buildEngineeringDiagramSvg, buildTableDiagramSvg, buildTableRelationshipPaths, computeTableDiagramCanvas, diagramSvgFileName } from "../../apps/desktop/src/lib/export/diagramSvgExport.ts";
 import { buildDiagramRelationships, normalizeCustomDiagramRelationship, type DiagramTable } from "../../apps/desktop/src/lib/diagram/erDiagram.ts";
 import { pointsToSvgPath } from "../../apps/desktop/src/lib/diagram/edge-obstacle-router.ts";
-import { CARD_HEADER_HEIGHT, CARD_WIDTH, COLUMN_ROW_HEIGHT, MARGIN } from "../../apps/desktop/src/lib/diagram/diagram-constants.ts";
+import { CARD_BOTTOM_PADDING, CARD_HEADER_HEIGHT, CARD_WIDTH, COLUMN_ROW_HEIGHT, MARGIN } from "../../apps/desktop/src/lib/diagram/diagram-constants.ts";
 
 const tables: DiagramTable[] = [
   {
@@ -268,7 +268,7 @@ test("computeTableDiagramCanvas uses default floor and MARGIN padding", () => {
     },
   );
 
-  assert.deepEqual(canvas, { width: 400 + MARGIN, height: 300 + MARGIN });
+  assert.deepEqual(canvas, { width: 400 + MARGIN, height: 300 + MARGIN, originX: 0, originY: 0 });
 });
 
 test("computeTableDiagramCanvas expands for tables and ignores zero-size layers", () => {
@@ -282,8 +282,11 @@ test("computeTableDiagramCanvas expands for tables and ignores zero-size layers"
       layers: [{ id: "z", name: "z", color: "#000", x: 0, y: 0, width: 0, height: 0 }],
     },
   );
-  assert.ok(withTable.width >= 1000 + CARD_WIDTH + MARGIN);
-  assert.ok(withTable.height >= 800 + MARGIN);
+  const tableHeight = CARD_HEADER_HEIGHT + tables[0].columns.length * COLUMN_ROW_HEIGHT + CARD_BOTTOM_PADDING;
+  assert.equal(withTable.originX, 1000 - MARGIN);
+  assert.equal(withTable.originY, 800 - MARGIN);
+  assert.equal(withTable.width, CARD_WIDTH + 2 * MARGIN);
+  assert.equal(withTable.height, tableHeight + 2 * MARGIN);
 
   const withLayer = computeTableDiagramCanvas(
     [],
@@ -295,6 +298,83 @@ test("computeTableDiagramCanvas expands for tables and ignores zero-size layers"
       layers: [{ id: "big", name: "big", color: "#000", x: 0, y: 0, width: 2000, height: 1500 }],
     },
   );
-  assert.equal(withLayer.width, 2000 + MARGIN);
-  assert.equal(withLayer.height, 1500 + MARGIN);
+  assert.equal(withLayer.originX, -MARGIN);
+  assert.equal(withLayer.originY, -MARGIN);
+  assert.equal(withLayer.width, 2000 + 2 * MARGIN);
+  assert.equal(withLayer.height, 1500 + 2 * MARGIN);
+});
+
+test("computeTableDiagramCanvas expands for relationship polylines beyond table bounds", () => {
+  const canvas = computeTableDiagramCanvas(
+    [tables[0]],
+    { users: { x: 40, y: 40 } },
+    {
+      cardWidth: CARD_WIDTH,
+      cardHeaderHeight: CARD_HEADER_HEIGHT,
+      columnRowHeight: COLUMN_ROW_HEIGHT,
+      relationshipPolylines: {
+        edge1: [
+          { x: 40, y: 40 },
+          { x: 40, y: 500 },
+        ],
+      },
+    },
+  );
+  assert.ok(canvas.originY <= 40 - MARGIN);
+  assert.ok(canvas.originY + canvas.height >= 500 + MARGIN);
+  assert.ok(canvas.height >= 500 - 40 + 2 * MARGIN);
+});
+
+test("buildTableDiagramSvg normalizes far-from-origin content to viewBox 0 0", () => {
+  const table = tables[0];
+  const positions = { users: { x: 1000, y: 800 } };
+  const canvas = computeTableDiagramCanvas([table], positions, {
+    cardWidth: CARD_WIDTH,
+    cardHeaderHeight: CARD_HEADER_HEIGHT,
+    columnRowHeight: COLUMN_ROW_HEIGHT,
+  });
+  assert.ok((canvas.originX ?? 0) > 0);
+  assert.ok((canvas.originY ?? 0) > 0);
+
+  const svg = buildTableDiagramSvg({
+    tables: [table],
+    relationships: [],
+    positions,
+    relationshipPaths: {},
+    canvas,
+    cardWidth: CARD_WIDTH,
+    cardHeaderHeight: CARD_HEADER_HEIGHT,
+    columnRowHeight: COLUMN_ROW_HEIGHT,
+  });
+  assert.match(svg, new RegExp(`viewBox="0 0 ${canvas.width} ${canvas.height}"`));
+  assert.match(svg, /rect x="0" y="0"/);
+  assert.match(svg, new RegExp(`transform="translate\\(${-(canvas.originX ?? 0)} ${-(canvas.originY ?? 0)}\\)"`));
+  assert.match(svg, /users/);
+});
+
+test("buildTableDiagramSvg normalizes negative-origin content to viewBox 0 0", () => {
+  const table = tables[0];
+  const positions = { users: { x: -200, y: -100 } };
+  const canvas = computeTableDiagramCanvas([table], positions, {
+    cardWidth: CARD_WIDTH,
+    cardHeaderHeight: CARD_HEADER_HEIGHT,
+    columnRowHeight: COLUMN_ROW_HEIGHT,
+  });
+  assert.ok((canvas.originX ?? 0) < 0);
+  assert.ok((canvas.originY ?? 0) < 0);
+
+  const svg = buildTableDiagramSvg({
+    tables: [table],
+    relationships: [],
+    positions,
+    relationshipPaths: {},
+    canvas,
+    cardWidth: CARD_WIDTH,
+    cardHeaderHeight: CARD_HEADER_HEIGHT,
+    columnRowHeight: COLUMN_ROW_HEIGHT,
+  });
+  assert.match(svg, new RegExp(`viewBox="0 0 ${canvas.width} ${canvas.height}"`));
+  assert.match(svg, /rect x="0" y="0"/);
+  assert.match(svg, new RegExp(`transform="translate\\(${-(canvas.originX ?? 0)} ${-(canvas.originY ?? 0)}\\)"`));
+  assert.match(svg, /users/);
 });

@@ -39,6 +39,8 @@ const props = defineProps<{
   generatedJoinSql: string;
   isFullscreen?: boolean;
   draftTableCount?: number;
+  canCreateTable?: boolean;
+  canSyncToDatabase?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -142,12 +144,20 @@ function connectionIconType(id: string) {
       </Button>
     </div>
 
-    <Button variant="outline" size="sm" class="h-8 px-2 text-xs" :disabled="!diagramReady" :title="t('diagram.createTable')" @click="emit('create-table')">
+    <Button variant="outline" size="sm" class="h-8 px-2 text-xs" :disabled="!diagramReady || canCreateTable === false" :title="canCreateTable === false ? t('diagram.createTableNotSupported') : t('diagram.createTable')" @click="emit('create-table')">
       <Plus class="mr-1 h-3.5 w-3.5" />
       {{ t("diagram.createTable") }}
     </Button>
 
-    <Button variant="outline" size="sm" class="h-8 px-2 text-xs" :disabled="!diagramReady || !(draftTableCount ?? 0)" :title="t('diagram.syncToDatabase')" :class="(draftTableCount ?? 0) > 0 ? 'bg-primary/10 border-primary text-primary' : ''" @click="emit('sync-to-database')">
+    <Button
+      variant="outline"
+      size="sm"
+      class="h-8 px-2 text-xs"
+      :disabled="!diagramReady || !(draftTableCount ?? 0) || canSyncToDatabase === false"
+      :title="canSyncToDatabase === false ? t('diagram.structureSyncNotSupported') : t('diagram.syncToDatabase')"
+      :class="(draftTableCount ?? 0) > 0 ? 'bg-primary/10 border-primary text-primary' : ''"
+      @click="emit('sync-to-database')"
+    >
       <Upload class="mr-1 h-3.5 w-3.5" />
       {{ t("diagram.syncToDatabase") }}
       <Badge v-if="(draftTableCount ?? 0) > 0" variant="secondary" class="ml-1 h-4 px-1 text-[10px]">{{ draftTableCount }}</Badge>
