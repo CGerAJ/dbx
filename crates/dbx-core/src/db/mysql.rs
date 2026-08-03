@@ -4644,26 +4644,6 @@ pub async fn list_doris_catalog_indexes(
     Ok(doris_indexes_from_create_table_ddl(&ddl))
 }
 
-fn merge_index_infos(target: &mut Vec<IndexInfo>, parsed: Vec<IndexInfo>) {
-    let mut seen_names: HashSet<String> = target.iter().map(|index| index.name.to_ascii_lowercase()).collect();
-    for index in parsed {
-        if index.columns.is_empty() {
-            continue;
-        }
-        if seen_names.contains(&index.name.to_ascii_lowercase())
-            || target.iter().any(|existing| {
-                existing.is_unique == index.is_unique
-                    && existing.is_primary == index.is_primary
-                    && existing.columns == index.columns
-            })
-        {
-            continue;
-        }
-        seen_names.insert(index.name.to_ascii_lowercase());
-        target.push(index);
-    }
-}
-
 fn doris_indexes_from_create_table_ddl(ddl: &str) -> Vec<IndexInfo> {
     let mut indexes = Vec::new();
     for raw_line in ddl.lines() {
