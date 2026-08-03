@@ -2884,6 +2884,11 @@ export default withEnglishFallback({
     relationshipKindInferred: "Inferido",
     relationshipReadOnlyFk: "Este relacionamento vem de uma restrição de chave estrangeira do banco de dados e não pode ser editado aqui.",
     relationshipUpdated: "Relacionamento atualizado",
+    createTableNotSupported: "O banco de dados atual não suporta criar nova tabela",
+    structureSyncNotSupported: "O banco de dados atual não suporta sincronizar a estrutura da tabela a partir do diagrama",
+    addColumnNotSupported: "O banco de dados atual não suporta adicionar coluna",
+    dropColumnNotSupported: "O banco de dados atual não suporta excluir coluna",
+    dropTableNotSupported: "O banco de dados atual não suporta excluir tabela do diagrama",
   },
   etcd: {
     prefixPlaceholder: "Buscar caminho da Key, por exemplo /app/ ou serviço",

@@ -2752,6 +2752,11 @@ export default withEnglishFallback({
     relationshipKindInferred: "推斷",
     relationshipReadOnlyFk: "該關係來自資料庫外鍵約束，無法在此修改。",
     relationshipUpdated: "關係已更新",
+    createTableNotSupported: "目前資料庫不支援建立新資料表",
+    structureSyncNotSupported: "目前資料庫不支援從圖同步資料表結構",
+    addColumnNotSupported: "目前資料庫不支援新增欄位",
+    dropColumnNotSupported: "目前資料庫不支援刪除欄位",
+    dropTableNotSupported: "目前資料庫不支援從圖刪除資料表",
   },
   redis: {
     setDatabaseAlias: "設定資料庫別名",

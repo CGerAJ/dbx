@@ -2948,6 +2948,11 @@ export default withEnglishFallback({
     relationshipKindInferred: "推論",
     relationshipReadOnlyFk: "このリレーションシップはデータベースの外部キー制約に基づいており、ここでは変更できません。",
     relationshipUpdated: "リレーションシップが更新されました",
+    createTableNotSupported: "現在のデータベースは新しいテーブルの作成をサポートしていません",
+    structureSyncNotSupported: "現在のデータベースは図からテーブル構造を同期することをサポートしていません",
+    addColumnNotSupported: "現在のデータベースは列の追加をサポートしていません",
+    dropColumnNotSupported: "現在のデータベースは列の削除をサポートしていません",
+    dropTableNotSupported: "現在のデータベースは図からテーブルを削除することをサポートしていません",
   },
   etcd: {
     prefixPlaceholder: "Key パスを検索（例: /app/、service）",

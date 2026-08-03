@@ -2882,6 +2882,11 @@ export default withEnglishFallback({
     relationshipKindInferred: "Inferita",
     relationshipReadOnlyFk: "Questa relazione deriva da un vincolo di chiave esterna del database; non può essere modificata qui.",
     relationshipUpdated: "Relazione aggiornata",
+    createTableNotSupported: "Il database corrente non supporta la creazione di nuove tabelle",
+    structureSyncNotSupported: "Il database corrente non supporta la sincronizzazione della struttura delle tabelle dal diagramma",
+    addColumnNotSupported: "Il database corrente non supporta l'aggiunta di colonne",
+    dropColumnNotSupported: "Il database corrente non supporta l'eliminazione di colonne",
+    dropTableNotSupported: "Il database corrente non supporta l'eliminazione di tabelle dal diagramma",
   },
   etcd: {
     prefixPlaceholder: "Cerca percorso Key, ad es. /app/ o servizio",
